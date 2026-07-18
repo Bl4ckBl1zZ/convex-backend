@@ -25,7 +25,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # jobs is conservative enough for a 32 GiB mixed-workload host and can be
 # overridden by callers with more dedicated build memory.
 ARG CARGO_BUILD_JOBS=4
-ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS} \
+    RUSTY_V8_MIRROR=https://github.com/get-convex/rusty_v8/releases/download
 
 # Update APT configuration for Docker builds
 # Sets retry attempts, assumes yes for prompts, and configures dpkg timeout
