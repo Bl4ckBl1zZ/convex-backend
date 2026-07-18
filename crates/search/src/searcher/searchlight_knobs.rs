@@ -7,7 +7,10 @@
 //! When running locally, these knobs can all be overridden with an environment
 //! variable.
 
-use std::sync::LazyLock;
+use std::{
+    path::PathBuf,
+    sync::LazyLock,
+};
 
 use cmd_util::env::env_config;
 // Knobs available in backend that are also available in searchlight.
@@ -19,6 +22,26 @@ pub use common::knobs::{
 };
 
 // Searchlight only knobs.
+
+/// Directory used by the in-process searcher's on-disk segment cache. An empty
+/// value keeps the existing temporary-directory behavior.
+pub static IN_PROCESS_SEARCH_CACHE_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let path = env_config("IN_PROCESS_SEARCH_CACHE_PATH", String::new());
+    (!path.is_empty()).then(|| PathBuf::from(path))
+});
+
+/// Maximum size of the in-process searcher's on-disk segment cache.
+pub static IN_PROCESS_SEARCH_CACHE_SIZE_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    env_config("IN_PROCESS_SEARCH_CACHE_SIZE_BYTES", bytesize::mib(500u64)).max(1)
+});
+
+/// Maximum number of general-purpose blocking search tasks running at once.
+pub static SEARCH_GENERAL_POOL_MAX_CONCURRENCY: LazyLock<usize> =
+    LazyLock::new(|| env_config("SEARCH_GENERAL_POOL_MAX_CONCURRENCY", 50).max(1));
+
+/// Maximum number of queued general-purpose blocking search tasks.
+pub static SEARCH_GENERAL_POOL_QUEUE_SIZE: LazyLock<usize> =
+    LazyLock::new(|| env_config("SEARCH_GENERAL_POOL_QUEUE_SIZE", 1000).max(1));
 
 /// The maximum number of compactions we can run concurrently on one
 /// searchlight instance. Each compaction takes 4 cores, so this should

@@ -1,8 +1,11 @@
-use std::collections::BTreeMap;
 /// Searcher trait and implementations
 /// - Stub implementation
 /// - InProcessSearcher implementation
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    fs,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use common::{
@@ -44,6 +47,10 @@ use super::{
     TermValue,
 };
 use crate::{
+    searcher::searchlight_knobs::{
+        IN_PROCESS_SEARCH_CACHE_PATH,
+        IN_PROCESS_SEARCH_CACHE_SIZE_BYTES,
+    },
     Searcher,
     SegmentTermMetadataFetcher,
 };
@@ -135,21 +142,30 @@ impl SegmentTermMetadataFetcher for SearcherStub {
 #[derive(Clone)]
 pub struct InProcessSearcher<RT: Runtime> {
     searcher: Arc<SearcherImpl<RT>>,
-    _tmpdir: Arc<TempDir>,
+    _tmpdir: Option<Arc<TempDir>>,
 }
 
 impl<RT: Runtime> InProcessSearcher<RT> {
     pub fn new(runtime: RT) -> anyhow::Result<Self> {
-        let tmpdir = TempDir::new()?;
+        let (cache_path, tmpdir) = match &*IN_PROCESS_SEARCH_CACHE_PATH {
+            Some(path) => {
+                fs::create_dir_all(path)?;
+                (path.clone(), None)
+            },
+            None => {
+                let tmpdir = Arc::new(TempDir::new()?);
+                (tmpdir.path().to_owned(), Some(tmpdir))
+            },
+        };
         Ok(Self {
             searcher: Arc::new(SearcherImpl::new(
-                tmpdir.path(),
-                bytesize::mib(500u64),
+                cache_path,
+                *IN_PROCESS_SEARCH_CACHE_SIZE_BYTES,
                 100,
                 false,
                 runtime,
             )?),
-            _tmpdir: Arc::new(tmpdir),
+            _tmpdir: tmpdir,
         })
     }
 }

@@ -9567,6 +9567,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "cmd_util",
  "common",
  "convex_macro",
  "derive_more",

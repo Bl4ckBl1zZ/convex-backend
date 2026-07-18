@@ -9,6 +9,7 @@
  */
 
 import type * as actions_componentsNode from "../actions/componentsNode.js";
+import type * as actions_cpu from "../actions/cpu.js";
 import type * as actions_externalNodeDeps from "../actions/externalNodeDeps.js";
 import type * as actions_insert from "../actions/insert.js";
 import type * as common from "../common.js";
@@ -33,6 +34,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   "actions/componentsNode": typeof actions_componentsNode;
+  "actions/cpu": typeof actions_cpu;
   "actions/externalNodeDeps": typeof actions_externalNodeDeps;
   "actions/insert": typeof actions_insert;
   common: typeof common;

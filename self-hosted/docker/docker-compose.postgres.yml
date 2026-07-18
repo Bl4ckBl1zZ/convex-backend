@@ -1,0 +1,28 @@
+services:
+  backend:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DO_NOT_REQUIRE_SSL=1
+      - INSTANCE_NAME=${INSTANCE_NAME:-convex-self-hosted}
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://convex:convex@postgres:5432}
+      - POSTGRES_MAX_CONNECTIONS=${POSTGRES_MAX_CONNECTIONS:-64}
+      - MAX_BYTES_WRITTEN_PER_SECOND=${MAX_BYTES_WRITTEN_PER_SECOND:-16777216}
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      - POSTGRES_DB=convex_self_hosted
+      - POSTGRES_USER=convex
+      - POSTGRES_PASSWORD=convex
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U convex -d convex_self_hosted"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:

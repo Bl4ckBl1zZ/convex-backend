@@ -1,0 +1,11 @@
+{
+  "name": "benchmark_large_insert",
+  "scenarios": [
+    {
+      "name": "RunFunction",
+      "path": "insert:insertLargeMessage",
+      "fn_type": "mutation",
+      "benchmark": 8
+    }
+  ]
+}

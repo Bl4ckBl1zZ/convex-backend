@@ -92,6 +92,26 @@ export async function maybeDownloadAndLinkPackages(
     return local;
   }
 
+  // Multiple actions can reach a cold executor at the same time. Deduplicate
+  // package setup so they do not concurrently remove, recreate, and populate
+  // the same source directory.
+  let packagePromise = pendingSourcePackages.get(sourcePackage.key);
+  if (packagePromise === undefined) {
+    packagePromise = downloadAndLinkPackages(sourcePackage);
+    pendingSourcePackages.set(sourcePackage.key, packagePromise);
+  }
+  try {
+    return await packagePromise;
+  } finally {
+    if (pendingSourcePackages.get(sourcePackage.key) === packagePromise) {
+      pendingSourcePackages.delete(sourcePackage.key);
+    }
+  }
+}
+
+async function downloadAndLinkPackages(
+  sourcePackage: SourcePackage,
+): Promise<LocalSourcePackage> {
   const sourcePackagePromise = downloadSourcePackage(
     sourcePackage.bundled_source,
   );
@@ -167,45 +187,60 @@ async function downloadSourcePackage(
 async function maybeDownloadExternalPackage(
   externalPackage: Package,
 ): Promise<ExternalDepsPackage> {
-  const start = performance.now();
-  const externalDeps =
-    availableExternalPackages.get(externalPackage.key) || null;
-
-  if (!externalDeps) {
-    logDebug("External Package not available locally");
-
-    // Cleanup other external dependency packages to not run out of disk space
-    await cleanupExternalPackages();
-    logDurationMs("cleanupExternalPackages", start);
-
-    // Create directory and do download in parallel
-    const downloadStart = performance.now();
-    const dir = path.join(os.tmpdir(), `external_deps/${externalPackage.key}`);
-    const dirPromise = createFreshDir(dir);
-    const downloadPackagePromise = download(externalPackage.uri);
-    const [externalPackageStream, ..._] = await Promise.all([
-      downloadPackagePromise,
-      dirPromise,
-    ]);
-    logDurationMs("downloadExternalsTime", downloadStart);
-
-    // Process the external package download readable stream by checking hash and writing to dir
-    await processExternalPackageStream(
-      dir,
-      externalPackage,
-      externalPackageStream,
-    );
-    const result: ExternalDepsPackage = { dir, dynamicallyDownloaded: true };
-
-    // Save result for next time
-    availableExternalPackages.set(externalPackage.key, result);
-
-    logDurationMs("externalDepsProcessingTime", start);
-    return result;
-  } else {
+  const externalDeps = availableExternalPackages.get(externalPackage.key);
+  if (externalDeps !== undefined) {
     logDebug("External Package available locally");
     return externalDeps;
   }
+
+  let packagePromise = pendingExternalPackages.get(externalPackage.key);
+  if (packagePromise === undefined) {
+    packagePromise = downloadExternalPackage(externalPackage);
+    pendingExternalPackages.set(externalPackage.key, packagePromise);
+  }
+  try {
+    return await packagePromise;
+  } finally {
+    if (pendingExternalPackages.get(externalPackage.key) === packagePromise) {
+      pendingExternalPackages.delete(externalPackage.key);
+    }
+  }
+}
+
+async function downloadExternalPackage(
+  externalPackage: Package,
+): Promise<ExternalDepsPackage> {
+  const start = performance.now();
+  logDebug("External Package not available locally");
+
+  // Cleanup other external dependency packages to not run out of disk space
+  await cleanupExternalPackages();
+  logDurationMs("cleanupExternalPackages", start);
+
+  // Create directory and do download in parallel
+  const downloadStart = performance.now();
+  const dir = path.join(os.tmpdir(), `external_deps/${externalPackage.key}`);
+  const dirPromise = createFreshDir(dir);
+  const downloadPackagePromise = download(externalPackage.uri);
+  const [externalPackageStream, ..._] = await Promise.all([
+    downloadPackagePromise,
+    dirPromise,
+  ]);
+  logDurationMs("downloadExternalsTime", downloadStart);
+
+  // Process the external package download readable stream by checking hash and writing to dir
+  await processExternalPackageStream(
+    dir,
+    externalPackage,
+    externalPackageStream,
+  );
+  const result: ExternalDepsPackage = { dir, dynamicallyDownloaded: true };
+
+  // Save result for next time
+  availableExternalPackages.set(externalPackage.key, result);
+
+  logDurationMs("externalDepsProcessingTime", start);
+  return result;
 }
 
 async function createFreshDir(dir: string) {
@@ -373,7 +408,9 @@ async function processSourcePackageStream(
 }
 
 export const availableSourcePackages = new Map<string, LocalSourcePackage>();
+const pendingSourcePackages = new Map<string, Promise<LocalSourcePackage>>();
 export const availableExternalPackages = new Map<string, ExternalDepsPackage>();
+const pendingExternalPackages = new Map<string, Promise<ExternalDepsPackage>>();
 
 /**
  * Prepopulates source and external deps caches if this Lambda was pushed with source and, optionally,

@@ -20,6 +20,7 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
+cmd_util = { workspace = true }
 common = { workspace = true }
 derive_more = { workspace = true }
 fastrace = { workspace = true }
