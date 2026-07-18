@@ -1,0 +1,202 @@
+services:
+  postgres:
+    # Preserve the existing RestoreCord PostgreSQL 18 service and volume layout.
+    # This service definition intentionally matches the current Dokploy stack so
+    # deploying the patched backend does not replace or migrate the database.
+    image: postgres:18-alpine
+    restart: always
+    shm_size: 256mb
+    mem_limit: 768m
+    mem_reservation: 384m
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    ports:
+      - "100.68.15.120:5432:5432"
+    environment:
+      POSTGRES_DB: convex_self_hosted
+      POSTGRES_USER: convex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      PGDATA: /var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=8
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_slot_wal_keep_size=40GB
+      - -c
+      - wal_sender_timeout=60s
+      - -c
+      - max_connections=40
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - effective_cache_size=512MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - autovacuum_work_mem=64MB
+      - -c
+      - temp_buffers=2MB
+      - -c
+      - wal_buffers=8MB
+      - -c
+      - autovacuum=on
+      - -c
+      - autovacuum_max_workers=2
+      - -c
+      - autovacuum_naptime=30s
+      - -c
+      - autovacuum_vacuum_cost_limit=2000
+      - -c
+      - autovacuum_vacuum_cost_delay=5ms
+      - -c
+      - autovacuum_vacuum_scale_factor=0.02
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
+      - -c
+      - max_worker_processes=4
+      - -c
+      - max_parallel_workers=2
+      - -c
+      - max_parallel_workers_per_gather=1
+      - -c
+      - max_parallel_maintenance_workers=1
+      - -c
+      - jit=off
+      - -c
+      - idle_in_transaction_session_timeout=5min
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=32
+      - -c
+      - log_autovacuum_min_duration=10s
+      - -c
+      - log_min_duration_statement=5000
+      - -c
+      - track_io_timing=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U convex -d convex_self_hosted"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      options:
+        max-size: 100m
+        max-file: "5"
+
+  backend:
+    image: convex-backend:restorecord-scale
+    build:
+      context: ../..
+      dockerfile: self-hosted/docker-build/Dockerfile.backend
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
+        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:?VERGEN_GIT_SHA is required}
+        VERGEN_GIT_COMMIT_TIMESTAMP: ${VERGEN_GIT_COMMIT_TIMESTAMP:?VERGEN_GIT_COMMIT_TIMESTAMP is required}
+    restart: always
+    init: true
+    stop_grace_period: 30s
+    stop_signal: SIGINT
+    expose:
+      - "3210"
+      - "3211"
+    volumes:
+      - convex_data:/convex/data
+    mem_limit: 8g
+    mem_reservation: 4g
+    memswap_limit: 8g
+    environment:
+      LOG_MANAGER_AGGREGATION_INTERVAL: ${LOG_MANAGER_AGGREGATION_INTERVAL:-1000}
+      INSTANCE_NAME: ${INSTANCE_NAME:?INSTANCE_NAME is required}
+      INSTANCE_SECRET: ${INSTANCE_SECRET:?INSTANCE_SECRET is required}
+      CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-https://rc-cv-api.8u9yhy8fewf.org}
+      CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-https://rc-cv-sync.8u9yhy8fewf.org}
+
+      # Convex expects the PostgreSQL cluster URL and selects its existing
+      # convex_self_hosted database. Do not append a database path here.
+      POSTGRES_URL: postgres://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432
+      POSTGRES_MAX_CONNECTIONS: ${POSTGRES_MAX_CONNECTIONS:-32}
+      DO_NOT_REQUIRE_SSL: "true"
+      DISABLE_BEACON: "true"
+      REDACT_LOGS_TO_CLIENT: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+
+      HTTP_SERVER_MAX_CONCURRENT_REQUESTS: ${HTTP_SERVER_MAX_CONCURRENT_REQUESTS:-1024}
+      APPLICATION_MAX_CONCURRENT_MUTATIONS: ${APPLICATION_MAX_CONCURRENT_MUTATIONS:-16}
+      APPLICATION_MAX_CONCURRENT_QUERIES: ${APPLICATION_MAX_CONCURRENT_QUERIES:-32}
+      APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: ${APPLICATION_MAX_CONCURRENT_NODE_ACTIONS:-12}
+      APPLICATION_MAX_CONCURRENT_V8_ACTIONS: ${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-24}
+      LOCAL_NODE_EXECUTOR_POOL_SIZE: ${LOCAL_NODE_EXECUTOR_POOL_SIZE:-4}
+      RUNTIME_WORKER_THREADS: ${RUNTIME_WORKER_THREADS:-8}
+      V8_THREADS: ${V8_THREADS:-8}
+      MAX_BYTES_WRITTEN_PER_SECOND: ${MAX_BYTES_WRITTEN_PER_SECOND:-16777216}
+      IN_PROCESS_SEARCH_CACHE_PATH: /convex/data/search-cache
+      IN_PROCESS_SEARCH_CACHE_SIZE_BYTES: ${IN_PROCESS_SEARCH_CACHE_SIZE_BYTES:-536870912}
+      SEARCH_GENERAL_POOL_MAX_CONCURRENCY: ${SEARCH_GENERAL_POOL_MAX_CONCURRENCY:-50}
+      SEARCH_GENERAL_POOL_QUEUE_SIZE: ${SEARCH_GENERAL_POOL_QUEUE_SIZE:-1000}
+      STORAGE_MAXIMUM_PARALLEL_UPLOADS: ${STORAGE_MAXIMUM_PARALLEL_UPLOADS:-8}
+      STORAGE_MAX_CONCURRENT_CHUNK_DOWNLOADS: ${STORAGE_MAX_CONCURRENT_CHUNK_DOWNLOADS:-16}
+
+      DOCUMENT_RETENTION_DELAY: ${DOCUMENT_RETENTION_DELAY:-3600}
+      INDEX_RETENTION_DELAY: ${INDEX_RETENTION_DELAY:-240}
+      DOCUMENT_RETENTION_RATE_LIMIT: ${DOCUMENT_RETENTION_RATE_LIMIT:-10000}
+      DOCUMENT_RETENTION_DELETE_CHUNK: ${DOCUMENT_RETENTION_DELETE_CHUNK:-1000}
+      DOCUMENT_RETENTION_DELETE_PARALLEL: ${DOCUMENT_RETENTION_DELETE_PARALLEL:-6}
+      DOCUMENT_RETENTION_BATCH_INTERVAL_SECONDS: ${DOCUMENT_RETENTION_BATCH_INTERVAL_SECONDS:-2}
+      DOCUMENT_RETENTION_MAX_SCANNED_DOCUMENTS: ${DOCUMENT_RETENTION_MAX_SCANNED_DOCUMENTS:-500000}
+      RETENTION_DELETE_BATCH: ${RETENTION_DELETE_BATCH:-100000}
+      SCHEDULED_JOB_RETENTION: ${SCHEDULED_JOB_RETENTION:-3600}
+      SCHEDULED_JOB_GARBAGE_COLLECTION_DELAY: ${SCHEDULED_JOB_GARBAGE_COLLECTION_DELAY:-1}
+      SCHEDULED_JOB_GARBAGE_COLLECTION_BATCH_SIZE: ${SCHEDULED_JOB_GARBAGE_COLLECTION_BATCH_SIZE:-1000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3210/version >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 60s
+    logging:
+      options:
+        max-size: 100m
+        max-file: "5"
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard@sha256:f3a8ccb90a07c9cb580974c0e4a03f38137b5b53dd4c70cd5b242d5d7ae2260b
+    restart: always
+    init: true
+    expose:
+      - "6791"
+    environment:
+      NEXT_PUBLIC_DEPLOYMENT_URL: ${CONVEX_CLOUD_ORIGIN:-https://rc-cv-api.8u9yhy8fewf.org}
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging:
+      options:
+        max-size: 50m
+        max-file: "3"
+
+volumes:
+  # These names resolve to the current Dokploy project volumes. They must not be
+  # renamed: postgres_data contains RestoreCord's 128 GB production database.
+  postgres_data:
+  convex_data:
