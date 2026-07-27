@@ -58,7 +58,9 @@ services:
       INSTANCE_SECRET: ${INSTANCE_SECRET:?INSTANCE_SECRET is required}
       CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-https://sync.modularbots.io}
       CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-https://api.modularbots.io}
-      POSTGRES_URL: postgresql://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/convex_self_hosted
+      # Convex derives convex_self_hosted from INSTANCE_NAME and rejects a
+      # database path in this cluster URL.
+      POSTGRES_URL: postgresql://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432
       POSTGRES_MAX_CONNECTIONS: ${POSTGRES_MAX_CONNECTIONS:-64}
       DO_NOT_REQUIRE_SSL: "true"
       DISABLE_BEACON: "true"
