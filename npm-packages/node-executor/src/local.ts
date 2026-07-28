@@ -4,9 +4,23 @@ import { v4 as uuidv4 } from "uuid";
 import { log, setDebugLogging } from "./log";
 import os from "node:os";
 import http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import express, { Request, Response } from "express";
 
 const DEFAULT_PORT = 3002;
+const AUTH_HEADER = "x-convex-node-executor-secret";
+
+function isAuthorized(req: Request, sharedSecret: string): boolean {
+  const providedSecret = req.header(AUTH_HEADER);
+  if (providedSecret === undefined) {
+    return false;
+  }
+  const expected = Buffer.from(sharedSecret);
+  const provided = Buffer.from(providedSecret);
+  return (
+    expected.length === provided.length && timingSafeEqual(expected, provided)
+  );
+}
 
 async function startServer(
   listenTarget: number | { path: string },
@@ -15,6 +29,22 @@ async function startServer(
 ) {
   setDebugLogging(debug);
   const app = express();
+  const requireAuth = process.env.NODE_EXECUTOR_REQUIRE_AUTH === "true";
+  if (requireAuth) {
+    const sharedSecret = process.env.NODE_EXECUTOR_SHARED_SECRET;
+    if (sharedSecret === undefined || sharedSecret.length < 32) {
+      throw new Error(
+        "NODE_EXECUTOR_SHARED_SECRET must be at least 32 bytes when remote authentication is enabled",
+      );
+    }
+    app.use((req: Request, res: Response, next) => {
+      if (!isAuthorized(req, sharedSecret)) {
+        res.status(401).json({ type: "error", message: "Unauthorized" });
+        return;
+      }
+      next();
+    });
+  }
   app.use(express.json({ limit: "6MB" })); // 5 MiB for args (https://docs.convex.dev/production/state/limits#functions) + extra space
 
   // Override os.tmpdir to use the provided tempdir

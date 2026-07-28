@@ -75,6 +75,11 @@ Increase this for CPU-bound Node actions only. Each process has its own V8 heap
 and module state, so it consumes additional memory. The pool is local to one
 backend and does not implement multi-backend routing or horizontal scaling.
 
+For horizontal Node action processing, use the authenticated remote executor
+pool described in [horizontal-scaling.md](./horizontal-scaling.md). It keeps a
+single database leader while moving Node CPU and heap usage to independently
+scalable containers.
+
 ## Write budget
 
 `MAX_BYTES_WRITTEN_PER_SECOND` has a conservative Rust and base-Docker default

@@ -102,11 +102,13 @@ RUN --mount=type=cache,target=/convex/npm-packages/common/temp/,sharing=locked -
 export PROTOC="$(mise which protoc)"
 cargo build --release -p local_backend --bin convex-local-backend
 cp target/release/convex-local-backend .
+cargo build --release -p node_executor --bin convex-node-executor
+cp target/release/convex-node-executor .
 cargo build --release -p keybroker --bin generate_key
 cp target/release/generate_key .
 EOF
 ARG debug
-RUN if [[ -z "$debug" ]]; then strip ./convex-local-backend; strip ./generate_key; fi
+RUN if [[ -z "$debug" ]]; then strip ./convex-local-backend; strip ./convex-node-executor; strip ./generate_key; fi
 
 # Final stage: Creates minimal runtime image with only necessary components
 # Uses Ubuntu Noble (24.04) as the base image
@@ -133,6 +135,7 @@ RUN ln -sf /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
 RUN ln -sf /usr/lib/node_modules/npm/bin/npx-cli.js /usr/bin/npx && \
     chmod +x /usr/bin/npx
 COPY --from=build --chmod=744 /convex/convex-local-backend .
+COPY --from=build --chmod=744 /convex/convex-node-executor .
 COPY --from=build --chmod=744 /convex/generate_key .
 COPY --chmod=744 self-hosted/docker-build/read_credentials.sh .
 COPY --chmod=744 self-hosted/docker-build/run_backend.sh .
@@ -146,3 +149,4 @@ ENTRYPOINT ["./run_backend.sh"]
 # Expose the required ports
 EXPOSE 3210
 EXPOSE 3211
+EXPOSE 3002

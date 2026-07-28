@@ -270,40 +270,43 @@ impl LocalNodeExecutor {
             },
         )
     }
+}
 
-    #[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
-    async fn response_stream(config: &LocalNodeExecutorConfig, mut response: reqwest::Response) {
-        let mut timeout_future = Box::pin(tokio::time::sleep(config.node_process_timeout));
-        let timeout_future = &mut timeout_future;
-        loop {
-            let process_chunk = async {
-                select_biased! {
-                    chunk = response.chunk().fuse() => {
-                        let chunk = chunk?;
-                        match chunk {
-                            Some(chunk) => {
-                                anyhow::Ok(NodeExecutorStreamPart::Chunk(chunk))
-                            }
-                            None => {
-                                anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
-                            }
+#[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
+pub(crate) async fn node_executor_response_stream(
+    node_process_timeout: Duration,
+    mut response: reqwest::Response,
+) {
+    let mut timeout_future = Box::pin(tokio::time::sleep(node_process_timeout));
+    let timeout_future = &mut timeout_future;
+    loop {
+        let process_chunk = async {
+            select_biased! {
+                chunk = response.chunk().fuse() => {
+                    let chunk = chunk?;
+                    match chunk {
+                        Some(chunk) => {
+                            anyhow::Ok(NodeExecutorStreamPart::Chunk(chunk))
                         }
-                    },
-                    _ = timeout_future.fuse() => {
-                        anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
-                            response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
-                            aws_request_id: None,
-                        })))
-                    },
-                }
-            };
-            let part = process_chunk.await?;
-            if let NodeExecutorStreamPart::InvokeComplete(_) = part {
-                yield part;
-                break;
-            } else {
-                yield part;
+                        None => {
+                            anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
+                        }
+                    }
+                },
+                _ = timeout_future.fuse() => {
+                    anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
+                        response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
+                        aws_request_id: None,
+                    })))
+                },
             }
+        };
+        let part = process_chunk.await?;
+        if let NodeExecutorStreamPart::InvokeComplete(_) = part {
+            yield part;
+            break;
+        } else {
+            yield part;
         }
     }
 }
@@ -375,7 +378,7 @@ impl NodeExecutor for LocalNodeExecutor {
             let error = response.text().await?;
             anyhow::bail!("Node executor server returned error: {}", error);
         }
-        let stream = Self::response_stream(&self.config, response);
+        let stream = node_executor_response_stream(self.config.node_process_timeout, response);
         let stream = Box::pin(stream);
         let result = handle_node_executor_stream(log_line_sender, stream).await?;
         match result {
