@@ -15,7 +15,13 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use cmd_util::env::env_config;
-use common::log_lines::LogLine;
+use common::{
+    knobs::{
+        VERTICAL_SCALING_CPU_COUNT,
+        VERTICAL_SCALING_ENABLED,
+    },
+    log_lines::LogLine,
+};
 use errors::ErrorMetadata;
 use futures::{
     select_biased,
@@ -56,8 +62,14 @@ const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
 
 /// Number of local Node.js executor processes. Each process has an independent
 /// event loop and heap, allowing CPU-heavy Node actions to run in parallel.
-pub static LOCAL_NODE_EXECUTOR_POOL_SIZE: LazyLock<usize> =
-    LazyLock::new(|| env_config("LOCAL_NODE_EXECUTOR_POOL_SIZE", 1).max(1));
+pub static LOCAL_NODE_EXECUTOR_POOL_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let default = if *VERTICAL_SCALING_ENABLED {
+        VERTICAL_SCALING_CPU_COUNT.div_ceil(4).clamp(1, 16)
+    } else {
+        1
+    };
+    env_config("LOCAL_NODE_EXECUTOR_POOL_SIZE", default).max(1)
+});
 
 pub struct LocalNodeExecutor {
     workers: Vec<LocalNodeExecutorWorker>,

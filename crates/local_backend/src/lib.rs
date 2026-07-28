@@ -29,10 +29,22 @@ use common::{
         RouteMapper,
     },
     knobs::{
+        APPLICATION_MAX_CONCURRENT_MUTATIONS,
+        APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
+        APPLICATION_MAX_CONCURRENT_QUERIES,
+        APPLICATION_MAX_CONCURRENT_V8_ACTIONS,
+        COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES,
         DOCUMENT_RETENTION_RATE_LIMIT,
+        FUNRUN_ISOLATE_ACTIVE_THREADS,
         INDEX_CACHE_SIZE,
+        MAX_ACTION_ISOLATE_WORKERS,
+        MAX_TRANSACTION_ISOLATE_WORKERS,
         NODE_ACTION_USER_TIMEOUT,
+        POSTGRES_MAX_CONNECTIONS,
         UDF_CACHE_MAX_SIZE,
+        VERTICAL_SCALING_CPU_COUNT,
+        VERTICAL_SCALING_ENABLED,
+        VERTICAL_SCALING_RESERVED_CPU_COUNT,
     },
     persistence::Persistence,
     runtime::{
@@ -69,7 +81,10 @@ use model::{
     virtual_system_mapping,
 };
 use node_executor::{
-    local::LocalNodeExecutor,
+    local::{
+        LocalNodeExecutor,
+        LOCAL_NODE_EXECUTOR_POOL_SIZE,
+    },
     remote::RemoteNodeExecutor,
     NodeActions,
     NodeExecutor,
@@ -154,6 +169,22 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
 ) -> anyhow::Result<LocalAppState> {
+    tracing::info!(
+        vertical_scaling_enabled = *VERTICAL_SCALING_ENABLED,
+        cpu_count = *VERTICAL_SCALING_CPU_COUNT,
+        reserved_cpu_count = *VERTICAL_SCALING_RESERVED_CPU_COUNT,
+        active_v8_cpu_limit = *FUNRUN_ISOLATE_ACTIVE_THREADS,
+        transaction_isolate_workers = *MAX_TRANSACTION_ISOLATE_WORKERS,
+        action_isolate_workers = *MAX_ACTION_ISOLATE_WORKERS,
+        max_concurrent_queries = *APPLICATION_MAX_CONCURRENT_QUERIES,
+        max_concurrent_mutations = *APPLICATION_MAX_CONCURRENT_MUTATIONS,
+        max_concurrent_v8_actions = *APPLICATION_MAX_CONCURRENT_V8_ACTIONS,
+        max_concurrent_node_actions = *APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
+        max_concurrent_persistence_writes = *COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES,
+        postgres_max_connections = *POSTGRES_MAX_CONNECTIONS,
+        local_node_executor_processes = *LOCAL_NODE_EXECUTOR_POOL_SIZE,
+        "Resolved single-host execution capacity"
+    );
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
     let searcher: Arc<dyn Searcher> = in_process_searcher.clone();

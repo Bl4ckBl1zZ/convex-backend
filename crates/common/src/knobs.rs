@@ -49,6 +49,93 @@ fn prod_override<T>(local_value: T, prod_value: T) -> T {
     local_value
 }
 
+/// Enables hardware-aware defaults for a vertically scaled, single-backend
+/// deployment. Every derived value can still be overridden by its existing
+/// environment variable.
+pub static VERTICAL_SCALING_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("VERTICAL_SCALING_ENABLED", false));
+
+/// CPU parallelism used to derive vertical-scaling defaults. Zero selects the
+/// parallelism visible to the process, including container CPU constraints.
+pub static VERTICAL_SCALING_CPU_COUNT: LazyLock<usize> = LazyLock::new(|| {
+    let configured = env_config("VERTICAL_SCALING_CPU_COUNT", 0_usize);
+    if configured > 0 {
+        configured
+    } else {
+        std::thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(1)
+    }
+});
+
+/// CPU cores reserved for the async runtime, the committer, persistence, and
+/// background maintenance when vertical scaling is enabled. Zero selects one
+/// eighth of visible CPUs, with one core reserved on machines with >1 CPU.
+pub static VERTICAL_SCALING_RESERVED_CPU_COUNT: LazyLock<usize> = LazyLock::new(|| {
+    let configured = env_config("VERTICAL_SCALING_RESERVED_CPU_COUNT", 0_usize);
+    if configured > 0 {
+        configured.min(VERTICAL_SCALING_CPU_COUNT.saturating_sub(1))
+    } else if *VERTICAL_SCALING_CPU_COUNT > 1 {
+        (*VERTICAL_SCALING_CPU_COUNT / 8)
+            .max(1)
+            .min(VERTICAL_SCALING_CPU_COUNT.saturating_sub(1))
+    } else {
+        0
+    }
+});
+
+fn vertical_scaling_default(
+    compatibility_default: usize,
+    per_cpu: usize,
+    minimum: usize,
+    maximum: usize,
+) -> usize {
+    calculate_vertical_scaling_default(
+        *VERTICAL_SCALING_ENABLED,
+        *VERTICAL_SCALING_CPU_COUNT,
+        *VERTICAL_SCALING_RESERVED_CPU_COUNT,
+        compatibility_default,
+        per_cpu,
+        minimum,
+        maximum,
+    )
+}
+
+fn calculate_vertical_scaling_default(
+    enabled: bool,
+    cpu_count: usize,
+    reserved_cpu_count: usize,
+    compatibility_default: usize,
+    per_cpu: usize,
+    minimum: usize,
+    maximum: usize,
+) -> usize {
+    if !enabled {
+        return compatibility_default;
+    }
+    cpu_count
+        .saturating_sub(reserved_cpu_count)
+        .max(1)
+        .saturating_mul(per_cpu)
+        .clamp(minimum, maximum)
+}
+
+fn calculate_commit_persistence_default(
+    enabled: bool,
+    cpu_count: usize,
+    reserved_cpu_count: usize,
+    postgres_max_connections: usize,
+) -> usize {
+    if !enabled {
+        return 128;
+    }
+    // Keep a meaningful portion of the PostgreSQL pool available for queries,
+    // subscriptions, index workers, and administration.
+    calculate_vertical_scaling_default(true, cpu_count, reserved_cpu_count, 128, 4, 8, 64)
+        .min(postgres_max_connections.saturating_sub(16).max(1))
+        .min(40)
+}
+
 /// Set a consistent thread stack size regardless of environment. This is
 /// 2x Rust's default: https://doc.rust-lang.org/nightly/std/thread/index.html#stack-size
 pub static RUNTIME_STACK_SIZE: LazyLock<usize> =
@@ -883,6 +970,29 @@ pub static ISOLATE_QUEUE_SIZE: LazyLock<usize> =
 pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_ISOLATE_WORKERS", 300));
 
+/// Maximum number of isolate workers dedicated to queries, mutations, and
+/// deployment analysis. This pool is isolated from long-lived actions.
+pub static MAX_TRANSACTION_ISOLATE_WORKERS: LazyLock<usize> = LazyLock::new(|| {
+    let compatibility_default = (*MAX_ISOLATE_WORKERS * 2 / 5).max(1);
+    env_config(
+        "MAX_TRANSACTION_ISOLATE_WORKERS",
+        vertical_scaling_default(compatibility_default, 4, 32, 256),
+    )
+    .max(1)
+});
+
+/// Maximum number of isolate workers dedicated to V8 and HTTP actions. This
+/// keeps long-lived or I/O-heavy actions from consuming query workers.
+pub static MAX_ACTION_ISOLATE_WORKERS: LazyLock<usize> = LazyLock::new(|| {
+    let compatibility_default =
+        MAX_ISOLATE_WORKERS.saturating_sub(*MAX_TRANSACTION_ISOLATE_WORKERS);
+    env_config(
+        "MAX_ACTION_ISOLATE_WORKERS",
+        vertical_scaling_default(compatibility_default.max(1), 8, 64, 512),
+    )
+    .max(1)
+});
+
 /// The size of the pending commits in the committer queue. This is a FIFO
 /// queue, so if the queue is too large, we run into a risk of all requests
 /// waiting too long and no requests going through during overload. The size of
@@ -891,6 +1001,19 @@ pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
 /// in any process.
 pub static COMMITTER_QUEUE_SIZE: LazyLock<usize> =
     LazyLock::new(|| env_config("COMMITTER_QUEUE_SIZE", 128));
+
+/// Maximum number of commit writes concurrently using persistence connections.
+/// Validation and publication stay ordered; this only bounds parallel database
+/// I/O so a mutation burst leaves connections available for reads.
+pub static COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES: LazyLock<usize> = LazyLock::new(|| {
+    let default = calculate_commit_persistence_default(
+        *VERTICAL_SCALING_ENABLED,
+        *VERTICAL_SCALING_CPU_COUNT,
+        *VERTICAL_SCALING_RESERVED_CPU_COUNT,
+        *POSTGRES_MAX_CONNECTIONS,
+    );
+    env_config("COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES", default).max(1)
+});
 
 /// 0 -> default (number of cores)
 pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS", 0));
@@ -961,7 +1084,7 @@ pub static DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY: usize = 16;
 pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|| {
     env_config(
         "APPLICATION_MAX_CONCURRENT_QUERIES",
-        DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
+        vertical_scaling_default(DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY, 4, 16, 512),
     )
 });
 
@@ -974,7 +1097,7 @@ pub static APPLICATION_MAX_CONCURRENT_QUERIES: LazyLock<usize> = LazyLock::new(|
 pub static APPLICATION_MAX_CONCURRENT_MUTATIONS: LazyLock<usize> = LazyLock::new(|| {
     env_config(
         "APPLICATION_MAX_CONCURRENT_MUTATIONS",
-        DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY,
+        vertical_scaling_default(DEFAULT_APPLICATION_MAX_FUNCTION_CONCURRENCY, 2, 16, 256),
     )
 });
 
@@ -989,8 +1112,12 @@ pub static APPLICATION_MAX_CONCURRENT_MUTATIONS: LazyLock<usize> = LazyLock::new
 /// knob.
 ///
 /// The value here may be overridden by big brain.
-pub static APPLICATION_MAX_CONCURRENT_V8_ACTIONS: LazyLock<usize> =
-    LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_V8_ACTIONS", 64));
+pub static APPLICATION_MAX_CONCURRENT_V8_ACTIONS: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "APPLICATION_MAX_CONCURRENT_V8_ACTIONS",
+        vertical_scaling_default(64, 8, 64, 1024),
+    )
+});
 
 /// The maximum number of node actions that can be run concurrently by an
 /// application
@@ -1001,8 +1128,12 @@ pub static APPLICATION_MAX_CONCURRENT_V8_ACTIONS: LazyLock<usize> =
 /// limit, we'll see 429 error responses for node actions.
 ///
 /// The value here may be overridden by big brain.
-pub static APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: LazyLock<usize> =
-    LazyLock::new(|| env_config("APPLICATION_MAX_CONCURRENT_NODE_ACTIONS", 64));
+pub static APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "APPLICATION_MAX_CONCURRENT_NODE_ACTIONS",
+        vertical_scaling_default(64, 8, 64, 1024),
+    )
+});
 
 /// The maximum number of concurrent package uploads during
 /// `/api/deploy2/start_push` + `/api/deploy2/evaluate_push`.
@@ -1287,8 +1418,18 @@ pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
 
 /// The maximum number of CPU cores that can be used simultaneously by the
 /// isolates. Zero means no limit.
-pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> =
-    LazyLock::new(|| env_config("FUNRUN_ISOLATE_ACTIVE_THREADS", 0));
+pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "FUNRUN_ISOLATE_ACTIVE_THREADS",
+        if *VERTICAL_SCALING_ENABLED {
+            VERTICAL_SCALING_CPU_COUNT
+                .saturating_sub(*VERTICAL_SCALING_RESERVED_CPU_COUNT)
+                .max(1)
+        } else {
+            0
+        },
+    )
+});
 
 /// The maximum length of time to wait to start running a function (when the
 /// FUNRUN_ISOLATE_ACTIVE_THREADS limit is reached).
@@ -1913,3 +2054,47 @@ pub static INITIAL_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::ne
 pub static MAX_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_millis(env_config("MAX_PERSISTENCE_WRITES_BACKOFF_MS", 10 * 1000))
 });
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        calculate_commit_persistence_default,
+        calculate_vertical_scaling_default,
+    };
+
+    #[test]
+    fn vertical_scaling_defaults_preserve_compatibility_when_disabled() {
+        assert_eq!(
+            calculate_vertical_scaling_default(false, 64, 8, 16, 4, 16, 512),
+            16
+        );
+    }
+
+    #[test]
+    fn vertical_scaling_defaults_use_available_application_cpus() {
+        assert_eq!(
+            calculate_vertical_scaling_default(true, 10, 1, 16, 4, 16, 512),
+            36
+        );
+    }
+
+    #[test]
+    fn vertical_scaling_defaults_enforce_bounds() {
+        assert_eq!(
+            calculate_vertical_scaling_default(true, 1, 0, 16, 2, 16, 256),
+            16
+        );
+        assert_eq!(
+            calculate_vertical_scaling_default(true, 512, 1, 64, 8, 64, 1024),
+            1024
+        );
+    }
+
+    #[test]
+    fn commit_persistence_keeps_postgres_connections_available() {
+        assert_eq!(calculate_commit_persistence_default(true, 10, 1, 64), 36);
+        assert_eq!(calculate_commit_persistence_default(true, 64, 8, 64), 40);
+        assert_eq!(calculate_commit_persistence_default(true, 8, 1, 24), 8);
+        assert_eq!(calculate_commit_persistence_default(false, 64, 8, 24), 128);
+    }
+}

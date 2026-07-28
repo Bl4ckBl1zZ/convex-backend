@@ -208,7 +208,6 @@ impl IsolateConfig {
             limiter,
         }
     }
-
 }
 
 pub struct UdfRequest<RT: Runtime> {
@@ -583,17 +582,44 @@ impl<RT: Runtime> IsolateClient<RT> {
         max_isolate_workers: usize,
         isolate_config: Option<IsolateConfig>,
     ) -> anyhow::Result<Self> {
-        let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
-            ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
-        } else {
-            ConcurrencyLimiter::unlimited()
-        };
-        let concurrency_logger = rt.spawn(
-            "concurrency_logger",
-            concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
-        );
+        let concurrency_limiter = isolate_config
+            .as_ref()
+            .map(|config| config.limiter.clone())
+            .unwrap_or_else(|| {
+                if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
+                    ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
+                } else {
+                    ConcurrencyLimiter::unlimited()
+                }
+            });
         let isolate_config =
             isolate_config.unwrap_or(IsolateConfig::new("funrun", concurrency_limiter.clone()));
+        Self::new_with_shared_limiter(
+            rt,
+            max_percent_per_client,
+            max_isolate_workers,
+            isolate_config,
+            true,
+        )
+    }
+
+    /// Creates an isolate worker pool that shares a CPU concurrency limiter
+    /// with other pools. Exactly one pool sharing a limiter should set
+    /// `start_concurrency_logger` so permit metrics are not duplicated.
+    pub fn new_with_shared_limiter(
+        rt: RT,
+        max_percent_per_client: usize,
+        max_isolate_workers: usize,
+        isolate_config: IsolateConfig,
+        start_concurrency_logger: bool,
+    ) -> anyhow::Result<Self> {
+        let concurrency_limiter = isolate_config.limiter.clone();
+        let concurrency_logger = start_concurrency_logger.then(|| {
+            rt.spawn(
+                "concurrency_logger",
+                concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
+            )
+        });
 
         initialize_v8();
         // NB: We don't call V8::Dispose or V8::ShutdownPlatform since we just assume a
@@ -625,7 +651,7 @@ impl<RT: Runtime> IsolateClient<RT> {
             rt,
             sender,
             scheduler: Arc::new(Mutex::new(Some(scheduler))),
-            concurrency_logger: Arc::new(Mutex::new(Some(concurrency_logger))),
+            concurrency_logger: Arc::new(Mutex::new(concurrency_logger)),
             handles,
             concurrency_limiter,
             active_workers,

@@ -23,6 +23,11 @@ pool or the new HTTP, search, and storage wiring. The bundled PostgreSQL
 credentials are for local development; replace them or use a managed database
 for a production deployment.
 
+For a large single host, start with the hardware-aware capacity plan in
+[vertical-scaling.md](./vertical-scaling.md). It separates transactional and
+action isolate pools, gives them a shared CPU budget, and bounds parallel
+commit I/O independently from PostgreSQL read capacity.
+
 ## PostgreSQL first
 
 Use PostgreSQL rather than SQLite for sustained concurrent writes. SQLite uses a
@@ -55,8 +60,9 @@ Function permits are separate:
 - `APPLICATION_MAX_CONCURRENT_V8_ACTIONS`
 - `APPLICATION_MAX_CONCURRENT_NODE_ACTIONS`
 
-Docker defaults to 16 queries, 16 mutations, 64 V8 actions, and 64 Node actions.
-Test 16, 32, and 64 for the relevant function type. More permits can reduce
+The compatibility defaults are 16 queries, 16 mutations, 64 V8 actions, and 64
+Node actions. With vertical scaling enabled, Docker derives these values from
+visible CPUs instead of forcing those defaults. More permits can reduce
 throughput and increase tail latency once CPU, search indexing, or the database
 is saturated.
 
@@ -64,8 +70,8 @@ is saturated.
 
 `LOCAL_NODE_EXECUTOR_POOL_SIZE` controls the number of lazy local Node.js
 executor processes. Requests are sent to the least-busy process, with
-round-robin tie breaking. Docker defaults to two processes; the Rust default is
-one for compatibility outside Docker.
+round-robin tie breaking. Vertical mode derives one process per four visible
+CPUs, rounded up and capped at 16. Compatibility mode defaults to one.
 
 Cold concurrent requests are deduplicated by source-package key while each
 process downloads and links a deployment. This avoids multiple first requests

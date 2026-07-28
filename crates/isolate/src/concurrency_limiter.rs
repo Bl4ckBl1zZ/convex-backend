@@ -193,3 +193,37 @@ impl SuspendedPermit {
         self.limiter.acquire(self.client_id).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::Arc,
+        time::Duration,
+    };
+
+    use super::ConcurrencyLimiter;
+
+    #[tokio::test]
+    async fn cloned_limiters_share_cpu_capacity() {
+        let transaction_pool = ConcurrencyLimiter::new(1);
+        let action_pool = transaction_pool.clone();
+        let transaction_permit = transaction_pool
+            .acquire(Arc::new("transaction".to_owned()))
+            .await;
+
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            action_pool.acquire(Arc::new("action".to_owned())),
+        )
+        .await
+        .is_err());
+
+        drop(transaction_permit);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            action_pool.acquire(Arc::new("action".to_owned())),
+        )
+        .await
+        .expect("action pool should use CPU capacity released by transaction pool");
+    }
+}
