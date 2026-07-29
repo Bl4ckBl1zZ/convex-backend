@@ -5713,6 +5713,9 @@ importers:
 
   ../../scenario-runner:
     dependencies:
+      '@convex-dev/workflow':
+        specifier: ^0.3.3
+        version: 0.3.3(@convex-dev/workpool@0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76))(convex@..+convex))(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76))(convex@..+convex)
       '@langchain/core':
         specifier: ^0.3.80
         version: 0.3.80(@opentelemetry/api@1.9.0)(@opentelemetry/sdk-trace-base@2.2.0(@opentelemetry/api@1.9.0))(openai@6.10.0(ws@8.21.0(bufferutil@4.0.9))(zod@3.25.76))(ws@8.21.0(bufferutil@4.0.9))
@@ -31043,12 +31046,24 @@ snapshots:
       handlebars: 4.7.9
       typedoc: 0.24.8(typescript@5.0.4)
 
+  '@convex-dev/workflow@0.3.3(@convex-dev/workpool@0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76))(convex@..+convex))(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76))(convex@..+convex)':
+    dependencies:
+      '@convex-dev/workpool': 0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76))(convex@..+convex)
+      async-channel: 0.2.0
+      convex: link:../../convex
+      convex-helpers: 0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76)
+
   '@convex-dev/workflow@0.3.3(@convex-dev/workpool@0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@19.2.4)(typescript@5.9.3)(zod@4.4.3))(convex@..+convex))(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@19.2.4)(typescript@5.9.3)(zod@4.4.3))(convex@..+convex)':
     dependencies:
       '@convex-dev/workpool': 0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@19.2.4)(typescript@5.9.3)(zod@4.4.3))(convex@..+convex)
       async-channel: 0.2.0
       convex: link:../../convex
       convex-helpers: 0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@19.2.4)(typescript@5.9.3)(zod@4.4.3)
+
+  '@convex-dev/workpool@0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76))(convex@..+convex)':
+    dependencies:
+      convex: link:../../convex
+      convex-helpers: 0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76)
 
   '@convex-dev/workpool@0.3.0(convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@19.2.4)(typescript@5.9.3)(zod@4.4.3))(convex@..+convex)':
     dependencies:
@@ -43409,6 +43424,16 @@ snapshots:
   convex-ents@0.20.0(convex@..+convex):
     dependencies:
       convex: link:../../convex
+
+  convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@3.25.76):
+    dependencies:
+      convex: link:../../convex
+    optionalDependencies:
+      '@standard-schema/spec': 1.1.0
+      hono: 4.12.26
+      react: 18.3.1
+      typescript: 5.0.4
+      zod: 3.25.76
 
   convex-helpers@0.1.105(@standard-schema/spec@1.1.0)(convex@..+convex)(hono@4.12.26)(react@18.3.1)(typescript@5.0.4)(zod@4.4.3):
     dependencies:
