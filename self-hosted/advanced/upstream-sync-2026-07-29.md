@@ -135,5 +135,12 @@ Completed locally:
 The full local Docker image build could not start because Docker Desktop's
 engine API socket stopped responding. Both the CLI and the supported Desktop
 restart action failed to recover the local daemon. This is an environment
-failure after source/Compose validation, so the integration branch's GitHub CI
-is the image-build gate.
+failure after source/Compose validation. The integration branch's GitHub CI
+therefore repeats the backend crate checks, strict Clippy pass, fork regression
+tests, JavaScript build, and repository-wide formatting check.
+
+Upstream's backend workflow targeted Convex's private
+`self-hosted, aws, x64, xlarge` runners. This fork has no runner with those
+labels, so the job could never start. The merged workflow uses a bounded
+GitHub-hosted Ubuntu job and falls back to local sccache when Convex's private
+R2 credentials are unavailable.

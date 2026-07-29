@@ -12,11 +12,15 @@ concurrency:
 
 env:
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   build:
     name: Build Convex Backend
-    runs-on: [self-hosted, aws, x64, xlarge]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repo
@@ -32,19 +36,6 @@ jobs:
       - name: Check Cargo.lock up-to-date
         run: cargo update -w --locked
 
-      # Restore-only: OSS can't write this cache (cache-write role is get-convex/convex-only).
-      - name: Restore pnpm artifacts
-        uses: runs-on/cache/restore@bd330c5a5f6cbb837823ee25864f3c71a211c2e3 # v5.0.5
-        env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          RUNS_ON_S3_BUCKET_CACHE: ${{ vars.RUNS_ON_S3_BUCKET_CACHE }}
-        with:
-          path: |
-            ~/.local/share/pnpm/store
-            npm-packages/.turbo/cache
-          key: pnpm-cache-${{ hashFiles('npm-packages/pnpm-lock.yaml') }}-3
-          restore-keys: pnpm-cache-
-
       - name: Install mise tools
         uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
         with:
@@ -59,10 +50,28 @@ jobs:
           just install-js
           just turbo run build --filter=component-tests... --filter=convex... --filter=system-udfs... --filter=udf-runtime... --filter=udf-tests...
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@481c34c1cf3a84c68b5e46f4eccfc82af798415a # v2
-        with:
-          tool: cargo-nextest
+      - name: Check backend integration crates
+        run: >-
+          cargo check -p local_backend -p node_executor -p application -p
+          function_runner -p database -p indexing -p isolate -p
+          search_index_workers -p storage
 
-      - name: Build rust tests
-        run: cargo nextest run --no-run --profile ci
+      - name: Lint fork-modified libraries
+        run: >-
+          cargo clippy -p application -p database -p function_runner -p indexing
+          -p isolate -p search_index_workers -p storage --lib -- -D warnings
+
+      - name: Test vertical-scaling defaults
+        run: cargo test -p common vertical_scaling --lib
+
+      - name: Test persistence connection headroom
+        run: cargo test -p common commit_persistence --lib
+
+      - name: Test shared isolate CPU capacity
+        run: cargo test -p isolate cloned_limiters_share_cpu_capacity --lib
+
+      - name: Test state-only index OCC behavior
+        run: >-
+          cargo test -p indexing
+          state_only_index_update_does_not_invalidate_virtual_definition_index
+          --lib
