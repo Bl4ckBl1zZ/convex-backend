@@ -213,7 +213,7 @@ impl<RT: Runtime> IndexWorker<RT> {
             }
         }
         log_num_indexes_to_backfill(num_to_backfill);
-        tracing::info!(
+        tracing::debug!(
             "{num_to_backfill} database indexes to backfill @ {}",
             tx.begin_timestamp()
         );
@@ -319,7 +319,7 @@ impl<RT: Runtime> IndexWorker<RT> {
             }
             // Alternatively, wait for invalidation
             ts = subscription_fut.fuse() => {
-                tracing::info!("Index backfill worker got invalidation at {ts:?}");
+                tracing::debug!("Index backfill worker got invalidation at {ts:?}");
                 self.backoff.reset();
             }
         }

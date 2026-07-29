@@ -291,8 +291,8 @@ impl IndexRegistry {
     pub fn document_index_keys<F>(
         &self,
         id: ResolvedDocumentId,
-        old_document: Option<PackedDocument>,
-        new_document: Option<PackedDocument>,
+        old_document: Option<&PackedDocument>,
+        new_document: Option<&PackedDocument>,
         search_tokenizer: F,
     ) -> DocumentIndexKeys
     where
@@ -303,8 +303,8 @@ impl IndexRegistry {
             .filter_map(|index| {
                 let update = Self::index_keys_for_index(
                     index,
-                    old_document.as_ref(),
-                    new_document.as_ref(),
+                    old_document,
+                    new_document,
                     &search_tokenizer,
                 )?;
                 Some((
@@ -312,7 +312,7 @@ impl IndexRegistry {
                     IndexUpdate {
                         document_id: id,
                         update,
-                        new_document: new_document.clone(),
+                        new_document: new_document.cloned(),
                     },
                 ))
             })
@@ -324,7 +324,7 @@ impl IndexRegistry {
             )
             .expect("invalid built-in index name");
 
-            let definition_unchanged = match (&old_document, &new_document) {
+            let definition_unchanged = match (old_document, new_document) {
                 (Some(old_document), Some(new_document)) => {
                     match (
                         TabletIndexMetadata::from_document(old_document.unpack()),
@@ -349,10 +349,8 @@ impl IndexRegistry {
             // writes on the indexed table.
             if !definition_unchanged {
                 let old_key = old_document
-                    .as_ref()
                     .map(|doc| doc.index_key_bytes(slice::from_ref(&*TABLE_ID_FIELD_PATH)));
                 let new_key = new_document
-                    .as_ref()
                     .map(|doc| doc.index_key_bytes(slice::from_ref(&*TABLE_ID_FIELD_PATH)));
 
                 map.insert(
@@ -363,7 +361,7 @@ impl IndexRegistry {
                             old: old_key,
                             new: new_key,
                         }),
-                        new_document,
+                        new_document: new_document.cloned(),
                     },
                 );
             }
@@ -864,19 +862,22 @@ mod tests {
             INDEX_BY_TABLE_ID_VIRTUAL_INDEX_DESCRIPTOR.clone(),
         )
         .unwrap();
+        let old_packed = PackedDocument::pack(&old_document);
+        let state_only_packed = PackedDocument::pack(&state_only_document);
+        let changed_spec_packed = PackedDocument::pack(&changed_spec_document);
 
         let state_only_keys = registry.document_index_keys(
             index_document_id,
-            Some(PackedDocument::pack(&old_document)),
-            Some(PackedDocument::pack(&state_only_document)),
+            Some(&old_packed),
+            Some(&state_only_packed),
             |_| unreachable!(),
         );
         assert!(!state_only_keys.0.contains_key(&virtual_name));
 
         let changed_spec_keys = registry.document_index_keys(
             index_document_id,
-            Some(PackedDocument::pack(&old_document)),
-            Some(PackedDocument::pack(&changed_spec_document)),
+            Some(&old_packed),
+            Some(&changed_spec_packed),
             |_| unreachable!(),
         );
         assert!(changed_spec_keys.0.contains_key(&virtual_name));
