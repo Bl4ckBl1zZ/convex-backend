@@ -33,6 +33,9 @@ jobs:
           r2-access-key: ${{ secrets.R2_ACCESS_KEY_ID }}
           r2-secret-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
+      - name: Install Clippy for the pinned nightly toolchain
+        run: rustup component add clippy
+
       - name: Install mise tools
         uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
         with:
