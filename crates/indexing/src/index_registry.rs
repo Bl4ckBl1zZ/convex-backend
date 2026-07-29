@@ -324,24 +324,49 @@ impl IndexRegistry {
             )
             .expect("invalid built-in index name");
 
-            let old_key = old_document
-                .as_ref()
-                .map(|doc| doc.index_key_bytes(slice::from_ref(&*TABLE_ID_FIELD_PATH)));
-            let new_key = new_document
-                .as_ref()
-                .map(|doc| doc.index_key_bytes(slice::from_ref(&*TABLE_ID_FIELD_PATH)));
-
-            map.insert(
-                index_name,
-                IndexUpdate {
-                    document_id: id,
-                    update: IndexKeyUpdate::Database(Update {
-                        old: old_key,
-                        new: new_key,
-                    }),
-                    new_document,
+            let definition_unchanged = match (&old_document, &new_document) {
+                (Some(old_document), Some(new_document)) => {
+                    match (
+                        TabletIndexMetadata::from_document(old_document.unpack()),
+                        TabletIndexMetadata::from_document(new_document.unpack()),
+                    ) {
+                        (Ok(old_metadata), Ok(new_metadata)) => {
+                            old_metadata.name == new_metadata.name
+                                && old_metadata.config.same_spec(&new_metadata.config)
+                        },
+                        // Invalid metadata is rejected elsewhere. Keep the
+                        // conservative invalidation if it reaches this layer.
+                        _ => false,
+                    }
                 },
-            );
+                _ => false,
+            };
+
+            // `_index.by_table_id` is a virtual OCC index used by user-table
+            // writes to ensure that the set and specification of indexes stay
+            // stable. Mutable search/backfill checkpoints do not change that
+            // contract, so publishing them must not abort unrelated data
+            // writes on the indexed table.
+            if !definition_unchanged {
+                let old_key = old_document
+                    .as_ref()
+                    .map(|doc| doc.index_key_bytes(slice::from_ref(&*TABLE_ID_FIELD_PATH)));
+                let new_key = new_document
+                    .as_ref()
+                    .map(|doc| doc.index_key_bytes(slice::from_ref(&*TABLE_ID_FIELD_PATH)));
+
+                map.insert(
+                    index_name,
+                    IndexUpdate {
+                        document_id: id,
+                        update: IndexKeyUpdate::Database(Update {
+                            old: old_key,
+                            new: new_key,
+                        }),
+                        new_document,
+                    },
+                );
+            }
         }
         DocumentIndexKeys(map)
     }
@@ -721,7 +746,141 @@ impl IndexRegistry {
             .map(|(_name, index)| index.id())
             .collect()
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use common::{
+        bootstrap_model::index::{
+            database_index::IndexedFields,
+            IndexMetadata,
+            INDEX_BY_TABLE_ID_VIRTUAL_INDEX_DESCRIPTOR,
+            INDEX_TABLE,
+        },
+        document::{
+            CreationTime,
+            PackedDocument,
+            ResolvedDocument,
+        },
+        types::{
+            GenericIndexName,
+            IndexDescriptor,
+            TableName,
+            Timestamp,
+        },
+    };
+    use value::{
+        DeveloperDocumentId,
+        InternalId,
+        ResolvedDocumentId,
+        TableMapping,
+        TableNamespace,
+        TableNumber,
+        TabletId,
+    };
+
+    use super::IndexRegistry;
+
+    #[test]
+    fn state_only_index_update_does_not_invalidate_virtual_definition_index() {
+        let index_tablet = TabletId(InternalId([1; 16]));
+        let user_tablet = TabletId(InternalId([2; 16]));
+        let index_table_number = TableNumber::MIN;
+        let user_table_number = index_table_number.increment().unwrap();
+        let mut table_mapping = TableMapping::new();
+        table_mapping.insert(
+            index_tablet,
+            TableNamespace::Global,
+            index_table_number,
+            INDEX_TABLE.clone(),
+        );
+        let table: TableName = "messages".parse().unwrap();
+        table_mapping.insert(
+            user_tablet,
+            TableNamespace::Global,
+            user_table_number,
+            table,
+        );
+        let resolved_id = |last_byte: u8| {
+            let mut bytes = [0; 16];
+            bytes[15] = last_byte;
+            ResolvedDocumentId::new(
+                index_tablet,
+                DeveloperDocumentId::new(index_table_number, InternalId(bytes)),
+            )
+        };
+        let creation_time = CreationTime::try_from(1.0).unwrap();
+        let by_id_document = ResolvedDocument::new(
+            resolved_id(1),
+            creation_time,
+            IndexMetadata::new_enabled(
+                GenericIndexName::by_id(index_tablet),
+                IndexedFields::by_id(),
+            )
+            .try_into()
+            .unwrap(),
+        )
+        .unwrap();
+
+        let index_name =
+            GenericIndexName::new(user_tablet, IndexDescriptor::new("by_channel").unwrap())
+                .unwrap();
+        let index_document_id = resolved_id(2);
+        let old_document = ResolvedDocument::new(
+            index_document_id,
+            creation_time,
+            IndexMetadata::new_backfilling(
+                Timestamp::MIN,
+                index_name.clone(),
+                IndexedFields::by_id(),
+            )
+            .try_into()
+            .unwrap(),
+        )
+        .unwrap();
+        let state_only_document = ResolvedDocument::new(
+            index_document_id,
+            creation_time,
+            IndexMetadata::new_enabled(index_name.clone(), IndexedFields::by_id())
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let changed_spec_document = ResolvedDocument::new(
+            index_document_id,
+            creation_time,
+            IndexMetadata::new_enabled(index_name, IndexedFields::creation_time())
+                .try_into()
+                .unwrap(),
+        )
+        .unwrap();
+        let registry = IndexRegistry::bootstrap(
+            &table_mapping,
+            [&by_id_document, &old_document].iter().copied(),
+        )
+        .unwrap();
+        let virtual_name = GenericIndexName::new(
+            index_tablet,
+            INDEX_BY_TABLE_ID_VIRTUAL_INDEX_DESCRIPTOR.clone(),
+        )
+        .unwrap();
+
+        let state_only_keys = registry.document_index_keys(
+            index_document_id,
+            Some(PackedDocument::pack(&old_document)),
+            Some(PackedDocument::pack(&state_only_document)),
+            |_| unreachable!(),
+        );
+        assert!(!state_only_keys.0.contains_key(&virtual_name));
+
+        let changed_spec_keys = registry.document_index_keys(
+            index_document_id,
+            Some(PackedDocument::pack(&old_document)),
+            Some(PackedDocument::pack(&changed_spec_document)),
+            |_| unreachable!(),
+        );
+        assert!(changed_spec_keys.0.contains_key(&virtual_name));
+    }
 }
 
 pub trait IndexedDocument {

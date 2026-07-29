@@ -66,6 +66,7 @@ use crate::{
         vector_prefetch_timer,
         SearchType,
     },
+    searcher::MAX_CONCURRENT_SEGMENT_FETCHES,
     SearchFileType,
 };
 
@@ -111,7 +112,7 @@ impl<RT: Runtime> FragmentedSegmentFetcher<RT> {
         }))
         // Limit the parallel downloads a bit, we don't want to start and finish all downloads at
         // the same time. We want to be downloading and working with segments concurrently.
-        .buffer_unordered(4)
+        .buffer_unordered(*MAX_CONCURRENT_SEGMENT_FETCHES)
     }
 
     /// Fetch all parts of an individual fragmented segment.
@@ -399,18 +400,28 @@ impl<RT: Runtime> FragmentedSegmentPrefetcher<RT> {
                     let fetcher = fetcher.clone();
                     let metric_labels = metric_labels.clone();
                     async move {
-                        for fragment in fragments {
-                            let timer = vector_prefetch_timer();
-                            fetcher
-                                .fetch_fragmented_segment(
-                                    search_storage.clone(),
-                                    fragment,
-                                    metric_labels.clone(),
-                                )
-                                .await?;
-                            timer.finish();
-                        }
-                        Ok(())
+                        stream::iter(fragments)
+                            .map(|fragment| {
+                                let fetcher = fetcher.clone();
+                                let search_storage = search_storage.clone();
+                                let metric_labels = metric_labels.clone();
+                                async move {
+                                    let timer = vector_prefetch_timer();
+                                    fetcher
+                                        .fetch_fragmented_segment(
+                                            search_storage,
+                                            fragment,
+                                            metric_labels,
+                                        )
+                                        .await?;
+                                    timer.finish();
+                                    anyhow::Ok(())
+                                }
+                            })
+                            .buffer_unordered(*MAX_CONCURRENT_SEGMENT_FETCHES)
+                            .try_collect::<Vec<_>>()
+                            .await?;
+                        anyhow::Ok(())
                     }
                 },
             )

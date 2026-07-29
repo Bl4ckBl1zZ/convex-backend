@@ -9,6 +9,7 @@ use common::{
         MAX_COMPACTION_SEGMENTS,
         MAX_SEGMENT_DELETED_PERCENTAGE,
         MIN_COMPACTION_SEGMENTS,
+        SEARCH_INDEX_COMPACTION_CONCURRENCY,
         SEARCH_WORKER_PASSIVE_PAGES_PER_SECOND,
         SEGMENT_MAX_SIZE_BYTES,
         VECTOR_INDEX_SIZE_HARD_LIMIT,
@@ -20,6 +21,11 @@ use database::{
     Database,
     IndexModel,
     Token,
+};
+use futures::{
+    stream,
+    StreamExt,
+    TryStreamExt,
 };
 use itertools::Itertools;
 use keybroker::Identity;
@@ -82,8 +88,6 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexCompactor<RT, T> {
     }
 
     pub(crate) async fn step(&self) -> anyhow::Result<(BTreeMap<TabletIndexName, u64>, Token)> {
-        let mut metrics = BTreeMap::new();
-
         let (to_build, token) = self.needs_compaction().await?;
         let num_to_build = to_build.len();
         if num_to_build > 0 {
@@ -96,13 +100,17 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexCompactor<RT, T> {
         let pause_client = self.database.runtime().pause_client();
         pause_client.wait(COMPACTION_RUNNING_LABEL).await;
 
-        for job in to_build {
-            task::consume_budget().await;
-
-            let index_name = job.index_name.clone();
-            let total_segments_compacted = self.build_one(job).await?;
-            metrics.insert(index_name, total_segments_compacted);
-        }
+        let results: Vec<_> = stream::iter(to_build)
+            .map(|job| async move {
+                task::consume_budget().await;
+                let index_name = job.index_name.clone();
+                let total_segments_compacted = self.build_one(job).await?;
+                anyhow::Ok((index_name, total_segments_compacted))
+            })
+            .buffer_unordered(*SEARCH_INDEX_COMPACTION_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let metrics = results.into_iter().collect();
 
         if num_to_build > 0 {
             tracing::info!(

@@ -145,6 +145,16 @@ pub static RUNTIME_STACK_SIZE: LazyLock<usize> =
 pub static RUNTIME_WORKER_THREADS: LazyLock<usize> =
     LazyLock::new(|| env_config("RUNTIME_WORKER_THREADS", 0));
 
+/// Concurrency used by shared helpers that join lightweight independent async
+/// tasks. The compatibility default preserves the upstream value of 20.
+pub static ASYNC_JOIN_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "ASYNC_JOIN_CONCURRENCY",
+        vertical_scaling_default(20, 4, 20, 128),
+    )
+    .max(1)
+});
+
 /// Disable the Tokio scheduler's LIFO slot optimization, which may
 /// help with tail latencies until they improve its implementation.
 /// See https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.disable_lifo_slot.
@@ -723,6 +733,37 @@ pub static INDEX_BACKFILL_CHUNK_SIZE: LazyLock<NonZeroU32> =
 pub static INDEX_BACKFILL_WORKERS: LazyLock<usize> =
     LazyLock::new(|| env_config("INDEX_BACKFILL_WORKERS", 4));
 
+/// Number of independent table scans used when loading database indexes into
+/// memory. Each scan uses persistence read capacity and builds separate index
+/// maps, so tables can be loaded concurrently without weakening index ordering.
+pub static IN_MEMORY_INDEX_LOAD_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "IN_MEMORY_INDEX_LOAD_CONCURRENCY",
+        vertical_scaling_default(1, 1, 1, 16),
+    )
+    .max(1)
+});
+
+/// Number of tables whose count and shape summaries can be rebuilt
+/// concurrently at a fixed repeatable snapshot.
+pub static TABLE_SUMMARY_SNAPSHOT_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "TABLE_SUMMARY_SNAPSHOT_CONCURRENCY",
+        vertical_scaling_default(1, 1, 1, 16),
+    )
+    .max(1)
+});
+
+/// Number of independent index range requests a single batched query may fetch
+/// concurrently before merging results in input order.
+pub static INDEX_RANGE_BATCH_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "INDEX_RANGE_BATCH_CONCURRENCY",
+        vertical_scaling_default(20, 4, 20, 128),
+    )
+    .max(1)
+});
+
 /// How often to persist index backfill progress updates.
 pub static INDEX_BACKFILL_PROGRESS_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config("INDEX_BACKFILL_PROGRESS_INTERVAL_SECONDS", 1))
@@ -1013,6 +1054,71 @@ pub static COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES: LazyLock<usize> = LazyLo
         *POSTGRES_MAX_CONNECTIONS,
     );
     env_config("COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES", default).max(1)
+});
+
+/// Number of independent search indexes a flusher may build concurrently.
+/// Segment creation is CPU and memory intensive, so the automatic value assumes
+/// roughly four application CPUs per build.
+pub static SEARCH_INDEX_BUILD_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "SEARCH_INDEX_BUILD_CONCURRENCY",
+        if *VERTICAL_SCALING_ENABLED {
+            VERTICAL_SCALING_CPU_COUNT
+                .saturating_sub(*VERTICAL_SCALING_RESERVED_CPU_COUNT)
+                .max(1)
+                .div_ceil(4)
+                .clamp(1, 4)
+        } else {
+            1
+        },
+    )
+    .max(1)
+});
+
+/// Number of independent search indexes whose segments may be compacted
+/// concurrently. Compactions of the same index remain serialized.
+pub static SEARCH_INDEX_COMPACTION_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "SEARCH_INDEX_COMPACTION_CONCURRENCY",
+        if *VERTICAL_SCALING_ENABLED {
+            VERTICAL_SCALING_CPU_COUNT
+                .saturating_sub(*VERTICAL_SCALING_RESERVED_CPU_COUNT)
+                .max(1)
+                .div_ceil(4)
+                .clamp(1, 8)
+        } else {
+            1
+        },
+    )
+    .max(1)
+});
+
+/// Blocking threads used to reconcile and commit search index metadata.
+pub static SEARCH_INDEX_WRITER_THREADS: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "SEARCH_INDEX_WRITER_THREADS",
+        if *VERTICAL_SCALING_ENABLED {
+            (*SEARCH_INDEX_BUILD_CONCURRENCY)
+                .max(*SEARCH_INDEX_COMPACTION_CONCURRENCY)
+                .clamp(1, 8)
+        } else {
+            1
+        },
+    )
+    .max(1)
+});
+
+/// Queue capacity for search index metadata writer CPU work.
+pub static SEARCH_INDEX_WRITER_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "SEARCH_INDEX_WRITER_QUEUE_SIZE",
+        if *VERTICAL_SCALING_ENABLED {
+            SEARCH_INDEX_WRITER_THREADS.saturating_mul(4)
+        } else {
+            2
+        },
+    )
+    .max(1)
 });
 
 /// 0 -> default (number of cores)
@@ -1416,8 +1522,12 @@ pub static SEARCHLIGHT_CLUSTER_NAME: LazyLock<String> = LazyLock::new(|| {
 pub static TICKETMASTER_CLUSTER_NAME: LazyLock<String> =
     LazyLock::new(|| env_config("TICKETMASTER_CLUSTER_NAME", String::from("ticketmaster")));
 
-/// The maximum number of CPU cores that can be used simultaneously by the
-/// isolates. Zero means no limit.
+/// The maximum number of runnable V8 isolate tasks. Zero means no limit.
+///
+/// The vertical default permits two runnable isolates per application CPU.
+/// A one-to-one limit underutilizes the host during V8/runtime transitions and
+/// regressed mutation throughput in local A/B tests; the request admission
+/// limits remain the outer workload-specific bounds.
 pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> = LazyLock::new(|| {
     env_config(
         "FUNRUN_ISOLATE_ACTIVE_THREADS",
@@ -1425,6 +1535,7 @@ pub static FUNRUN_ISOLATE_ACTIVE_THREADS: LazyLock<usize> = LazyLock::new(|| {
             VERTICAL_SCALING_CPU_COUNT
                 .saturating_sub(*VERTICAL_SCALING_RESERVED_CPU_COUNT)
                 .max(1)
+                .saturating_mul(2)
         } else {
             0
         },

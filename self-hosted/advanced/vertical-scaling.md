@@ -54,8 +54,9 @@ Queries, mutations, and deployment analysis have a dedicated isolate-worker
 pool. V8 and HTTP actions have a separate pool. Long-lived actions can no
 longer occupy all workers needed by latency-sensitive transactional functions.
 
-Both V8 pools share one CPU limiter. A pool may use all available V8 CPU when
-the other is idle, but mixed traffic cannot exceed the combined CPU budget.
+Both V8 pools share one runnable-isolate limiter. A pool may use the full
+budget when the other is idle, but mixed traffic cannot exceed the combined
+budget.
 V8 functions release a CPU permit while awaiting supported asynchronous
 operations, allowing useful I/O overlap without allowing unbounded JavaScript
 execution.
@@ -77,7 +78,7 @@ At least one application CPU is always retained. Defaults are bounded:
 
 | Setting | Derived default |
 | --- | ---: |
-| Active V8 CPU permits | `application_cpus` |
+| Runnable V8 isolate permits | `application_cpus * 2` |
 | Concurrent queries | `clamp(application_cpus * 4, 16, 512)` |
 | Concurrent mutations | `clamp(application_cpus * 2, 16, 256)` |
 | Concurrent V8 actions | `clamp(application_cpus * 8, 64, 1024)` |
@@ -93,8 +94,9 @@ the Tokio runtime, ordered commits, PostgreSQL communication, subscription
 processing, and background workers.
 
 For example, a 10-CPU container automatically resolves to 9 application CPUs,
-36 query slots, 18 mutation slots, 72 action slots, 36 transaction workers, 72
-action workers, 36 parallel persistence writes, and 3 local Node processes.
+18 runnable V8 permits, 36 query slots, 18 mutation slots, 72 action slots, 36
+transaction workers, 72 action workers, 36 parallel persistence writes, and 3
+local Node processes.
 
 ## Memory and PostgreSQL constraints
 
@@ -144,6 +146,10 @@ The startup capacity log reports the resolved execution limits, but it cannot
 infer memory bandwidth, storage IOPS, workload conflict rate, or PostgreSQL
 running on a separate machine. Those remain benchmark inputs.
 
+See [Parallel pipelines](parallel-pipelines.md) for the hardware-aware table
+scan and search-index stages, and for the audit of ordering that remains
+required for correctness.
+
 ## Tuning procedure
 
 1. Pin a CPU and memory limit on the backend container.
@@ -161,33 +167,40 @@ mutations still retry and all successful commits publish in timestamp order.
 
 ## Local A/B benchmark
 
-The first implementation benchmark used the same debug backend binary and
-PostgreSQL 17 database for both modes. The host exposed 10 CPUs, the client ran
-80 concurrent `ConvexHttpClient` loops, and every measured request completed
-without an error. PostgreSQL used a disposable tmpfs data directory to reduce
-unrelated disk variance.
+The final development benchmark used the same debug backend binary, PostgreSQL
+17 on a disposable tmpfs data directory, 10 visible CPUs, 80 concurrent
+`ConvexHttpClient` loops, a 10-second warmup, and no per-request info logging.
+Every measured request completed without a client error.
 
-Compatibility mode disabled automatic capacity sizing but retained the new
-transaction/action pool architecture. This comparison therefore measures the
-CPU-derived limits and bounded commit persistence; it is not an upstream-versus-
-fork comparison of action isolation.
+Compatibility mode disables automatic sizing but retains this fork's
+architecture and correctness fixes. The table therefore compares capacity
+plans, not upstream against the fork.
 
-| Workload | Mode | QPS | p50 | p95 | p99 | Errors |
+| Workload | Capacity plan | QPS | p50 | p95 | p99 | Errors |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Indexed query | Compatibility | 204.4 | 379.5 ms | 683.5 ms | 933.5 ms | 0 |
-| Indexed query | Vertical | 258.5 | 307.9 ms | 551.0 ms | 641.1 ms | 0 |
-| Insert mutation | Compatibility | 193.5 | 313.2 ms | 940.2 ms | 1145.4 ms | 0 |
-| Insert mutation | Vertical, trial 1 | 226.2 | 342.5 ms | 625.8 ms | 762.1 ms | 0 |
-| Insert mutation | Vertical, trial 2 | 206.3 | 357.2 ms | 729.1 ms | 918.7 ms | 0 |
+| Cache-bypassing indexed query | Compatibility, 16 query slots | 774.1 | 98.4 ms | 168.7 ms | 210.3 ms | 0 |
+| Cache-bypassing indexed query | Vertical, 36 query slots, 18 V8 permits | 669.2 | 113.4 ms | 206.7 ms | 266.1 ms | 0 |
+| Indexed insert mutation | Compatibility, 16 mutation slots | 475.6 | 159.1 ms | 259.7 ms | 357.7 ms | 0 |
+| Indexed insert mutation | Rejected one-per-CPU V8 policy | 422.9 | 179.0 ms | 300.4 ms | 384.7 ms | 0 |
+| Indexed insert mutation | Vertical, 18 mutation slots, 18 V8 permits | 452.2 | 168.7 ms | 275.2 ms | 357.9 ms | 0 |
 
-The indexed-query result improved throughput by 26.5%, p95 by 19.4%, and p99
-by 31.3%. The two vertical mutation trials averaged 216.2 QPS, 11.7% above
-compatibility mode. Their average p95 and p99 were 27.9% and 26.6% lower,
-respectively. Mutation p50 increased by 11.7% because the vertical plan admitted
-more simultaneous work; tune mutation admission downward if median latency is
-more important than throughput and tail latency.
+The one-per-application-CPU V8 policy underutilized the host, so the automatic
+default now allows two runnable isolates per application CPU. This recovered
+6.9% mutation throughput in the controlled policy comparison. The simple
+query and single-hot-table mutation samples still favor the lower compatibility
+admission limits. Extra capacity is useful for mixed and independent work, but
+it is not a universal throughput win when every request competes for the same
+CPU or commit stream.
 
-These are directional development results, not production capacity claims. A
-release build, persistent production-class storage, CPU and memory container
-limits, a steady database size, and mixed query/mutation/action traffic are
-required before selecting production values.
+The parallel-pipeline work targets multi-table bootstrap, multiple independent
+search indexes, deployment fan-out, and mixed query/action/mutation workloads.
+The single-table foreground benchmarks do not exercise most of those stages.
+They are included to prevent the defaults from being presented as automatically
+faster for every workload.
+
+These are directional debug-build results, not production capacity claims.
+Benchmark a release image, persistent production-class storage, fixed container
+CPU/memory limits, a steady database size, and the real traffic mix before
+selecting production values. If p95/p99 rises without a QPS gain, lower
+`APPLICATION_MAX_CONCURRENT_QUERIES` or
+`APPLICATION_MAX_CONCURRENT_MUTATIONS`.

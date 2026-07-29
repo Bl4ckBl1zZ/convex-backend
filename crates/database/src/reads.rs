@@ -6,7 +6,11 @@ use std::{
 
 use cmd_util::env::env_config;
 use common::{
-    bootstrap_model::index::database_index::IndexedFields,
+    bootstrap_model::index::{
+        database_index::IndexedFields,
+        TabletIndexMetadata,
+        INDEX_BY_TABLE_ID_VIRTUAL_INDEX_DESCRIPTOR,
+    },
     components::ComponentPath,
     document::{
         IndexKeyBuffer,
@@ -138,6 +142,15 @@ impl ReadSet {
         document: &PackedDocument,
         reusable_buffer: &mut IndexKeyBuffer,
     ) -> Option<ConflictingRead> {
+        self.overlaps_document_inner(document, reusable_buffer, false)
+    }
+
+    fn overlaps_document_inner(
+        &self,
+        document: &PackedDocument,
+        reusable_buffer: &mut IndexKeyBuffer,
+        skip_index_definition_dependency: bool,
+    ) -> Option<ConflictingRead> {
         for (
             index,
             IndexReads {
@@ -147,6 +160,11 @@ impl ReadSet {
             },
         ) in iter_indexes_for_table(&self.indexed, document.id().tablet_id)
         {
+            if skip_index_definition_dependency
+                && index.descriptor() == &INDEX_BY_TABLE_ID_VIRTUAL_INDEX_DESCRIPTOR
+            {
+                continue;
+            }
             let index_key = document.index_key(fields, reusable_buffer);
             if intervals.contains(index_key) {
                 let stack_traces = stack_traces.as_ref().map(|st| {
@@ -195,12 +213,33 @@ impl ReadSet {
                 &'a WriteSource,
             ),
         >,
+        index_table: TabletId,
     ) -> Option<ConflictingReadWithWriteSource> {
         let mut buffer = IndexKeyBuffer::new();
         for (update_ts, updates, write_source) in updates {
             for update in updates {
+                let index_definition_unchanged = update.id.tablet_id == index_table
+                    && match (&update.old_document, &update.new_document) {
+                        (Some(old_document), Some(new_document)) => {
+                            match (
+                                TabletIndexMetadata::from_document(old_document.unpack()),
+                                TabletIndexMetadata::from_document(new_document.unpack()),
+                            ) {
+                                (Ok(old_metadata), Ok(new_metadata)) => {
+                                    old_metadata.name == new_metadata.name
+                                        && old_metadata.config.same_spec(&new_metadata.config)
+                                },
+                                _ => false,
+                            }
+                        },
+                        _ => false,
+                    };
                 if let Some(ref document) = update.new_document
-                    && let Some(conflicting_read) = self.overlaps_document(document, &mut buffer)
+                    && let Some(conflicting_read) = self.overlaps_document_inner(
+                        document,
+                        &mut buffer,
+                        index_definition_unchanged,
+                    )
                 {
                     return Some(ConflictingReadWithWriteSource {
                         read: conflicting_read,
@@ -209,7 +248,11 @@ impl ReadSet {
                     });
                 }
                 if let Some(ref prev_value) = update.old_document
-                    && let Some(conflicting_read) = self.overlaps_document(prev_value, &mut buffer)
+                    && let Some(conflicting_read) = self.overlaps_document_inner(
+                        prev_value,
+                        &mut buffer,
+                        index_definition_unchanged,
+                    )
                 {
                     return Some(ConflictingReadWithWriteSource {
                         read: conflicting_read,

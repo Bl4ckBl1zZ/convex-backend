@@ -16,6 +16,7 @@ use common::{
         ParsedDocument,
     },
     json::JsonForm,
+    knobs::TABLE_SUMMARY_SNAPSHOT_CONCURRENCY,
     persistence::{
         new_static_repeatable_recent,
         LatestDocument,
@@ -50,7 +51,9 @@ use common::{
 };
 use errors::ErrorMetadata;
 use futures::{
+    stream,
     Stream,
+    StreamExt,
     TryStreamExt,
 };
 use serde::Deserialize;
@@ -449,16 +452,29 @@ impl<RT: Runtime> TableSummaryWriter<RT> {
         table_mapping: &TableMapping,
         by_id_indexes: &BTreeMap<TabletId, IndexId>,
     ) -> anyhow::Result<TableSummarySnapshot> {
-        let mut snapshot = BTreeMap::new();
-        for (tablet_id, ..) in table_mapping.iter() {
-            let by_id_index = by_id_indexes.get(&tablet_id).expect("by_id should exist");
-            // table_iterator, table_mapping, and by_id_indexes should all be
-            // computed at the same snapshot.
-            let revision_stream =
-                table_iterator().stream_documents_in_table(tablet_id, *by_id_index, None);
-            let summary = Self::collect_table_revisions(revision_stream).await?;
-            snapshot.insert(tablet_id, summary);
-        }
+        let table_jobs: Vec<_> = table_mapping
+            .iter()
+            .map(|(tablet_id, ..)| {
+                let by_id_index = *by_id_indexes.get(&tablet_id).expect("by_id should exist");
+                (tablet_id, by_id_index)
+            })
+            .collect();
+        let summaries: Vec<_> = stream::iter(table_jobs)
+            .map(|(tablet_id, by_id_index)| {
+                // The iterator and metadata all refer to the same repeatable
+                // snapshot, so independent tables can be scanned concurrently.
+                let table_iterator = table_iterator();
+                async move {
+                    let revision_stream =
+                        table_iterator.stream_documents_in_table(tablet_id, by_id_index, None);
+                    let summary = Self::collect_table_revisions(revision_stream).await?;
+                    anyhow::Ok((tablet_id, summary))
+                }
+            })
+            .buffer_unordered(*TABLE_SUMMARY_SNAPSHOT_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let snapshot = summaries.into_iter().collect();
         Ok(TableSummarySnapshot {
             tables: snapshot,
             ts: snapshot_ts,

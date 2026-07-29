@@ -63,6 +63,16 @@ impl PendingWrites for ComponentRegistry {}
 
 pub type NestedWriteToken = u32;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataWriteDependency {
+    /// The write can change table/index registry invariants and must conflict
+    /// with every concurrent metadata registry change.
+    Registry,
+    /// The write only changes mutable state on an existing metadata document.
+    /// Its point read supplies the required same-document OCC dependency.
+    Document,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NestedWrites<W: PendingWrites> {
     parent: Option<Box<NestedWrites<W>>>,
@@ -234,9 +244,10 @@ impl Writes {
         self.updates.is_empty()
     }
 
-    pub fn update(
+    pub(crate) fn update(
         &mut self,
         bootstrap_tables: BootstrapTableIds,
+        metadata_write_dependency: MetadataWriteDependency,
         is_system_document: bool,
         reads: &mut TransactionReadSet,
         document_id: ResolvedDocumentId,
@@ -248,7 +259,12 @@ impl Writes {
             anyhow::ensure!(!self.updates.contains(&document_id), "Duplicate insert");
             self.register_new_id(reads, document_id)?;
         }
-        Self::record_reads_for_write(bootstrap_tables, reads, document_id.tablet_id)?;
+        Self::record_reads_for_write(
+            bootstrap_tables,
+            metadata_write_dependency,
+            reads,
+            document_id.tablet_id,
+        )?;
 
         let value_size = match &new_document {
             Some(document) => document.to_document_with_max_commit_ts()?.size(),
@@ -356,11 +372,15 @@ impl Writes {
 
     fn record_reads_for_write(
         table_mapping: BootstrapTableIds,
+        metadata_write_dependency: MetadataWriteDependency,
         reads: &mut TransactionReadSet,
         tablet_id: TabletId,
     ) -> anyhow::Result<()> {
         // by_name index on _indexes table.
         if table_mapping.is_index_table(tablet_id) || table_mapping.is_tables_table(tablet_id) {
+            if metadata_write_dependency == MetadataWriteDependency::Document {
+                return Ok(());
+            }
             // Changes in _tables or _index cannot race with any other table or
             // index. This is because TableRegistry and IndexRegistry check a
             // number of invariants between tables and index records.
