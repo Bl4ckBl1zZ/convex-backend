@@ -31,10 +31,11 @@ runs:
         # captures them at spawn. Role MaxSessionDuration is raised to match.
         role-duration-seconds: 14400
 
-    - name: Install libsodium and libssl
+    - name: Install native build dependencies
       shell: bash
       if: runner.os == 'Linux'
-      run: sudo apt-get install pkg-config libsodium-dev libssl-dev
+      run:
+        sudo apt-get install pkg-config libsodium-dev libssl-dev libsnappy-dev
 
     # The runner AMI ships a prebuilt librocksdb but no pkg-config .pc, so mise's
     # ROCKSDB_COMPILE check fails and librocksdb-sys rebuilds it from source every
