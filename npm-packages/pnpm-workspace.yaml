@@ -147,6 +147,8 @@ packages:
   - version
 
 autoInstallPeers: true
+onlyBuiltDependencies:
+  - "root@https://codeload.github.com/nipunn1313/docusaurus-openapi-docs/tar.gz/33ca8ab0ecbe76adc157c6c7ade3e53e5c990428"
 minimumReleaseAge: 10080
 # The next security overrides below force a brand-new next version; next pins
 # its @next/swc platform binaries to that exact (equally new) version, which

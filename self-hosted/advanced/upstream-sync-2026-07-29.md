@@ -128,6 +128,8 @@ Completed locally:
 - Shared isolate CPU-capacity test.
 - State-only index metadata OCC regression test.
 - pnpm lockfile regeneration.
+- Frozen pnpm lockfile verification with an exact prepare-script allowlist for
+  the pinned Docusaurus git dependency.
 - Turborepo build of `scenario-runner` and its Convex dependency.
 - Docker Compose rendering for the base PostgreSQL, vertical, Node-pool,
   ModularBots Dokploy, and Restorecord Dokploy profiles.
