@@ -33,9 +33,6 @@ jobs:
           r2-access-key: ${{ secrets.R2_ACCESS_KEY_ID }}
           r2-secret-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 
-      - name: Check Cargo.lock up-to-date
-        run: cargo update -w --locked
-
       - name: Install mise tools
         uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
         with:
@@ -52,26 +49,29 @@ jobs:
 
       - name: Check backend integration crates
         run: >-
-          cargo check -p local_backend -p node_executor -p application -p
-          function_runner -p database -p indexing -p isolate -p
+          cargo check --locked -p local_backend -p node_executor -p application
+          -p function_runner -p database -p indexing -p isolate -p
           search_index_workers -p storage
 
       - name: Lint fork-modified libraries
         run: >-
-          cargo clippy -p application -p database -p function_runner -p indexing
-          -p isolate -p search_index_workers -p storage --lib -- -D warnings
+          cargo clippy --locked -p application -p database -p function_runner -p
+          indexing -p isolate -p search_index_workers -p storage --lib -- -D
+          warnings
 
       - name: Test vertical-scaling defaults
-        run: cargo test -p common vertical_scaling --lib
+        run: cargo test --locked -p common vertical_scaling --lib
 
       - name: Test persistence connection headroom
-        run: cargo test -p common commit_persistence --lib
+        run: cargo test --locked -p common commit_persistence --lib
 
       - name: Test shared isolate CPU capacity
-        run: cargo test -p isolate cloned_limiters_share_cpu_capacity --lib
+        run:
+          cargo test --locked -p isolate cloned_limiters_share_cpu_capacity
+          --lib
 
       - name: Test state-only index OCC behavior
         run: >-
-          cargo test -p indexing
+          cargo test --locked -p indexing
           state_only_index_update_does_not_invalidate_virtual_definition_index
           --lib
