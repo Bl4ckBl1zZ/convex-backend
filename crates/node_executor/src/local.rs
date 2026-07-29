@@ -94,6 +94,11 @@ impl Drop for InFlightGuard<'_> {
 
 struct LocalNodeExecutorConfig {
     node_process_timeout: Duration,
+    /// Overrides the initial callback retry backoff in the spawned node
+    /// process (read by syscalls.ts at module load). Tests zero this so
+    /// callbacks retrying against an unreachable backend settle within test
+    /// timeouts.
+    callback_initial_backoff: Option<Duration>,
 }
 
 struct InnerLocalNodeExecutor {
@@ -103,7 +108,7 @@ struct InnerLocalNodeExecutor {
 }
 
 impl InnerLocalNodeExecutor {
-    async fn new(worker_index: usize) -> anyhow::Result<Self> {
+    async fn new(worker_index: usize, config: &LocalNodeExecutorConfig) -> anyhow::Result<Self> {
         tracing::info!(worker_index, "Initializing inner local node executor");
         // Create a single temp directory for both source files and Node.js temp files
         let source_dir = TempDir::new()?;
@@ -131,7 +136,7 @@ impl InnerLocalNodeExecutor {
             panic!("not supported");
         };
         let server_handle =
-            Self::start_node_with_listener(&source_path, &source_dir, &socket_path).await?;
+            Self::start_node_with_listener(config, &source_path, &source_dir, &socket_path).await?;
         // Don't keep idle connections in the pool. The Node HTTP server closes
         // idle keep-alive connections after its (default 5s) `keepAliveTimeout`,
         // but hyper's pool would hold one much longer and reuse it right as the
@@ -198,6 +203,7 @@ impl InnerLocalNodeExecutor {
     }
 
     async fn start_node_with_listener(
+        config: &LocalNodeExecutorConfig,
         source_path: &PathBuf,
         temp_dir: &TempDir,
         socket_path: &PathBuf,
@@ -223,6 +229,12 @@ impl InnerLocalNodeExecutor {
             .arg("--tempdir")
             .arg(temp_dir.path())
             .kill_on_drop(true);
+        if let Some(backoff) = config.callback_initial_backoff {
+            cmd.env(
+                "CALLBACK_INITIAL_BACKOFF_MS",
+                backoff.as_millis().to_string(),
+            );
+        }
 
         let child = cmd.spawn()?;
 
@@ -251,6 +263,7 @@ impl LocalNodeExecutor {
             next_worker: AtomicUsize::new(0),
             config: LocalNodeExecutorConfig {
                 node_process_timeout,
+                callback_initial_backoff: None,
             },
         };
 
@@ -339,7 +352,7 @@ impl NodeExecutor for LocalNodeExecutor {
             let mut inner = worker.inner.lock().await;
             if inner.is_none() {
                 *inner = Some(
-                    InnerLocalNodeExecutor::new(worker_index)
+                    InnerLocalNodeExecutor::new(worker_index, &self.config)
                         .await
                         .context("Failed to create inner local node executor")?,
                 )
