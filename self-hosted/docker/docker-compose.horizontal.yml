@@ -4,7 +4,8 @@ services:
       # Comma-separated executor endpoints are balanced by current in-flight
       # request count. Add more services and URLs to scale Node processing.
       - NODE_EXECUTOR_URLS=http://node-executor-1:3002,http://node-executor-2:3002
-      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET is required}
+      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET
+        is required}
       - NODE_EXECUTOR_FAILURE_COOLDOWN_SECONDS=${NODE_EXECUTOR_FAILURE_COOLDOWN_SECONDS:-5}
     depends_on:
       node-executor-1:
@@ -25,7 +26,8 @@ services:
       - "3002"
     environment:
       - NODE_EXECUTOR_PORT=3002
-      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET is required}
+      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET
+        is required}
       - NODE_EXECUTOR_TEMP_DIR=/convex-node-executor
     volumes:
       - node-executor-1-cache:/convex-node-executor
@@ -33,7 +35,8 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -fsS -H \"x-convex-node-executor-secret: $$NODE_EXECUTOR_SHARED_SECRET\" http://localhost:3002/health >/dev/null",
+          'curl -fsS -H "x-convex-node-executor-secret:
+          $$NODE_EXECUTOR_SHARED_SECRET" http://localhost:3002/health >/dev/null',
         ]
       interval: 5s
       timeout: 3s
@@ -53,7 +56,8 @@ services:
       - "3002"
     environment:
       - NODE_EXECUTOR_PORT=3002
-      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET is required}
+      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET
+        is required}
       - NODE_EXECUTOR_TEMP_DIR=/convex-node-executor
     volumes:
       - node-executor-2-cache:/convex-node-executor
@@ -61,7 +65,8 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -fsS -H \"x-convex-node-executor-secret: $$NODE_EXECUTOR_SHARED_SECRET\" http://localhost:3002/health >/dev/null",
+          'curl -fsS -H "x-convex-node-executor-secret:
+          $$NODE_EXECUTOR_SHARED_SECRET" http://localhost:3002/health >/dev/null',
         ]
       interval: 5s
       timeout: 3s

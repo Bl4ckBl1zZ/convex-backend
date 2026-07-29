@@ -30,7 +30,8 @@ services:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U ${POSTGRES_USER:-convex} -d ${POSTGRES_DB:-convex_self_hosted}",
+          "pg_isready -U ${POSTGRES_USER:-convex} -d
+          ${POSTGRES_DB:-convex_self_hosted}",
         ]
       interval: 5s
       timeout: 5s

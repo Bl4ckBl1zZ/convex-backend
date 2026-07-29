@@ -52,7 +52,6 @@ use database::{
 };
 use futures::{
     stream,
-    FutureExt,
     StreamExt,
     TryStreamExt,
 };
@@ -254,19 +253,16 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
         else {
             return Ok(None);
         };
-        let table_name = table_name.to_string();
         let cache_value_result = self
             .cache
-            .get(
-                key,
+            .get(&key, || {
                 load_index(
                     index_id,
                     self.index_reader.clone(),
                     tablet_id,
-                    table_name.clone(),
+                    table_name.to_string(),
                 )
-                .boxed(),
-            )
+            })
             .await
             .map(Some);
         log_funrun_index_cache_get(&table_name);
@@ -301,11 +297,11 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
         let table_registry = self
             .cache
             .get(
-                Key {
+                &Key {
                     deployment_name: self.deployment_name.clone(),
                     tables_last_modified,
                 },
-                async move {
+                || async move {
                     let (documents, size) =
                         load_unpacked_index(tables_by_id, &index_reader, tables_tablet_id, NAME)
                             .await?;
@@ -318,8 +314,7 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
                     // so just approximate its size using the size of the
                     // documents it was made from.
                     Ok(WithSize(registry, size))
-                }
-                .boxed(),
+                },
             )
             .await?;
         Ok((tables_last_modified, table_registry.0.clone()))
@@ -354,14 +349,14 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
         let index_registry = self
             .cache
             .get(
-                Key {
+                &Key {
                     deployment_name: self.deployment_name.clone(),
                     // We use the max of the two timestamps as our cache key
                     // because it's "as if" `load_unpacked_index` is reading at
                     // that timestamp.
                     last_modified: table_registry.0.max(indexes_last_modified),
                 },
-                async move {
+                || async move {
                     let (documents, size) =
                         load_unpacked_index(index_by_id, &index_reader, index_tablet_id, NAME)
                             .await?;
@@ -371,8 +366,7 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
                     )?;
                     DatabaseSnapshot::<RT>::verify_invariants(&table_registry.1, &index_registry)?;
                     Ok(WithSize(index_registry, size))
-                }
-                .boxed(),
+                },
             )
             .await?;
         Ok((indexes_last_modified, index_registry.0.clone()))
@@ -409,14 +403,14 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
         let component_registry = self
             .cache
             .get(
-                Key {
+                &Key {
                     deployment_name: self.deployment_name.clone(),
                     last_modified: table_registry
                         .0
                         .max(index_registry.0)
                         .max(components_last_modified),
                 },
-                async move {
+                || async move {
                     let (documents, size) = load_unpacked_index(
                         components_by_id,
                         &index_reader,
@@ -429,8 +423,7 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
                         documents.into_iter().map(|d| d.parse()).try_collect()?,
                     )?;
                     Ok(WithSize(component_registry, size))
-                }
-                .boxed(),
+                },
             )
             .await?;
         Ok((components_last_modified, component_registry.0.clone()))
@@ -485,11 +478,11 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
         let schema_registry = self
             .cache
             .get(
-                Key {
+                &Key {
                     deployment_name: self.deployment_name.clone(),
                     last_modified: last_modified_ts,
                 },
-                async move {
+                || async move {
                     let mut size = 0;
                     let mut schema_docs = BTreeMap::new();
                     let loaded_components = stream::iter(schema_tables)
@@ -519,8 +512,7 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
                     }
                     let schema_registry = SchemaRegistry::bootstrap(schema_docs);
                     Ok(WithSize(schema_registry, size))
-                }
-                .boxed(),
+                },
             )
             .await?;
         Ok((last_modified_ts, schema_registry.0.clone()))
