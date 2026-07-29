@@ -7,7 +7,10 @@
 //! When running locally, these knobs can all be overridden with an environment
 //! variable.
 
-use std::sync::LazyLock;
+use std::{
+    path::PathBuf,
+    sync::LazyLock,
+};
 
 use cmd_util::env::env_config;
 // Knobs available in backend that are also available in searchlight.
@@ -16,9 +19,86 @@ pub use common::knobs::{
     ARCHIVE_FETCH_TIMEOUT_SECONDS,
     CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS,
     CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
+    SEARCH_INDEX_COMPACTION_CONCURRENCY,
+    VERTICAL_SCALING_CPU_COUNT,
+    VERTICAL_SCALING_ENABLED,
+    VERTICAL_SCALING_RESERVED_CPU_COUNT,
 };
 
 // Searchlight only knobs.
+
+fn vertical_search_default(
+    compatibility_default: usize,
+    per_cpu: usize,
+    minimum: usize,
+    maximum: usize,
+) -> usize {
+    calculate_vertical_search_default(
+        *VERTICAL_SCALING_ENABLED,
+        *VERTICAL_SCALING_CPU_COUNT,
+        *VERTICAL_SCALING_RESERVED_CPU_COUNT,
+        compatibility_default,
+        per_cpu,
+        minimum,
+        maximum,
+    )
+}
+
+fn calculate_vertical_search_default(
+    enabled: bool,
+    cpu_count: usize,
+    reserved_cpu_count: usize,
+    compatibility_default: usize,
+    per_cpu: usize,
+    minimum: usize,
+    maximum: usize,
+) -> usize {
+    if !enabled {
+        return compatibility_default;
+    }
+    let cpu_derived = cpu_count
+        .saturating_sub(reserved_cpu_count)
+        .max(1)
+        .saturating_mul(per_cpu)
+        .clamp(minimum, maximum);
+    // Enabling vertical scaling must not silently reduce a pool below the
+    // established compatibility default on a medium-sized host.
+    cpu_derived.max(compatibility_default.min(maximum))
+}
+
+/// Directory used by the in-process searcher's on-disk segment cache. An empty
+/// value keeps the existing temporary-directory behavior.
+pub static IN_PROCESS_SEARCH_CACHE_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
+    let path = env_config("IN_PROCESS_SEARCH_CACHE_PATH", String::new());
+    (!path.is_empty()).then(|| PathBuf::from(path))
+});
+
+/// Maximum size of the in-process searcher's on-disk segment cache.
+pub static IN_PROCESS_SEARCH_CACHE_SIZE_BYTES: LazyLock<u64> = LazyLock::new(|| {
+    env_config("IN_PROCESS_SEARCH_CACHE_SIZE_BYTES", bytesize::mib(500u64)).max(1)
+});
+
+/// Maximum number of general-purpose blocking search tasks running at once.
+pub static SEARCH_GENERAL_POOL_MAX_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "SEARCH_GENERAL_POOL_MAX_CONCURRENCY",
+        vertical_search_default(50, 4, 16, 128),
+    )
+    .max(1)
+});
+
+/// Maximum number of queued general-purpose blocking search tasks.
+pub static SEARCH_GENERAL_POOL_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "SEARCH_GENERAL_POOL_QUEUE_SIZE",
+        if *VERTICAL_SCALING_ENABLED {
+            SEARCH_GENERAL_POOL_MAX_CONCURRENCY.saturating_mul(20)
+        } else {
+            1000
+        },
+    )
+    .max(1)
+});
 
 /// The maximum number of compactions we can run concurrently on one
 /// searchlight instance. Each compaction takes 4 cores, so this should
@@ -27,8 +107,13 @@ pub use common::knobs::{
 ///
 /// The queue size for compactions is set to QUEUE_SIZE_MULTIPLIER * this
 /// number, so this knob also determines the maximum queue length.
-pub static MAX_CONCURRENT_SEGMENT_COMPACTIONS: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_CONCURRENT_SEGMENT_COMPACTIONS", 3));
+pub static MAX_CONCURRENT_SEGMENT_COMPACTIONS: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "MAX_CONCURRENT_SEGMENT_COMPACTIONS",
+        *SEARCH_INDEX_COMPACTION_CONCURRENCY,
+    )
+    .max(1)
+});
 
 /// The maximum number of segments we can fetch in parallel across all
 /// searches and compactions.
@@ -51,16 +136,26 @@ pub static MAX_CONCURRENT_SEGMENT_COMPACTIONS: LazyLock<usize> =
 ///
 /// The queue size for fetches is set to QUEUE_SIZE_MULTIPLIER * this number, so
 /// this knob also determines the maximum queue length.
-pub static MAX_CONCURRENT_SEGMENT_FETCHES: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_CONCURRENT_SEGMENT_FETCHES", 8));
+pub static MAX_CONCURRENT_SEGMENT_FETCHES: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "MAX_CONCURRENT_SEGMENT_FETCHES",
+        vertical_search_default(8, 1, 8, 16),
+    )
+    .max(1)
+});
 
 /// The maximum number of concurrent vector searches we'll run at once,
 /// based on a very rough estimate of memory used per search.
 ///
 /// The queue size for searches is set to QUEUE_SIZE_MULTIPLIER * this number,
 /// so this knob also determines the maximum queue length.
-pub static MAX_CONCURRENT_VECTOR_SEARCHES: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_CONCURRENT_VECTOR_SEARCHES", 20));
+pub static MAX_CONCURRENT_VECTOR_SEARCHES: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "MAX_CONCURRENT_VECTOR_SEARCHES",
+        vertical_search_default(20, 2, 8, 64),
+    )
+    .max(1)
+});
 
 /// A generic multiplier applied to concurrencly limits for most pools in
 /// searchlight to figure out the queue size.
@@ -84,8 +179,21 @@ pub static MAX_VECTOR_LRU_SIZE: LazyLock<u64> =
 
 /// The maximum number of segments we're allowed to prefetch at one time in a
 /// given searchlight node.
-pub static MAX_CONCURRENT_VECTOR_SEGMENT_PREFETCHES: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_CONCURRENT_VECTOR_PREFETCHES", 2));
+pub static MAX_CONCURRENT_VECTOR_SEGMENT_PREFETCHES: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "MAX_CONCURRENT_VECTOR_PREFETCHES",
+        if *VERTICAL_SCALING_ENABLED {
+            VERTICAL_SCALING_CPU_COUNT
+                .saturating_sub(*VERTICAL_SCALING_RESERVED_CPU_COUNT)
+                .max(1)
+                .div_ceil(4)
+                .clamp(2, 8)
+        } else {
+            2
+        },
+    )
+    .max(1)
+});
 /// The maximum number of text segments (each backed by a single-segment tantiy
 /// index ) that we'll keep in memory in the LRU at once.
 pub static MAX_TEXT_LRU_ENTRIES: LazyLock<u64> =
@@ -96,5 +204,47 @@ pub static MAX_TEXT_LRU_ENTRIES: LazyLock<u64> =
 ///
 /// The queue size for searches is set to QUEUE_SIZE_MULTIPLIER * this number,
 /// so this knob also determines the maximum queue length.
-pub static MAX_CONCURRENT_TEXT_SEARCHES: LazyLock<usize> =
-    LazyLock::new(|| env_config("MAX_CONCURRENT_TEXT_SEARCHES", 20));
+pub static MAX_CONCURRENT_TEXT_SEARCHES: LazyLock<usize> = LazyLock::new(|| {
+    env_config(
+        "MAX_CONCURRENT_TEXT_SEARCHES",
+        vertical_search_default(20, 4, 16, 128),
+    )
+    .max(1)
+});
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_vertical_search_default;
+
+    #[test]
+    fn compatibility_search_default_is_unchanged() {
+        assert_eq!(
+            calculate_vertical_search_default(false, 64, 8, 20, 4, 16, 128),
+            20
+        );
+    }
+
+    #[test]
+    fn search_default_uses_unreserved_cpus_and_bounds() {
+        assert_eq!(
+            calculate_vertical_search_default(true, 10, 1, 20, 4, 16, 128),
+            36
+        );
+        assert_eq!(
+            calculate_vertical_search_default(true, 512, 1, 20, 4, 16, 128),
+            128
+        );
+    }
+
+    #[test]
+    fn vertical_search_default_never_regresses_compatibility_capacity() {
+        assert_eq!(
+            calculate_vertical_search_default(true, 10, 1, 50, 4, 16, 128),
+            50
+        );
+        assert_eq!(
+            calculate_vertical_search_default(true, 10, 1, 20, 2, 8, 64),
+            20
+        );
+    }
+}

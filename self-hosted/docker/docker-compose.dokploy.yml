@@ -1,0 +1,151 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    mem_limit: 6g
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.dokploy.conf
+    environment:
+      POSTGRES_DB: convex_self_hosted
+      POSTGRES_USER: convex
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --data-checksums --locale=C --encoding=UTF8
+    volumes:
+      - postgres17_data:/var/lib/postgresql/data
+      - ./postgresql.dokploy.conf:/etc/postgresql/postgresql.dokploy.conf:ro
+      - ./postgres-autovacuum.sql:/opt/convex/postgres-autovacuum.sql:ro
+      - ./postgres-autovacuum-health.sql:/opt/convex/postgres-autovacuum-health.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U convex -d convex_self_hosted && psql -U convex -d convex_self_hosted -Atqc 'SELECT 1' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    logging:
+      options:
+        max-size: 100m
+        max-file: "5"
+
+  backend:
+    image: convex-backend:modularbots-scale
+    build:
+      context: ../..
+      dockerfile: self-hosted/docker-build/Dockerfile.backend
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
+        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:-e4cd335ddcc69b8ec1a7c74bcfe711a574ae0631}
+        VERGEN_GIT_COMMIT_TIMESTAMP: ${VERGEN_GIT_COMMIT_TIMESTAMP:-2026-07-18T16:35:27+02:00}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    stop_signal: SIGINT
+    mem_limit: 12g
+    expose:
+      - "3210"
+      - "3211"
+    volumes:
+      - convex_data:/convex/data
+    environment:
+      INSTANCE_NAME: ${INSTANCE_NAME:-convex-self-hosted}
+      INSTANCE_SECRET: ${INSTANCE_SECRET:?INSTANCE_SECRET is required}
+      CONVEX_CLOUD_ORIGIN: ${CONVEX_CLOUD_ORIGIN:-https://sync.modularbots.io}
+      CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-https://api.modularbots.io}
+      # Convex derives convex_self_hosted from INSTANCE_NAME and rejects a
+      # database path in this cluster URL.
+      POSTGRES_URL: postgresql://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432
+      POSTGRES_MAX_CONNECTIONS: ${POSTGRES_MAX_CONNECTIONS:-64}
+      DO_NOT_REQUIRE_SSL: "true"
+      DISABLE_BEACON: "true"
+      DISABLE_METRICS_ENDPOINT: "true"
+      REDACT_LOGS_TO_CLIENT: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+      DOCUMENT_RETENTION_DELAY: ${DOCUMENT_RETENTION_DELAY:-172800}
+      HTTP_SERVER_MAX_CONCURRENT_REQUESTS: ${HTTP_SERVER_MAX_CONCURRENT_REQUESTS:-1024}
+      APPLICATION_MAX_CONCURRENT_QUERIES: ${APPLICATION_MAX_CONCURRENT_QUERIES:-64}
+      APPLICATION_MAX_CONCURRENT_MUTATIONS: ${APPLICATION_MAX_CONCURRENT_MUTATIONS:-32}
+      APPLICATION_MAX_CONCURRENT_V8_ACTIONS: ${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-32}
+      APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: ${APPLICATION_MAX_CONCURRENT_NODE_ACTIONS:-16}
+      LOCAL_NODE_EXECUTOR_POOL_SIZE: ${LOCAL_NODE_EXECUTOR_POOL_SIZE:-4}
+      MAX_BYTES_WRITTEN_PER_SECOND: ${MAX_BYTES_WRITTEN_PER_SECOND:-16777216}
+      IN_PROCESS_SEARCH_CACHE_PATH: /convex/data/search-cache
+      IN_PROCESS_SEARCH_CACHE_SIZE_BYTES: ${IN_PROCESS_SEARCH_CACHE_SIZE_BYTES:-1073741824}
+      SEARCH_GENERAL_POOL_MAX_CONCURRENCY: ${SEARCH_GENERAL_POOL_MAX_CONCURRENCY:-50}
+      SEARCH_GENERAL_POOL_QUEUE_SIZE: ${SEARCH_GENERAL_POOL_QUEUE_SIZE:-1000}
+      STORAGE_MAXIMUM_PARALLEL_UPLOADS: ${STORAGE_MAXIMUM_PARALLEL_UPLOADS:-8}
+      STORAGE_MAX_CONCURRENT_CHUNK_DOWNLOADS: ${STORAGE_MAX_CONCURRENT_CHUNK_DOWNLOADS:-16}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3210/version >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    logging:
+      options:
+        max-size: 100m
+        max-file: "5"
+
+  postgres-autovacuum-maintenance:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGDATABASE: convex_self_hosted
+      PGUSER: convex
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - ./postgres-autovacuum.sql:/opt/convex/postgres-autovacuum.sql:ro
+      - ./postgres-autovacuum-health.sql:/opt/convex/postgres-autovacuum-health.sql:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until [ "$(psql -Atqc "SELECT to_regclass('public.documents') IS NOT NULL")" = "t" ]; do
+          sleep 2
+        done
+        while true; do
+          psql -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS pg_stat_statements'
+          psql -v ON_ERROR_STOP=1 -f /opt/convex/postgres-autovacuum.sql
+          psql -v ON_ERROR_STOP=1 -f /opt/convex/postgres-autovacuum-health.sql
+          sleep 21600
+        done
+    logging:
+      options:
+        max-size: 50m
+        max-file: "3"
+
+  dashboard:
+    image: ghcr.io/get-convex/convex-dashboard@sha256:f3a8ccb90a07c9cb580974c0e4a03f38137b5b53dd4c70cd5b242d5d7ae2260b
+    restart: unless-stopped
+    init: true
+    expose:
+      - "6791"
+    environment:
+      NEXT_PUBLIC_DEPLOYMENT_URL: ${CONVEX_CLOUD_ORIGIN:-https://sync.modularbots.io}
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging:
+      options:
+        max-size: 50m
+        max-file: "3"
+
+volumes:
+  postgres17_data:
+  convex_data:

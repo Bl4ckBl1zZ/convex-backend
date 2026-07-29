@@ -1,0 +1,31 @@
+services:
+  backend:
+    environment:
+      - VERTICAL_SCALING_ENABLED=${VERTICAL_SCALING_ENABLED:-true}
+      - VERTICAL_SCALING_CPU_COUNT=${VERTICAL_SCALING_CPU_COUNT:-0}
+      - VERTICAL_SCALING_RESERVED_CPU_COUNT=${VERTICAL_SCALING_RESERVED_CPU_COUNT:-0}
+
+  postgres:
+    # PostgreSQL shared memory must be larger than shared_buffers. These
+    # defaults target a database container with roughly 12-16 GiB available.
+    shm_size: ${POSTGRES_SHM_SIZE:-5gb}
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.convex.conf
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-4GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-12GB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-1GB}
+      - -c
+      - autovacuum_work_mem=${POSTGRES_AUTOVACUUM_WORK_MEM:-256MB}
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-8GB}
+      - -c
+      - max_worker_processes=${POSTGRES_MAX_WORKER_PROCESSES:-16}
+      - -c
+      - max_parallel_workers=${POSTGRES_MAX_PARALLEL_WORKERS:-12}
+      - -c
+      - autovacuum_max_workers=${POSTGRES_AUTOVACUUM_MAX_WORKERS:-8}

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use metrics::{
     log_counter,
+    log_counter_with_labels,
     log_distribution,
     log_distribution_with_labels,
     register_convex_counter,
@@ -79,6 +80,19 @@ pub fn log_function_execution(cold_start: Option<bool>) {
             log_counter(&NODE_EXECUTOR_NON_LAMBDA_RESPONSE_TOTAL, 1);
         },
     }
+}
+
+register_convex_counter!(
+    REMOTE_NODE_EXECUTOR_FAILURE_TOTAL,
+    "Number of remote Node executor failures",
+    &["type"],
+);
+pub fn log_remote_node_executor_failure(failure_type: &'static str) {
+    log_counter_with_labels(
+        &REMOTE_NODE_EXECUTOR_FAILURE_TOTAL,
+        1,
+        vec![StaticMetricLabel::new("type", failure_type)],
+    );
 }
 
 register_convex_counter!(

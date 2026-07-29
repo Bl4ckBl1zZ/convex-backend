@@ -125,6 +125,9 @@ e.g., instead of setting `CONVEX_DEPLOY_KEY`, you'll need to set
 - [Upgrading Convex self-hosted version](./advanced/upgrading.md)
 - [Benchmarking](./advanced/benchmarking.md)
 - [Advanced tuning with knobs](./advanced/knobs.md)
+- [Scaling and throughput tuning](./advanced/scaling.md)
+- [Hardware-aware vertical scaling](./advanced/vertical-scaling.md)
+- [Parallel pipeline architecture](./advanced/parallel-pipelines.md)
 
 # Limitations
 

@@ -26,6 +26,7 @@ use common::{
     execution_context::ExecutionId,
     fastrace_helpers::get_sampled_span,
     knobs::{
+        ASYNC_JOIN_CONCURRENCY,
         INDEX_BACKFILL_CONCURRENCY,
         INDEX_WORKERS_INITIAL_BACKOFF,
         INDEX_WORKERS_MAX_BACKOFF,
@@ -47,7 +48,12 @@ use common::{
     RequestId,
 };
 use fastrace::future::FutureExt as _;
-use futures::FutureExt as _;
+use futures::{
+    stream,
+    FutureExt as _,
+    StreamExt,
+    TryStreamExt,
+};
 use hashlink::LinkedHashSet;
 use keybroker::Identity;
 use tokio::{
@@ -104,7 +110,6 @@ pub struct IndexWorker<RT: Runtime> {
     progress_rx: mpsc::Receiver<TabletBackfillProgress>,
     /// Limit on the size of `in_progress`
     max_concurrency: usize,
-    metadata_mutex: Arc<tokio::sync::Mutex<()>>,
     database: Database<RT>,
     index_writer: IndexWriter<RT>,
     usage_tracking: UsageCounter,
@@ -139,7 +144,6 @@ impl<RT: Runtime> IndexWorker<RT> {
             pending: Default::default(),
             progress_rx,
             max_concurrency: *INDEX_BACKFILL_CONCURRENCY,
-            metadata_mutex: Default::default(),
             database,
             index_writer,
             usage_tracking,
@@ -356,7 +360,6 @@ impl<RT: Runtime> IndexWorker<RT> {
                 index_ids,
                 self.database.clone(),
                 self.index_writer.clone(),
-                self.metadata_mutex.clone(),
                 backfill_cursor,
             ),
         );
@@ -367,20 +370,28 @@ impl<RT: Runtime> IndexWorker<RT> {
         index_ids: Vec<IndexId>,
         database: Database<RT>,
         index_writer: IndexWriter<RT>,
-        metadata_mutex: Arc<tokio::sync::Mutex<()>>,
         backfill_cursor: Option<BackfillCursor>,
     ) -> anyhow::Result<u64> {
         let mut docs_indexed = 0;
         let _timer = tablet_index_backfill_timer();
         let mut backfills = BTreeMap::new();
-        for index_id in &index_ids {
-            let Some((index_name, retention_started)) =
-                Self::begin_backfill(*index_id, &database).await?
-            else {
+        let backfill_states =
+            stream::iter(index_ids.iter().copied())
+                .map(|index_id| {
+                    let database = database.clone();
+                    async move {
+                        anyhow::Ok((index_id, Self::begin_backfill(index_id, &database).await?))
+                    }
+                })
+                .buffer_unordered(*ASYNC_JOIN_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+        for (index_id, backfill_state) in backfill_states {
+            let Some((index_name, retention_started)) = backfill_state else {
                 tracing::info!("Skipping backfill of index {index_id:?} that no longer exists");
                 continue;
             };
-            backfills.insert(*index_id, (index_name, retention_started));
+            backfills.insert(index_id, (index_name, retention_started));
         }
         let live_index_ids: Vec<IndexId> = backfills.keys().copied().collect();
 
@@ -444,12 +455,6 @@ impl<RT: Runtime> IndexWorker<RT> {
 
         let mut min_begin_ts = None;
         let mut retention = BTreeMap::new();
-        // The database currently does not allow concurrent writers to the
-        // `_index` (or `_tables`) tables; see a TODO in
-        // `Writes::record_reads_for_write`.
-        // Since we run many `backfill_tablet` tasks concurrently, synchronize
-        // here to avoid creating OCC conflicts with ourselves.
-        let indexes_lock = metadata_mutex.lock().await;
         let mut tx = database.begin(Identity::system()).await?;
         for index_id in &live_index_ids {
             let Some((backfill_begin_ts, index_name, indexed_fields)) =
@@ -468,7 +473,6 @@ impl<RT: Runtime> IndexWorker<RT> {
         database
             .commit_with_write_source(tx, "index_worker_start_retention")
             .await?;
-        drop(indexes_lock);
         if let Some(min_begin_ts) = min_begin_ts {
             tracing::info!(
                 "Started running retention for {} indexes: {retention:?}",
@@ -477,7 +481,6 @@ impl<RT: Runtime> IndexWorker<RT> {
             index_writer.run_retention(min_begin_ts, retention).await?;
         }
 
-        let indexes_lock = metadata_mutex.lock().await;
         let mut tx = database.begin(Identity::system()).await?;
         for index_id in live_index_ids {
             Self::finish_backfill(&mut tx, index_id).await?;
@@ -485,7 +488,6 @@ impl<RT: Runtime> IndexWorker<RT> {
         database
             .commit_with_write_source(tx, "index_worker_finish_backfill")
             .await?;
-        drop(indexes_lock);
 
         Ok(docs_indexed)
     }
@@ -587,7 +589,7 @@ impl<RT: Runtime> IndexWorker<RT> {
 
         let name = index_metadata.name.clone();
         SystemMetadataModel::new_global(tx)
-            .replace(index_metadata.id(), index_metadata.into_value().try_into()?)
+            .replace_index_state(index_metadata.id(), index_metadata.into_value().try_into()?)
             .await?;
 
         Ok(Some((index_ts, name, indexed_fields)))
@@ -641,7 +643,7 @@ impl<RT: Runtime> IndexWorker<RT> {
         let name = index_metadata.name.clone();
 
         SystemMetadataModel::new_global(tx)
-            .replace(full_index_id, index_metadata.into_value().try_into()?)
+            .replace_index_state(full_index_id, index_metadata.into_value().try_into()?)
             .await?;
         let table_name = tx.table_mapping().tablet_name(*name.table())?;
         tracing::info!("Finished backfill of index {}", name);

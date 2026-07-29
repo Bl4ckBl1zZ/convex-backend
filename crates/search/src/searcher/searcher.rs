@@ -130,6 +130,8 @@ use crate::{
             MAX_TEXT_LRU_ENTRIES,
             MAX_VECTOR_LRU_SIZE,
             QUEUE_SIZE_MULTIPLIER,
+            SEARCH_GENERAL_POOL_MAX_CONCURRENCY,
+            SEARCH_GENERAL_POOL_QUEUE_SIZE,
         },
     },
     SearchFileType,
@@ -252,7 +254,12 @@ impl<RT: Runtime> SearcherImpl<RT> {
             ByteSize(max_disk_cache_size)
         );
         // Tokio uses ~500 threads for blocking tasks
-        let blocking_thread_pool = BoundedThreadPool::new(runtime.clone(), 1000, 50, "general");
+        let blocking_thread_pool = BoundedThreadPool::new(
+            runtime.clone(),
+            *SEARCH_GENERAL_POOL_QUEUE_SIZE,
+            *SEARCH_GENERAL_POOL_MAX_CONCURRENCY,
+            "general",
+        );
         let archive_cache = ArchiveCacheManager::new(
             local_storage_path,
             max_disk_cache_size,

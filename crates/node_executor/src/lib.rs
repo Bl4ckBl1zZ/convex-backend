@@ -11,6 +11,7 @@ mod executor;
 pub mod local;
 mod metrics;
 pub mod noop;
+pub mod remote;
 pub mod source_package;
 
 pub use crate::executor::{

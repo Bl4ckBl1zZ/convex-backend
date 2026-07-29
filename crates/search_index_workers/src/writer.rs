@@ -1,4 +1,5 @@
 use std::{
+    hash::Hash,
     iter,
     marker::PhantomData,
     num::NonZeroU32,
@@ -24,15 +25,13 @@ use common::{
         new_rate_limiter,
         Runtime,
     },
-    sync::{
-        Mutex,
-        MutexGuard,
-    },
+    sync::Mutex,
     types::{
         RepeatableTimestamp,
         TabletIndexName,
     },
 };
+use dashmap::DashMap;
 use database::{
     Database,
     IndexBackfillModel,
@@ -75,12 +74,34 @@ use crate::{
     MultiSegmentBackfillResult,
 };
 
-/// Serializes writes to index metadata from the worker and reconciles any
-/// conflicting writes that may have happened due to concurrent modifications in
-/// the flusher and compactor.
+struct KeyedLocks<K> {
+    locks: DashMap<K, Arc<Mutex<()>>>,
+}
+
+impl<K: Eq + Hash> Default for KeyedLocks<K> {
+    fn default() -> Self {
+        Self {
+            locks: DashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> KeyedLocks<K> {
+    fn for_key(&self, key: K) -> Arc<Mutex<()>> {
+        self.locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+}
+
+/// Serializes writes to each index's metadata and reconciles conflicting writes
+/// that may have happened due to concurrent modifications in the flusher and
+/// compactor. Independent indexes use independent locks.
 #[derive(Clone)]
 pub struct SearchIndexMetadataWriter<RT: Runtime, T: SearchIndex> {
-    inner: Arc<Mutex<Inner<RT, T>>>,
+    inner: Arc<Inner<RT, T>>,
+    index_locks: Arc<KeyedLocks<ResolvedDocumentId>>,
 }
 
 pub struct SearchIndexWriteResult<T: SearchIndex> {
@@ -101,15 +122,14 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
         build_index_args: T::BuildIndexArgs,
     ) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
+            inner: Arc::new(Inner {
                 runtime: runtime.clone(),
                 database,
                 storage,
-                // Use small limits because we should only ever run one job at a time.
                 thread_pool: BoundedThreadPool::new(
                     runtime,
-                    2,
-                    1,
+                    *common::knobs::SEARCH_INDEX_WRITER_QUEUE_SIZE,
+                    *common::knobs::SEARCH_INDEX_WRITER_THREADS,
                     match T::search_type() {
                         SearchType::Vector => "vector_writer",
                         SearchType::Text => "text_writer",
@@ -117,16 +137,21 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
                 ),
                 build_index_args,
                 _phantom_data: Default::default(),
-            })),
+            }),
+            index_locks: Arc::new(KeyedLocks::default()),
         }
+    }
+
+    fn index_lock(&self, index_id: ResolvedDocumentId) -> Arc<Mutex<()>> {
+        self.index_locks.for_key(index_id)
     }
 
     /// Merge results from a compaction with up to N previous writes by the
     /// flusher.
     ///
-    /// There are only two writers, the flusher and the compactor. Each run
-    /// serially. So we know that the only possibility of contention is from
-    /// the flusher because we're writing the result from the compactor.
+    /// There are only two writers for a given index, the flusher and the
+    /// compactor. The per-index lock serializes them, so the only possible
+    /// conflicting metadata write is from that index's flusher.
     ///
     /// The race we're worried about is that the flusher may have written one or
     /// more deletes to the set of segments we just compacted. We need to
@@ -145,8 +170,12 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
         rate_limit_pages_per_second: NonZeroU32,
         schema: T::Schema,
     ) -> anyhow::Result<()> {
-        self.inner(SearchWriterLockWaiter::Compactor)
-            .await
+        let index_lock = self.index_lock(index_id);
+        let lock_timer =
+            search_writer_lock_wait_timer(SearchWriterLockWaiter::Compactor, T::search_type());
+        let _guard = index_lock.lock().await;
+        drop(lock_timer);
+        self.inner
             .commit_compaction(
                 index_id,
                 index_name,
@@ -162,9 +191,9 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
     /// Merge results from a flush with up to N previous compactions by the
     /// compactor.
     ///
-    /// There are only two writers, the flusher and the compactor. Each run
-    /// serially. So we know that the only possibility of contention
-    /// is from the compactor because we're writing the result from the flusher.
+    /// There are only two writers for a given index, the flusher and the
+    /// compactor. The per-index lock serializes them, so the only possible
+    /// conflicting metadata write is from that index's compactor.
     ///
     /// The race we're worried about is that we may have just written one or
     /// more deletes to segments that were compacted while we were flushing. We
@@ -187,7 +216,11 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
             backfill_result,
         } = result;
 
-        let inner = self.inner(SearchWriterLockWaiter::Flusher).await;
+        let index_lock = self.index_lock(job.metadata_id);
+        let lock_timer =
+            search_writer_lock_wait_timer(SearchWriterLockWaiter::Flusher, T::search_type());
+        let _guard = index_lock.lock().await;
+        drop(lock_timer);
         let segments = data.require_multi_segment()?;
         let per_segment_stats = segments
             .iter()
@@ -195,12 +228,12 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
             .collect::<anyhow::Result<Vec<_>>>()?;
         if let Some(index_backfill_result) = backfill_result {
             let schema = T::new_schema(&job.index_config.spec);
-            inner
+            self.inner
                 .commit_backfill_flush(job, segments, new_segment_id, index_backfill_result, schema)
                 .await?
         } else {
             let schema = T::new_schema(&job.index_config.spec);
-            inner
+            self.inner
                 .commit_snapshot_flush(job, snapshot_ts, segments, new_segment_id, schema)
                 .await?
         }
@@ -211,12 +244,22 @@ impl<RT: Runtime, T: SearchIndex> SearchIndexMetadataWriter<RT, T> {
             per_segment_stats,
         })
     }
+}
 
-    async fn inner(&self, waiter: SearchWriterLockWaiter) -> MutexGuard<'_, Inner<RT, T>> {
-        let lock_timer = search_writer_lock_wait_timer(waiter, T::search_type());
-        let inner = self.inner.lock().await;
-        drop(lock_timer);
-        inner
+#[cfg(test)]
+mod tests {
+    use super::KeyedLocks;
+
+    #[test]
+    fn keyed_locks_serialize_only_matching_keys() {
+        let locks = KeyedLocks::default();
+        let first = locks.for_key(1);
+        let same = locks.for_key(1);
+        let different = locks.for_key(2);
+
+        let _guard = first.try_lock().expect("first key should be unlocked");
+        assert!(same.try_lock().is_err());
+        assert!(different.try_lock().is_ok());
     }
 }
 
@@ -353,7 +396,7 @@ impl<RT: Runtime, T: SearchIndex> Inner<RT, T> {
         };
 
         SystemMetadataModel::new_global(&mut tx)
-            .replace(id, new_metadata.try_into()?)
+            .replace_index_state(id, new_metadata.try_into()?)
             .await?;
         self.database
             .commit_with_write_source(

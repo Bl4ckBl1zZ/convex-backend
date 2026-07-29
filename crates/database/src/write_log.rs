@@ -879,29 +879,22 @@ impl PendingWrites {
         }
     }
 
-    pub fn iter(
-        &self,
-        from: Timestamp,
-        to: Timestamp,
-    ) -> impl Iterator<
-        Item = (
-            &Timestamp,
-            impl Iterator<Item = &PackedDocumentUpdate>,
-            &WriteSource,
-        ),
-    > {
-        self.by_ts
-            .range(from..=to)
-            .map(|(ts, (w, source, _snapshot))| (ts, w.iter(), source))
-    }
-
     pub fn is_stale(
         &self,
         reads: &ReadSet,
         reads_ts: Timestamp,
         ts: Timestamp,
     ) -> anyhow::Result<Option<ConflictingReadWithWriteSource>> {
-        Ok(reads.writes_overlap_docs(self.iter(reads_ts.succ()?, ts)))
+        for (write_ts, (writes, write_source, snapshot)) in self.by_ts.range(reads_ts.succ()?..=ts)
+        {
+            if let Some(conflict) = reads.writes_overlap_docs(
+                std::iter::once((write_ts, writes.iter(), write_source)),
+                snapshot.index_registry.index_table(),
+            ) {
+                return Ok(Some(conflict));
+            }
+        }
+        Ok(None)
     }
 
     pub fn pop_first(

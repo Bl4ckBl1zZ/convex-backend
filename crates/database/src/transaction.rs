@@ -15,6 +15,7 @@ use common::{
         index::{
             database_index::IndexedFields,
             IndexMetadata,
+            TabletIndexMetadata,
             INDEX_TABLE,
         },
         schema::SchemaState,
@@ -139,6 +140,7 @@ use crate::{
     transaction_index::TransactionIndex,
     write_limits::BiggestDocumentWrites,
     writes::{
+        MetadataWriteDependency,
         NestedWriteToken,
         NestedWrites,
         Writes,
@@ -190,7 +192,6 @@ pub struct Transaction<RT: Runtime> {
 
     pub usage_tracker: FunctionUsageTracker,
     pub(crate) virtual_system_mapping: VirtualSystemMapping,
-
 }
 
 #[async_trait]
@@ -652,6 +653,54 @@ impl<RT: Runtime> Transaction<RT> {
         Ok(new_document)
     }
 
+    /// Replace only the mutable state of an existing `_index` document.
+    ///
+    /// Unlike index definition writes, this records a point OCC dependency
+    /// instead of conflicting with every `_index` and `_tables` change. The
+    /// name and index specification are checked below before the narrow write
+    /// scope is allowed.
+    pub(crate) async fn replace_index_state_inner(
+        &mut self,
+        id: ResolvedDocumentId,
+        value: ConvexObject,
+    ) -> anyhow::Result<ResolvedDocument> {
+        task::consume_budget().await;
+        anyhow::ensure!(
+            self.bootstrap_tables().is_index_table(id.tablet_id),
+            "replace_index_state_inner requires an _index document"
+        );
+
+        let table_name = self.table_mapping().tablet_name(id.tablet_id)?;
+        let namespace = self.table_mapping().tablet_namespace(id.tablet_id)?;
+        let (old_document, old_ts) = self
+            .get_inner(id, table_name)
+            .await?
+            .context("Index state update on nonexistent index document")?;
+        let new_document = old_document.clone().replace_value(value)?;
+        if new_document == old_document {
+            return Ok(new_document);
+        }
+
+        let old_metadata = TabletIndexMetadata::from_document(old_document.clone())?;
+        let new_metadata = TabletIndexMetadata::from_document(new_document.clone())?;
+        anyhow::ensure!(
+            old_metadata.name == new_metadata.name
+                && old_metadata.config.same_spec(&new_metadata.config),
+            "Narrow index state update changed the index name or specification"
+        );
+
+        SchemaModel::new(self, namespace)
+            .enforce(&new_document)
+            .await?;
+        self.apply_validated_write_with_metadata_dependency(
+            id,
+            Some((old_document, old_ts)),
+            Some(new_document.clone().into()),
+            MetadataWriteDependency::Document,
+        )?;
+        Ok(new_document)
+    }
+
     #[convex_macro::instrument_future]
     pub async fn delete_inner(
         &mut self,
@@ -1109,6 +1158,21 @@ impl<RT: Runtime> Transaction<RT> {
         old_document_and_ts: Option<(ResolvedDocument, WriteTimestamp)>,
         new_document: Option<PendingDocument>,
     ) -> anyhow::Result<()> {
+        self.apply_validated_write_with_metadata_dependency(
+            id,
+            old_document_and_ts,
+            new_document,
+            MetadataWriteDependency::Registry,
+        )
+    }
+
+    fn apply_validated_write_with_metadata_dependency(
+        &mut self,
+        id: ResolvedDocumentId,
+        old_document_and_ts: Option<(ResolvedDocument, WriteTimestamp)>,
+        new_document: Option<PendingDocument>,
+        metadata_write_dependency: MetadataWriteDependency,
+    ) -> anyhow::Result<()> {
         // Implement something like two-phase commit between the index and the document
         // store. We first guarantee that the changes are valid for the index and
         // metadata and then let inserting into writes the commit
@@ -1171,6 +1235,7 @@ impl<RT: Runtime> Transaction<RT> {
         // index and metadata updates.
         self.writes.update(
             bootstrap_tables,
+            metadata_write_dependency,
             is_system_document,
             &mut self.reads,
             id,
@@ -1352,10 +1417,8 @@ impl<RT: Runtime> Transaction<RT> {
             runtime: self.runtime.clone(),
             usage_tracker: self.usage_tracker.clone(),
             virtual_system_mapping: self.virtual_system_mapping.clone(),
-
         }
     }
-
 }
 
 #[must_use]
@@ -1403,7 +1466,6 @@ pub struct FinalTransaction {
     pub(crate) writes: Writes,
 
     pub(crate) usage_tracker: FunctionUsageTracker,
-
 }
 
 impl FinalTransaction {
@@ -1423,7 +1485,6 @@ impl FinalTransaction {
             reads: transaction.reads,
             writes: transaction.writes.into_flat()?,
             usage_tracker: transaction.usage_tracker,
-
         })
     }
 

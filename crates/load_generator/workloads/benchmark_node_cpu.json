@@ -1,0 +1,11 @@
+{
+  "name": "benchmark_node_cpu",
+  "scenarios": [
+    {
+      "name": "RunFunction",
+      "path": "actions/cpu:spin",
+      "fn_type": "action",
+      "benchmark": 16
+    }
+  ]
+}

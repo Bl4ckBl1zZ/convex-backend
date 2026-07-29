@@ -547,6 +547,8 @@ impl FromStr for TableRate {
 #[derive(Clone)]
 pub struct FunctionExecutionLog<RT: Runtime> {
     inner: Arc<Mutex<Inner<RT>>>,
+    metrics: Arc<Mutex<MetricStore>>,
+    log_manager: Arc<dyn LogSender>,
     usage_tracking: UsageCounter,
     rt: RT,
     concurrency_stats_logger: Arc<Mutex<Box<dyn SpawnHandle>>>,
@@ -560,26 +562,25 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
             num_execution_completions: 0,
             log: WithHeapSize::default(),
             log_waiters: vec![].into(),
-            log_manager,
-            metrics: MetricStore::new(
-                base_ts,
-                MetricStoreConfig {
-                    bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
-                    max_buckets: *knobs::UDF_METRICS_MAX_BUCKETS,
-                    histogram_min_duration: *knobs::UDF_METRICS_MIN_DURATION,
-                    histogram_max_duration: *knobs::UDF_METRICS_MAX_DURATION,
-                    histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
-                },
-            ),
         }));
-
-        let inner_for_task = inner.clone();
+        let metrics = Arc::new(Mutex::new(MetricStore::new(
+            base_ts,
+            MetricStoreConfig {
+                bucket_width: *knobs::UDF_METRICS_BUCKET_WIDTH,
+                max_buckets: *knobs::UDF_METRICS_MAX_BUCKETS,
+                histogram_min_duration: *knobs::UDF_METRICS_MIN_DURATION,
+                histogram_max_duration: *knobs::UDF_METRICS_MAX_DURATION,
+                histogram_significant_figures: *knobs::UDF_METRICS_SIGNIFICANT_FIGURES,
+            },
+        )));
+        let metrics_for_task = metrics.clone();
+        let log_manager_for_task = log_manager.clone();
+        let runtime = rt.clone();
 
         // Spawn a background task to periodically send concurrency stats
         let concurrency_stats_logger = Arc::new(Mutex::new(rt.spawn(
             "concurrency_stats_logger",
             async move {
-                let runtime = inner_for_task.lock().rt.clone();
                 loop {
                     let bucket_width = *knobs::UDF_METRICS_BUCKET_WIDTH;
                     runtime.wait(bucket_width).await;
@@ -587,9 +588,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                     let now = runtime.system_time();
 
                     // Query all outstanding_functions gauges to get current concurrency stats
-                    let inner = inner_for_task.lock();
-                    let metrics = inner.metrics.clone();
-                    drop(inner);
+                    let metrics = metrics_for_task.lock().clone();
 
                     let start_time = now - bucket_width;
 
@@ -615,8 +614,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                             },
                         };
 
-                        let inner = inner_for_task.lock();
-                        inner.log_manager.send_logs(vec![event]);
+                        log_manager_for_task.send_logs(vec![event]);
                     }
                 }
             },
@@ -624,6 +622,8 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
 
         Self {
             inner,
+            metrics,
+            log_manager,
             rt,
             usage_tracking,
             concurrency_stats_logger,
@@ -1256,11 +1256,31 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         send_console_events: bool,
         log_app_metrics: bool,
     ) {
-        if let Err(mut e) =
-            self.inner
-                .lock()
-                .log_execution(execution, send_console_events, log_app_metrics)
+        if log_app_metrics
+            && let Err(e) =
+                Inner::<RT>::log_execution_app_metrics(&mut self.metrics.lock(), &execution)
         {
+            Inner::<RT>::log_metrics_error(e);
+        }
+
+        // Construct sink events outside the ordered in-memory log lock. Keep the
+        // nonblocking enqueue and cursor publication under the same short critical
+        // section so every consumer observes the same event order.
+        let mut log_events = if send_console_events {
+            execution.console_log_events()
+        } else {
+            vec![]
+        };
+        match execution.udf_execution_record_log_events() {
+            Ok(records) => log_events.extend(records),
+            Err(mut e) => {
+                tracing::error!("failed to create UDF execution record: {}", e);
+                report_error_sync(&mut e);
+            },
+        }
+        let mut inner = self.inner.lock();
+        self.log_manager.send_logs(log_events);
+        if let Err(mut e) = inner.push_execution(execution) {
             report_error_sync(&mut e);
         }
     }
@@ -1271,11 +1291,14 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         event_source: FunctionEventSource,
         timestamp: UnixTimestamp,
     ) {
-        if let Err(mut e) =
-            self.inner
-                .lock()
-                .log_execution_progress(log_lines, event_source, timestamp)
-        {
+        let progress = FunctionExecutionProgress {
+            log_lines,
+            event_source,
+            function_start_timestamp: timestamp,
+        };
+        let mut inner = self.inner.lock();
+        self.log_manager.send_logs(progress.console_log_events());
+        if let Err(mut e) = inner.push_execution_progress(progress) {
             report_error_sync(&mut e);
         }
     }
@@ -1289,17 +1312,57 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         num_running_jobs: u64,
     ) {
         if let Err(mut e) =
-            self.inner
-                .lock()
-                .log_scheduled_job_stats(next_job_ts, timestamp, num_running_jobs)
+            self.log_scheduled_job_stats_inner(next_job_ts, timestamp, num_running_jobs)
         {
             report_error_sync(&mut e);
         }
     }
 
+    fn log_scheduled_job_stats_inner(
+        &self,
+        next_job_ts: Option<SystemTime>,
+        now: SystemTime,
+        num_running_jobs: u64,
+    ) -> anyhow::Result<()> {
+        let name = scheduled_job_next_ts_metric();
+        // -Infinity means there is no scheduled job.
+        let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
+        if value > 0.0 {
+            self.log_manager.send_logs(vec![LogEvent {
+                timestamp: UnixTimestamp::from_system_time(now).context("now < UNIX_EPOCH?")?,
+                event: StructuredLogEvent::ScheduledJobLag {
+                    lag_seconds: Duration::from_secs_f32(value.max(0.0)),
+                },
+            }]);
+        }
+        if value > 0.0 || num_running_jobs > 0 {
+            self.log_manager.send_logs(vec![LogEvent {
+                timestamp: UnixTimestamp::from_system_time(now).context("now < UNIX_EPOCH?")?,
+                event: StructuredLogEvent::SchedulerStats {
+                    lag_seconds: Duration::from_secs_f32(value.max(0.0)),
+                    num_running_jobs,
+                },
+            }]);
+        }
+
+        let mut metrics = self.metrics.lock();
+        match metrics.add_gauge(name, now, value) {
+            Ok(()) => (),
+            Err(UdfMetricsError::SamplePrecedesCutoff { ts: _, cutoff }) => {
+                // `now` was too old; automatically promote the sample to the cutoff time
+                // instead.
+                let value =
+                    next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(cutoff, ts));
+                metrics.add_gauge(name, cutoff, value)?;
+            },
+            Err(err) => return Err(err.into()),
+        }
+        Ok(())
+    }
+
     pub fn record_subscription_invalidations(&self, events: Vec<database::InvalidationEvent>) {
         let ts = self.rt.system_time();
-        let mut inner = self.inner.lock();
+        let mut metrics = self.metrics.lock();
         for event in &events {
             if let Some(display_name) = event.write_source.as_ref().and_then(|ws| ws.display_name())
             {
@@ -1307,7 +1370,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
                     "subscription_invalidations:{display_name}:{}",
                     event.tablet_id
                 );
-                if let Err(e) = inner.metrics.add_counter(&name, ts, event.count as f32) {
+                if let Err(e) = metrics.add_counter(&name, ts, event.count as f32) {
                     Inner::<RT>::log_metrics_error(e);
                 }
             }
@@ -1320,10 +1383,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         metric: UdfRate,
         window: MetricsWindow,
     ) -> anyhow::Result<Timeseries> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         let name = match metric {
             UdfRate::Invocations => udf_invocations_metric(&identifier),
             UdfRate::Errors => udf_errors_metric(&identifier),
@@ -1352,10 +1412,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         identifier: UdfIdentifier,
         window: MetricsWindow,
     ) -> anyhow::Result<Timeseries> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         let hits = metrics.query_counter(
             &udf_cache_hits_metric(&identifier),
             window.start..window.end,
@@ -1375,10 +1432,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         window: MetricsWindow,
         k: usize,
     ) -> anyhow::Result<Vec<(String, Timeseries)>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
 
         // Get the invocations and errors
         let invocations = Self::get_udf_metric_counter(&window, &metrics, "invocations")?;
@@ -1392,10 +1446,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         window: MetricsWindow,
         k: usize,
     ) -> anyhow::Result<Vec<(String, Timeseries)>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
 
         // Get the invocations and hits
         let hits = Self::get_udf_metric_counter(&window, &metrics, "cache_hits")?;
@@ -1408,10 +1459,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         &self,
         window: &MetricsWindow,
     ) -> anyhow::Result<HashMap<String, Timeseries>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         Self::get_udf_metric_counter(window, &metrics, "invocations")
     }
 
@@ -1420,10 +1468,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         window: MetricsWindow,
         k: usize,
     ) -> anyhow::Result<Vec<(String, Timeseries)>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
 
         let mut invocations = Self::get_udf_metric_counter(&window, &metrics, "invocations")?;
 
@@ -1462,10 +1507,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         k: usize,
         identifier: Option<&UdfIdentifier>,
     ) -> anyhow::Result<Vec<(String, Timeseries)>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         let mutation_filter = identifier.map(udf_metric_name);
         let mut counters = Self::get_subscription_invalidation_counter(
             &window,
@@ -1644,10 +1686,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         percentiles: Vec<Percentile>,
         window: MetricsWindow,
     ) -> anyhow::Result<BTreeMap<Percentile, Timeseries>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         let buckets = metrics.query_histogram(
             &udf_execution_time_metric(&identifier),
             window.start..window.end,
@@ -1661,10 +1700,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         metric: TableRate,
         window: MetricsWindow,
     ) -> anyhow::Result<Timeseries> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         let name = match metric {
             TableRate::RowsRead => table_rows_read_metric(&table_name),
             TableRate::RowsWritten => table_rows_written_metric(&table_name),
@@ -1884,10 +1920,7 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
     }
 
     pub fn scheduled_job_lag(&self, window: MetricsWindow) -> anyhow::Result<Timeseries> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
         let buckets = metrics
             .query_gauge(scheduled_job_next_ts_metric(), window.start..window.end)?
             .into_iter()
@@ -1925,21 +1958,14 @@ impl<RT: Runtime> FunctionExecutionLog<RT> {
         let now = self.rt.system_time();
         let name = outstanding_functions_metric(&env, &udf_type, &state);
         // Use gauge with max operation to track maximum value within each bucket.
-        let _ = self
-            .inner
-            .lock()
-            .metrics
-            .add_gauge_max(&name, now, total as f32);
+        let _ = self.metrics.lock().add_gauge_max(&name, now, total as f32);
     }
 
     pub fn function_concurrency(
         &self,
         window: MetricsWindow,
     ) -> anyhow::Result<BTreeMap<String, Timeseries>> {
-        let metrics = {
-            let inner = self.inner.lock();
-            inner.metrics.clone()
-        };
+        let metrics = self.metrics.lock().clone();
 
         let mut result = BTreeMap::new();
 
@@ -2023,40 +2049,11 @@ struct Inner<RT: Runtime> {
     log: WithHeapSize<VecDeque<(CursorMs, FunctionExecutionPart)>>,
     num_execution_completions: usize,
     log_waiters: WithHeapSize<Vec<oneshot::Sender<()>>>,
-    log_manager: Arc<dyn LogSender>,
-    metrics: MetricStore,
 }
 
 impl<RT: Runtime> Inner<RT> {
-    fn log_execution(
-        &mut self,
-        execution: FunctionExecution,
-        send_console_events: bool,
-        log_app_metrics: bool,
-    ) -> anyhow::Result<()> {
-        if log_app_metrics && let Err(e) = self.log_execution_app_metrics(&execution) {
-            Self::log_metrics_error(e);
-        }
+    fn push_execution(&mut self, execution: FunctionExecution) -> anyhow::Result<()> {
         let next_time = self.next_time()?;
-
-        // Gather log lines
-        let mut log_events = if send_console_events {
-            execution.console_log_events()
-        } else {
-            vec![]
-        };
-        // Gather UDF execution record
-        match execution.udf_execution_record_log_events() {
-            Ok(records) => log_events.extend(records),
-            Err(mut e) => {
-                // Don't let failing to construct the UDF execution record block sending
-                // the other log events
-                tracing::error!("failed to create UDF execution record: {}", e);
-                report_error_sync(&mut e);
-            },
-        }
-
-        self.log_manager.send_logs(log_events);
 
         self.log
             .push_back((next_time, FunctionExecutionPart::Completion(execution)));
@@ -2094,7 +2091,7 @@ impl<RT: Runtime> Inner<RT> {
     }
 
     fn log_execution_app_metrics(
-        &mut self,
+        metrics: &mut MetricStore,
         execution: &FunctionExecution,
     ) -> Result<(), UdfMetricsError> {
         let ts = execution.unix_timestamp.as_system_time();
@@ -2102,7 +2099,7 @@ impl<RT: Runtime> Inner<RT> {
         let identifier = execution.identifier();
 
         let name = udf_invocations_metric(&identifier);
-        self.metrics.add_counter(&name, ts, 1.0)?;
+        metrics.add_counter(&name, ts, 1.0)?;
 
         let is_err = match &execution.params {
             UdfParams::Function { error, .. } => error.is_some(),
@@ -2110,92 +2107,39 @@ impl<RT: Runtime> Inner<RT> {
         };
         if is_err {
             let name = udf_errors_metric(&identifier);
-            self.metrics.add_counter(&name, ts, 1.0)?;
+            metrics.add_counter(&name, ts, 1.0)?;
         }
         if execution.udf_type == UdfType::Query {
             if execution.cached_result {
                 let name = udf_cache_hits_metric(&identifier);
-                self.metrics.add_counter(&name, ts, 1.0)?;
+                metrics.add_counter(&name, ts, 1.0)?;
             } else {
                 let name = udf_cache_misses_metric(&identifier);
-                self.metrics.add_counter(&name, ts, 1.0)?;
+                metrics.add_counter(&name, ts, 1.0)?;
             }
         }
 
         let name = udf_execution_time_metric(&identifier);
-        self.metrics
-            .add_histogram(&name, ts, Duration::from_secs_f64(execution.execution_time))?;
+        metrics.add_histogram(&name, ts, Duration::from_secs_f64(execution.execution_time))?;
 
         for (table_name, table_stats) in &execution.tables_touched {
             let name = table_rows_read_metric(table_name);
-            self.metrics
-                .add_counter(&name, ts, table_stats.rows_read as f32)?;
+            metrics.add_counter(&name, ts, table_stats.rows_read as f32)?;
             let name = table_rows_written_metric(table_name);
-            self.metrics
-                .add_counter(&name, ts, table_stats.rows_written as f32)?;
+            metrics.add_counter(&name, ts, table_stats.rows_written as f32)?;
         }
         Ok(())
     }
 
-    fn log_execution_progress(
+    fn push_execution_progress(
         &mut self,
-        log_lines: LogLines,
-        event_source: FunctionEventSource,
-        function_start_timestamp: UnixTimestamp,
+        progress: FunctionExecutionProgress,
     ) -> anyhow::Result<()> {
         let next_time = self.next_time()?;
-        let progress = FunctionExecutionProgress {
-            log_lines,
-            event_source,
-            function_start_timestamp,
-        };
-
-        let log_events = progress.console_log_events();
-        self.log_manager.send_logs(log_events);
         self.log
             .push_back((next_time, FunctionExecutionPart::Progress(progress)));
         for waiter in self.log_waiters.drain(..) {
             let _ = waiter.send(());
-        }
-        Ok(())
-    }
-
-    fn log_scheduled_job_stats(
-        &mut self,
-        next_job_ts: Option<SystemTime>,
-        now: SystemTime,
-        num_running_jobs: u64,
-    ) -> anyhow::Result<()> {
-        let name = scheduled_job_next_ts_metric();
-        // -Infinity means there is no scheduled job
-        let value = next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(now, ts));
-        if value > 0.0 {
-            self.log_manager.send_logs(vec![LogEvent {
-                timestamp: UnixTimestamp::from_system_time(now).context("now < UNIX_EPOCH?")?,
-                event: StructuredLogEvent::ScheduledJobLag {
-                    lag_seconds: Duration::from_secs_f32(value.max(0.0)),
-                },
-            }]);
-        }
-        if value > 0.0 || num_running_jobs > 0 {
-            self.log_manager.send_logs(vec![LogEvent {
-                timestamp: UnixTimestamp::from_system_time(now).context("now < UNIX_EPOCH?")?,
-                event: StructuredLogEvent::SchedulerStats {
-                    lag_seconds: Duration::from_secs_f32(value.max(0.0)),
-                    num_running_jobs,
-                },
-            }]);
-        }
-        match self.metrics.add_gauge(name, now, value) {
-            Ok(()) => (),
-            Err(UdfMetricsError::SamplePrecedesCutoff { ts: _, cutoff }) => {
-                // `now` was too old; automatically promote the sample to the cutoff time
-                // instead
-                let value =
-                    next_job_ts.map_or(-f32::INFINITY, |ts| signed_duration_since(cutoff, ts));
-                self.metrics.add_gauge(name, cutoff, value)?;
-            },
-            Err(err) => return Err(err.into()),
         }
         Ok(())
     }

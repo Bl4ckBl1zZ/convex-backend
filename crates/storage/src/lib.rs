@@ -27,7 +27,10 @@ use std::{
         PathBuf,
     },
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        LazyLock,
+    },
     task::{
         Context,
         Poll,
@@ -41,6 +44,7 @@ use std::{
 use anyhow::Context as _;
 use async_trait::async_trait;
 use bytes::Bytes;
+use cmd_util::env::env_config;
 use common::{
     errors::report_error,
     runtime::Runtime,
@@ -93,7 +97,9 @@ use value::sha256::{
 pub const LOCAL_DIR_MIN_PART_SIZE: usize = 5 * (1 << 20);
 pub const LOCAL_DIR_MAX_PART_SIZE: usize = 8 * (1 << 30);
 pub const MAX_NUM_PARTS: usize = 10000;
-pub const MAXIMUM_PARALLEL_UPLOADS: usize = 8;
+/// Maximum number of storage parts uploaded concurrently by one upload.
+pub static MAXIMUM_PARALLEL_UPLOADS: LazyLock<usize> =
+    LazyLock::new(|| env_config("STORAGE_MAXIMUM_PARALLEL_UPLOADS", 8).max(1));
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Ord, derive_more::Display)]
 pub struct UploadId(String);
@@ -128,7 +134,9 @@ pub struct ClientDrivenUploadToken(pub String);
 pub struct ClientDrivenUploadPartToken(pub String);
 
 pub const DOWNLOAD_CHUNK_SIZE: u64 = 8 * (1 << 20);
-pub const MAX_CONCURRENT_CHUNK_DOWNLOADS: usize = 16;
+/// Maximum number of storage chunks fetched concurrently by one download.
+pub static MAX_CONCURRENT_CHUNK_DOWNLOADS: LazyLock<usize> =
+    LazyLock::new(|| env_config("STORAGE_MAX_CONCURRENT_CHUNK_DOWNLOADS", 16).max(1));
 
 #[async_trait]
 pub trait Storage: Send + Sync + Debug {
@@ -425,7 +433,7 @@ impl Upload for BufferedUpload {
         stream: &mut Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send + 'a>>,
     ) -> anyhow::Result<()> {
         // Try to keep some buffered data ready in the channel, but not too much.
-        let (tx, rx) = mpsc::channel(MAXIMUM_PARALLEL_UPLOADS / 2);
+        let (tx, rx) = mpsc::channel((*MAXIMUM_PARALLEL_UPLOADS / 2).max(1));
 
         let mut boxed_rx = ReceiverStream::new(rx).boxed();
         let mut upload = self.upload.try_write_parallel(&mut boxed_rx).fuse();
@@ -731,7 +739,7 @@ impl StorageExt for Arc<dyn Storage> {
         // output of the future (i.e. a `ByteStream`)
         let byte_stream = futures::stream::iter(chunk_futures)
             // Limit the concurrency of the chunk downloads
-            .buffered(MAX_CONCURRENT_CHUNK_DOWNLOADS)
+            .buffered(*MAX_CONCURRENT_CHUNK_DOWNLOADS)
             // Flatten the `Stream<Item = io::Result<Stream<Item = io::Result<Bytes>>>>` into a single `Stream<Item = io::Result<Bytes>>`
             .try_flatten();
         StorageGetStream {

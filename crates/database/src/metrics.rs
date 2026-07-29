@@ -274,6 +274,14 @@ pub fn commit_queue_timer() -> Timer<VMHistogram> {
 }
 
 register_convex_histogram!(
+    DATABASE_COMMIT_PERSISTENCE_PERMIT_SECONDS,
+    "Time a commit waits for bounded persistence-write capacity"
+);
+pub fn commit_persistence_permit_timer() -> Timer<VMHistogram> {
+    Timer::new(&DATABASE_COMMIT_PERSISTENCE_PERMIT_SECONDS)
+}
+
+register_convex_histogram!(
     DATABASE_COMMIT_SECONDS,
     "Time taken for a database commit",
     &STATUS_LABEL

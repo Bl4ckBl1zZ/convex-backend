@@ -29,10 +29,30 @@ use common::{
         RouteMapper,
     },
     knobs::{
+        APPLICATION_MAX_CONCURRENT_MUTATIONS,
+        APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
+        APPLICATION_MAX_CONCURRENT_QUERIES,
+        APPLICATION_MAX_CONCURRENT_V8_ACTIONS,
+        ASYNC_JOIN_CONCURRENCY,
+        COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES,
         DOCUMENT_RETENTION_RATE_LIMIT,
+        FUNRUN_ISOLATE_ACTIVE_THREADS,
         INDEX_CACHE_SIZE,
+        INDEX_RANGE_BATCH_CONCURRENCY,
+        IN_MEMORY_INDEX_LOAD_CONCURRENCY,
+        MAX_ACTION_ISOLATE_WORKERS,
+        MAX_TRANSACTION_ISOLATE_WORKERS,
         NODE_ACTION_USER_TIMEOUT,
+        POSTGRES_MAX_CONNECTIONS,
+        SEARCH_INDEX_BUILD_CONCURRENCY,
+        SEARCH_INDEX_COMPACTION_CONCURRENCY,
+        SEARCH_INDEX_WRITER_QUEUE_SIZE,
+        SEARCH_INDEX_WRITER_THREADS,
+        TABLE_SUMMARY_SNAPSHOT_CONCURRENCY,
         UDF_CACHE_MAX_SIZE,
+        VERTICAL_SCALING_CPU_COUNT,
+        VERTICAL_SCALING_ENABLED,
+        VERTICAL_SCALING_RESERVED_CPU_COUNT,
     },
     persistence::Persistence,
     runtime::{
@@ -69,12 +89,26 @@ use model::{
     virtual_system_mapping,
 };
 use node_executor::{
-    local::LocalNodeExecutor,
+    local::{
+        LocalNodeExecutor,
+        LOCAL_NODE_EXECUTOR_POOL_SIZE,
+    },
+    remote::RemoteNodeExecutor,
     NodeActions,
+    NodeExecutor,
 };
 use runtime::prod::ProdRuntime;
 use search::{
-    searcher::InProcessSearcher,
+    searcher::{
+        InProcessSearcher,
+        MAX_CONCURRENT_SEGMENT_COMPACTIONS,
+        MAX_CONCURRENT_SEGMENT_FETCHES,
+        MAX_CONCURRENT_TEXT_SEARCHES,
+        MAX_CONCURRENT_VECTOR_SEARCHES,
+        MAX_CONCURRENT_VECTOR_SEGMENT_PREFETCHES,
+        SEARCH_GENERAL_POOL_MAX_CONCURRENCY,
+        SEARCH_GENERAL_POOL_QUEUE_SIZE,
+    },
     Searcher,
     SegmentTermMetadataFetcher,
 };
@@ -112,8 +146,6 @@ pub mod streaming_export;
 pub mod streaming_import;
 pub mod subs;
 pub mod usage_limits;
-
-pub const MAX_CONCURRENT_REQUESTS: usize = 128;
 
 #[derive(Clone)]
 pub struct LocalAppState {
@@ -154,6 +186,37 @@ pub async fn make_app(
     zombify_rx: async_broadcast::Receiver<()>,
     preempt_tx: ShutdownSignal,
 ) -> anyhow::Result<LocalAppState> {
+    tracing::info!(
+        vertical_scaling_enabled = *VERTICAL_SCALING_ENABLED,
+        cpu_count = *VERTICAL_SCALING_CPU_COUNT,
+        reserved_cpu_count = *VERTICAL_SCALING_RESERVED_CPU_COUNT,
+        active_v8_cpu_limit = *FUNRUN_ISOLATE_ACTIVE_THREADS,
+        transaction_isolate_workers = *MAX_TRANSACTION_ISOLATE_WORKERS,
+        action_isolate_workers = *MAX_ACTION_ISOLATE_WORKERS,
+        max_concurrent_queries = *APPLICATION_MAX_CONCURRENT_QUERIES,
+        max_concurrent_mutations = *APPLICATION_MAX_CONCURRENT_MUTATIONS,
+        max_concurrent_v8_actions = *APPLICATION_MAX_CONCURRENT_V8_ACTIONS,
+        max_concurrent_node_actions = *APPLICATION_MAX_CONCURRENT_NODE_ACTIONS,
+        max_concurrent_persistence_writes = *COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES,
+        postgres_max_connections = *POSTGRES_MAX_CONNECTIONS,
+        local_node_executor_processes = *LOCAL_NODE_EXECUTOR_POOL_SIZE,
+        async_join_concurrency = *ASYNC_JOIN_CONCURRENCY,
+        index_range_batch_concurrency = *INDEX_RANGE_BATCH_CONCURRENCY,
+        in_memory_index_load_concurrency = *IN_MEMORY_INDEX_LOAD_CONCURRENCY,
+        table_summary_snapshot_concurrency = *TABLE_SUMMARY_SNAPSHOT_CONCURRENCY,
+        search_index_build_concurrency = *SEARCH_INDEX_BUILD_CONCURRENCY,
+        search_index_compaction_concurrency = *SEARCH_INDEX_COMPACTION_CONCURRENCY,
+        search_global_compaction_concurrency = *MAX_CONCURRENT_SEGMENT_COMPACTIONS,
+        search_segment_fetch_concurrency = *MAX_CONCURRENT_SEGMENT_FETCHES,
+        search_vector_concurrency = *MAX_CONCURRENT_VECTOR_SEARCHES,
+        search_text_concurrency = *MAX_CONCURRENT_TEXT_SEARCHES,
+        search_vector_prefetch_concurrency = *MAX_CONCURRENT_VECTOR_SEGMENT_PREFETCHES,
+        search_general_pool_concurrency = *SEARCH_GENERAL_POOL_MAX_CONCURRENCY,
+        search_general_pool_queue_size = *SEARCH_GENERAL_POOL_QUEUE_SIZE,
+        search_index_writer_threads = *SEARCH_INDEX_WRITER_THREADS,
+        search_index_writer_queue_size = *SEARCH_INDEX_WRITER_QUEUE_SIZE,
+        "Resolved single-host execution capacity"
+    );
     let key_broker = config.key_broker()?;
     let in_process_searcher = Arc::new(InProcessSearcher::new(runtime.clone())?);
     let searcher: Arc<dyn Searcher> = in_process_searcher.clone();
@@ -199,7 +262,11 @@ pub async fn make_app(
         class: DeploymentClass::S16,
     };
     let node_process_timeout = *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5);
-    let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
+    let node_executor: Arc<dyn NodeExecutor> =
+        match RemoteNodeExecutor::from_env(node_process_timeout)? {
+            Some(remote_executor) => Arc::new(remote_executor),
+            None => Arc::new(LocalNodeExecutor::new(node_process_timeout).await?),
+        };
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,

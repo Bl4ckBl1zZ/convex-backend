@@ -174,6 +174,20 @@ impl<'a, RT: Runtime> SystemMetadataModel<'a, RT> {
         self.tx.replace_inner(id, value).await
     }
 
+    /// Replaces the mutable state of an existing `_index` document without
+    /// taking a whole-registry OCC dependency. The transaction verifies that
+    /// the index name and specification are unchanged.
+    #[fastrace::trace]
+    #[convex_macro::instrument_future]
+    pub async fn replace_index_state(
+        &mut self,
+        id: ResolvedDocumentId,
+        value: ConvexObject,
+    ) -> anyhow::Result<ResolvedDocument> {
+        anyhow::ensure!(self.tx.table_mapping().is_system_tablet(id.tablet_id));
+        self.tx.replace_index_state_inner(id, value).await
+    }
+
     /// Delete the document at the given path.
     #[fastrace::trace]
     #[convex_macro::instrument_future]

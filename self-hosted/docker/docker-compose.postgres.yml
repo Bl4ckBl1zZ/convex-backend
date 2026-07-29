@@ -1,0 +1,69 @@
+services:
+  backend:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DO_NOT_REQUIRE_SSL=1
+      - INSTANCE_NAME=${INSTANCE_NAME:-convex-self-hosted}
+      - POSTGRES_URL=${POSTGRES_URL:-postgresql://convex:convex@postgres:5432}
+      - POSTGRES_MAX_CONNECTIONS=${POSTGRES_MAX_CONNECTIONS:-64}
+      - MAX_BYTES_WRITTEN_PER_SECOND=${MAX_BYTES_WRITTEN_PER_SECOND:-16777216}
+
+  postgres:
+    image: postgres:17-alpine
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.convex.conf
+    shm_size: 1gb
+    ports:
+      # Bind only to localhost. The backend uses the internal `postgres:5432`
+      # address; this port is for migrations, diagnostics, and benchmarks.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-convex_self_hosted}
+      - POSTGRES_USER=${POSTGRES_USER:-convex}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-convex}
+      - POSTGRES_INITDB_ARGS=--data-checksums
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-convex} -d ${POSTGRES_DB:-convex_self_hosted}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgresql.convex.conf:/etc/postgresql/postgresql.convex.conf:ro
+      - ./postgres-autovacuum.sql:/opt/convex/postgres-autovacuum.sql:ro
+      - ./postgres-autovacuum-health.sql:/opt/convex/postgres-autovacuum-health.sql:ro
+
+  # Applies table and TOAST-specific autovacuum settings after the backend has
+  # created Convex's persistence tables. It exits successfully once tuned.
+  postgres-autovacuum-tune:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - PGHOST=postgres
+      - PGDATABASE=${POSTGRES_DB:-convex_self_hosted}
+      - PGUSER=${POSTGRES_USER:-convex}
+      - PGPASSWORD=${POSTGRES_PASSWORD:-convex}
+    volumes:
+      - ./postgres-autovacuum.sql:/opt/convex/postgres-autovacuum.sql:ro
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until [ "$(psql -Atqc "SELECT to_regclass('public.documents') IS NOT NULL")" = "t" ]; do
+          sleep 2
+        done
+        psql -v ON_ERROR_STOP=1 -f /opt/convex/postgres-autovacuum.sql
+    restart: on-failure
+
+volumes:
+  postgres-data:

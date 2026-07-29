@@ -38,6 +38,7 @@ use common::{
         EncodedSpan,
     },
     knobs::{
+        COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES,
         COMMITTER_QUEUE_SIZE,
         COMMIT_TRACE_THRESHOLD,
         INITIAL_PERSISTENCE_WRITES_BACKOFF,
@@ -106,6 +107,7 @@ use tokio::sync::{
         error::TrySendError,
     },
     oneshot,
+    Semaphore,
 };
 use tokio_util::task::AbortOnDropHandle;
 use usage_tracking::FunctionUsageTracker;
@@ -196,6 +198,7 @@ pub struct Committer<RT: Runtime> {
     last_assigned_ts: Timestamp,
 
     persistence_writes: FuturesOrdered<BoxFuture<'static, anyhow::Result<PersistenceWrite>>>,
+    persistence_write_limiter: Arc<Semaphore>,
 
     retention_validator: Arc<dyn RetentionValidator>,
     virtual_system_mapping: VirtualSystemMapping,
@@ -228,6 +231,9 @@ impl<RT: Runtime> Committer<RT> {
             runtime: runtime.clone(),
             last_assigned_ts: Timestamp::MIN,
             persistence_writes: FuturesOrdered::new(),
+            persistence_write_limiter: Arc::new(Semaphore::new(
+                *COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES,
+            )),
             retention_validator: retention_validator.clone(),
             virtual_system_mapping,
             user_documents_size_gauge: user_documents_size_subgauge(),
@@ -1049,6 +1055,7 @@ impl<RT: Runtime> Committer<RT> {
         // necessary because this value is moved
         let parent_trace_copy = parent_trace.clone();
         let persistence = self.persistence.clone();
+        let persistence_write_limiter = self.persistence_write_limiter.clone();
         let outer_span =
             initialize_root_from_parent("Committer::persistence_writes_future", parent_trace);
         if let Some(ctx) = SpanContext::from_span(root_span) {
@@ -1061,6 +1068,12 @@ impl<RT: Runtime> Committer<RT> {
         Some(
             async move {
                 let name = "Commit::write_to_persistence";
+                let persistence_permit_timer = metrics::commit_persistence_permit_timer();
+                let _persistence_write_permit = persistence_write_limiter
+                    .acquire_owned()
+                    .await
+                    .context("Commit persistence-write limiter shut down")?;
+                drop(persistence_permit_timer);
                 // Spawn a new task for tracking commit, serializing writes, and writing to
                 // persistence so it doesn't block the committer thread
                 let handle = AbortOnDropHandle::new(tokio_spawn(

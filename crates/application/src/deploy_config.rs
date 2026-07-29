@@ -29,7 +29,10 @@ use common::{
     },
     errors::JsError,
     execution_context::RequestMetadata,
-    knobs::FINISH_PUSH_MAX_OCC_FAILURES,
+    knobs::{
+        ASYNC_JOIN_CONCURRENCY,
+        FINISH_PUSH_MAX_OCC_FAILURES,
+    },
     runtime::Runtime,
     schemas::DatabaseSchema,
     types::{
@@ -58,7 +61,12 @@ use fastrace::{
     future::FutureExt as _,
     Span,
 };
-use futures::FutureExt;
+use futures::{
+    stream,
+    FutureExt,
+    StreamExt,
+    TryStreamExt,
+};
 use keybroker::Identity;
 use maplit::btreeset;
 use model::{
@@ -676,16 +684,29 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
         // Download all source packages. We can remove this once we don't store source
         // in the database.
-        let mut downloaded_source_packages = BTreeMap::new();
-        for (definition_path, source_package) in &start_push.component_definition_packages {
-            let package = download_package(
-                self.modules_storage().clone(),
-                source_package.storage_key.clone(),
-                source_package.sha256.clone(),
-            )
+        let source_package_jobs = start_push
+            .component_definition_packages
+            .iter()
+            .map(|(definition_path, source_package)| {
+                (
+                    definition_path.clone(),
+                    source_package.storage_key.clone(),
+                    source_package.sha256.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let modules_storage = self.modules_storage().clone();
+        let downloaded_source_packages = stream::iter(source_package_jobs)
+            .map(move |(definition_path, storage_key, sha256)| {
+                let storage = modules_storage.clone();
+                async move {
+                    let package = download_package(storage, storage_key, sha256).await?;
+                    anyhow::Ok((definition_path, package))
+                }
+            })
+            .buffer_unordered(*ASYNC_JOIN_CONCURRENCY)
+            .try_collect::<BTreeMap<_, _>>()
             .await?;
-            downloaded_source_packages.insert(definition_path.clone(), package);
-        }
 
         // TODO(ENG-7533): Strip out exports from the `StartPushResponse` since we don't
         // want to actually store it in the database. Remove this path once

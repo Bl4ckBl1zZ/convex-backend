@@ -20,6 +20,7 @@ use common::{
     },
     knobs::{
         DEFAULT_DOCUMENTS_PAGE_SIZE,
+        SEARCH_INDEX_BUILD_CONCURRENCY,
         SEARCH_WORKERS_MAX_CHECKPOINT_AGE,
         VECTOR_INDEX_WORKER_PAGE_SIZE,
     },
@@ -53,6 +54,7 @@ use database::{
     Token,
 };
 use futures::{
+    stream,
     StreamExt,
     TryStreamExt,
 };
@@ -185,8 +187,6 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
     /// Returns a map of IndexName to number of documents indexed for each
     /// index that was built.
     pub async fn step(&self) -> anyhow::Result<(BTreeMap<TabletIndexName, u64>, Token)> {
-        let mut metrics = BTreeMap::new();
-
         let (to_build, token) = self.needs_backfill().await?;
         let num_to_build = to_build.len();
         let index_type = self.index_type_name();
@@ -200,13 +200,17 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         let pause_client = self.database.runtime().pause_client();
         pause_client.wait(FLUSH_RUNNING_LABEL).await;
 
-        for job in to_build {
-            task::consume_budget().await;
-
-            let index_name = job.index_name.clone();
-            let num_documents_indexed = self.build_one(job, self.build_args.clone()).await?;
-            metrics.insert(index_name, num_documents_indexed);
-        }
+        let results: Vec<_> = stream::iter(to_build)
+            .map(|job| async move {
+                task::consume_budget().await;
+                let index_name = job.index_name.clone();
+                let num_documents_indexed = self.build_one(job, self.build_args.clone()).await?;
+                anyhow::Ok((index_name, num_documents_indexed))
+            })
+            .buffer_unordered(*SEARCH_INDEX_BUILD_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let metrics = results.into_iter().collect();
 
         if num_to_build > 0 {
             tracing::info!(

@@ -1,0 +1,73 @@
+services:
+  backend:
+    environment:
+      # Comma-separated executor endpoints are balanced by current in-flight
+      # request count. Add more services and URLs to scale Node processing.
+      - NODE_EXECUTOR_URLS=http://node-executor-1:3002,http://node-executor-2:3002
+      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET is required}
+      - NODE_EXECUTOR_FAILURE_COOLDOWN_SECONDS=${NODE_EXECUTOR_FAILURE_COOLDOWN_SECONDS:-5}
+    depends_on:
+      node-executor-1:
+        condition: service_healthy
+      node-executor-2:
+        condition: service_healthy
+
+  node-executor-1:
+    image: ${CONVEX_BACKEND_IMAGE:-convex-backend:scale-self-hosted}
+    build:
+      context: ../..
+      dockerfile: self-hosted/docker-build/Dockerfile.backend
+    entrypoint: ["/convex/convex-node-executor"]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    expose:
+      - "3002"
+    environment:
+      - NODE_EXECUTOR_PORT=3002
+      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET is required}
+      - NODE_EXECUTOR_TEMP_DIR=/convex-node-executor
+    volumes:
+      - node-executor-1-cache:/convex-node-executor
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H \"x-convex-node-executor-secret: $$NODE_EXECUTOR_SHARED_SECRET\" http://localhost:3002/health >/dev/null",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  node-executor-2:
+    image: ${CONVEX_BACKEND_IMAGE:-convex-backend:scale-self-hosted}
+    build:
+      context: ../..
+      dockerfile: self-hosted/docker-build/Dockerfile.backend
+    entrypoint: ["/convex/convex-node-executor"]
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    expose:
+      - "3002"
+    environment:
+      - NODE_EXECUTOR_PORT=3002
+      - NODE_EXECUTOR_SHARED_SECRET=${NODE_EXECUTOR_SHARED_SECRET:?NODE_EXECUTOR_SHARED_SECRET is required}
+      - NODE_EXECUTOR_TEMP_DIR=/convex-node-executor
+    volumes:
+      - node-executor-2-cache:/convex-node-executor
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H \"x-convex-node-executor-secret: $$NODE_EXECUTOR_SHARED_SECRET\" http://localhost:3002/health >/dev/null",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  node-executor-1-cache:
+  node-executor-2-cache:

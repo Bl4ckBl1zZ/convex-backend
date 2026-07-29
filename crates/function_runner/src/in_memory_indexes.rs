@@ -22,6 +22,7 @@ use common::{
     index::IndexKeyBytes,
     interval::Interval,
     knobs::{
+        ASYNC_JOIN_CONCURRENCY,
         FUNRUN_INDEX_CACHE_CONCURRENCY,
         FUNRUN_INDEX_CACHE_QUEUE_SIZE,
         FUNRUN_INDEX_CACHE_SIZE,
@@ -50,7 +51,9 @@ use database::{
     SCHEMAS_TABLE,
 };
 use futures::{
+    stream,
     FutureExt,
+    StreamExt,
     TryStreamExt,
 };
 use indexing::{
@@ -489,17 +492,29 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
                 async move {
                     let mut size = 0;
                     let mut schema_docs = BTreeMap::new();
-                    for (namespace, schema_tablet, index_id) in schema_tables {
-                        let (component_documents, component_size) =
-                            load_unpacked_index(index_id, &index_reader, schema_tablet, NAME)
+                    let loaded_components = stream::iter(schema_tables)
+                        .map(|(namespace, schema_tablet, index_id)| {
+                            let index_reader = index_reader.clone();
+                            async move {
+                                let (component_documents, component_size) = load_unpacked_index(
+                                    index_id,
+                                    &index_reader,
+                                    schema_tablet,
+                                    NAME,
+                                )
                                 .await?;
-                        schema_docs.insert(
-                            namespace,
-                            component_documents
-                                .into_iter()
-                                .map(|d| d.parse())
-                                .try_collect()?,
-                        );
+                                let documents = component_documents
+                                    .into_iter()
+                                    .map(|d| d.parse())
+                                    .try_collect()?;
+                                anyhow::Ok((namespace, documents, component_size))
+                            }
+                        })
+                        .buffer_unordered(*ASYNC_JOIN_CONCURRENCY)
+                        .try_collect::<Vec<_>>()
+                        .await?;
+                    for (namespace, documents, component_size) in loaded_components {
+                        schema_docs.insert(namespace, documents);
                         size += component_size;
                     }
                     let schema_registry = SchemaRegistry::bootstrap(schema_docs);

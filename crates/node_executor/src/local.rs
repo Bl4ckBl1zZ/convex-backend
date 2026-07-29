@@ -1,13 +1,27 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{
+            AtomicUsize,
+            Ordering,
+        },
+        Arc,
+        LazyLock,
+    },
     time::Duration,
 };
 
 use anyhow::Context;
 use async_trait::async_trait;
-use common::log_lines::LogLine;
+use cmd_util::env::env_config;
+use common::{
+    knobs::{
+        VERTICAL_SCALING_CPU_COUNT,
+        VERTICAL_SCALING_ENABLED,
+    },
+    log_lines::LogLine,
+};
 use errors::ErrorMetadata;
 use futures::{
     select_biased,
@@ -46,9 +60,36 @@ const NVMRC_VERSION: &str = include_str!("../../../.nvmrc");
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_HEALTH_CHECK_ATTEMPTS: u32 = 50;
 
+/// Number of local Node.js executor processes. Each process has an independent
+/// event loop and heap, allowing CPU-heavy Node actions to run in parallel.
+pub static LOCAL_NODE_EXECUTOR_POOL_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    let default = if *VERTICAL_SCALING_ENABLED {
+        VERTICAL_SCALING_CPU_COUNT.div_ceil(4).clamp(1, 16)
+    } else {
+        1
+    };
+    env_config("LOCAL_NODE_EXECUTOR_POOL_SIZE", default).max(1)
+});
+
 pub struct LocalNodeExecutor {
-    inner: Arc<Mutex<Option<InnerLocalNodeExecutor>>>,
+    workers: Vec<LocalNodeExecutorWorker>,
+    next_worker: AtomicUsize,
     config: LocalNodeExecutorConfig,
+}
+
+struct LocalNodeExecutorWorker {
+    inner: Arc<Mutex<Option<InnerLocalNodeExecutor>>>,
+    in_flight: AtomicUsize,
+}
+
+struct InFlightGuard<'a> {
+    in_flight: &'a AtomicUsize,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct LocalNodeExecutorConfig {
@@ -62,8 +103,8 @@ struct InnerLocalNodeExecutor {
 }
 
 impl InnerLocalNodeExecutor {
-    async fn new() -> anyhow::Result<Self> {
-        tracing::info!("Initializing inner local node executor");
+    async fn new(worker_index: usize) -> anyhow::Result<Self> {
+        tracing::info!(worker_index, "Initializing inner local node executor");
         // Create a single temp directory for both source files and Node.js temp files
         let source_dir = TempDir::new()?;
         let (source, source_map) =
@@ -74,6 +115,7 @@ impl InnerLocalNodeExecutor {
         fs::write(&source_path, source.as_bytes())?;
         fs::write(source_map_path, source_map.as_bytes())?;
         tracing::info!(
+            worker_index,
             "Using local node executor. Source: {}",
             source_path.to_str().expect("Path is not UTF-8 string?"),
         );
@@ -190,8 +232,23 @@ impl InnerLocalNodeExecutor {
 
 impl LocalNodeExecutor {
     pub async fn new(node_process_timeout: Duration) -> anyhow::Result<Self> {
+        Self::new_with_pool_size(node_process_timeout, *LOCAL_NODE_EXECUTOR_POOL_SIZE)
+    }
+
+    pub fn new_with_pool_size(
+        node_process_timeout: Duration,
+        pool_size: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(pool_size > 0, "Node executor pool size must be at least 1");
+        tracing::info!(pool_size, "Configuring local Node executor pool");
         let executor = Self {
-            inner: Arc::new(Mutex::new(None)),
+            workers: (0..pool_size)
+                .map(|_| LocalNodeExecutorWorker {
+                    inner: Arc::new(Mutex::new(None)),
+                    in_flight: AtomicUsize::new(0),
+                })
+                .collect(),
+            next_worker: AtomicUsize::new(0),
             config: LocalNodeExecutorConfig {
                 node_process_timeout,
             },
@@ -200,39 +257,68 @@ impl LocalNodeExecutor {
         Ok(executor)
     }
 
-    #[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
-    async fn response_stream(config: &LocalNodeExecutorConfig, mut response: reqwest::Response) {
-        let mut timeout_future = Box::pin(tokio::time::sleep(config.node_process_timeout));
-        let timeout_future = &mut timeout_future;
-        loop {
-            let process_chunk = async {
-                select_biased! {
-                    chunk = response.chunk().fuse() => {
-                        let chunk = chunk?;
-                        match chunk {
-                            Some(chunk) => {
-                                anyhow::Ok(NodeExecutorStreamPart::Chunk(chunk))
-                            }
-                            None => {
-                                anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
-                            }
-                        }
-                    },
-                    _ = timeout_future.fuse() => {
-                        anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
-                            response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
-                            aws_request_id: None,
-                        })))
-                    },
+    fn select_worker(&self) -> (usize, &LocalNodeExecutorWorker, InFlightGuard<'_>) {
+        let start = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        let mut selected_index = start;
+        let mut selected_load = self.workers[start].in_flight.load(Ordering::Relaxed);
+        for offset in 1..self.workers.len() {
+            let index = (start + offset) % self.workers.len();
+            let load = self.workers[index].in_flight.load(Ordering::Relaxed);
+            if load < selected_load {
+                selected_index = index;
+                selected_load = load;
+                if load == 0 {
+                    break;
                 }
-            };
-            let part = process_chunk.await?;
-            if let NodeExecutorStreamPart::InvokeComplete(_) = part {
-                yield part;
-                break;
-            } else {
-                yield part;
             }
+        }
+        let worker = &self.workers[selected_index];
+        worker.in_flight.fetch_add(1, Ordering::Relaxed);
+        (
+            selected_index,
+            worker,
+            InFlightGuard {
+                in_flight: &worker.in_flight,
+            },
+        )
+    }
+}
+
+#[try_stream(ok = NodeExecutorStreamPart, error = anyhow::Error)]
+pub(crate) async fn node_executor_response_stream(
+    node_process_timeout: Duration,
+    mut response: reqwest::Response,
+) {
+    let mut timeout_future = Box::pin(tokio::time::sleep(node_process_timeout));
+    let timeout_future = &mut timeout_future;
+    loop {
+        let process_chunk = async {
+            select_biased! {
+                chunk = response.chunk().fuse() => {
+                    let chunk = chunk?;
+                    match chunk {
+                        Some(chunk) => {
+                            anyhow::Ok(NodeExecutorStreamPart::Chunk(chunk))
+                        }
+                        None => {
+                            anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
+                        }
+                    }
+                },
+                _ = timeout_future.fuse() => {
+                    anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
+                        response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
+                        aws_request_id: None,
+                    })))
+                },
+            }
+        };
+        let part = process_chunk.await?;
+        if let NodeExecutorStreamPart::InvokeComplete(_) = part {
+            yield part;
+            break;
+        } else {
+            yield part;
         }
     }
 }
@@ -248,11 +334,12 @@ impl NodeExecutor for LocalNodeExecutor {
         request: ExecutorRequest,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
     ) -> anyhow::Result<InvokeResponse> {
+        let (worker_index, worker, _in_flight_guard) = self.select_worker();
         let client = {
-            let mut inner = self.inner.lock().await;
+            let mut inner = worker.inner.lock().await;
             if inner.is_none() {
                 *inner = Some(
-                    InnerLocalNodeExecutor::new()
+                    InnerLocalNodeExecutor::new(worker_index)
                         .await
                         .context("Failed to create inner local node executor")?,
                 )
@@ -279,8 +366,11 @@ impl NodeExecutor for LocalNodeExecutor {
                 } else if e.is_connect() {
                     // Connection error likely means the Node server crashed (e.g., OOM).
                     // Drop the dead server so it will be restarted on next invoke.
-                    tracing::warn!("Node server connection failed, dropping server: {e}");
-                    self.inner.lock().await.take();
+                    tracing::warn!(
+                        worker_index,
+                        "Node server connection failed, dropping server: {e}"
+                    );
+                    worker.inner.lock().await.take();
                     return Err(anyhow::anyhow!(e).context("Node server request failed"));
                 } else {
                     return Err(anyhow::anyhow!(e).context("Node server request failed"));
@@ -300,7 +390,7 @@ impl NodeExecutor for LocalNodeExecutor {
             let error = response.text().await?;
             anyhow::bail!("Node executor server returned error: {}", error);
         }
-        let stream = Self::response_stream(&self.config, response);
+        let stream = node_executor_response_stream(self.config.node_process_timeout, response);
         let stream = Box::pin(stream);
         let result = handle_node_executor_stream(log_line_sender, stream).await?;
         match result {
@@ -311,7 +401,7 @@ impl NodeExecutor for LocalNodeExecutor {
                     .unwrap_or(false)
                 {
                     // Drop the server if it claims to be exiting.
-                    self.inner.lock().await.take();
+                    worker.inner.lock().await.take();
                 }
                 Ok(InvokeResponse {
                     response: payload,
@@ -323,4 +413,20 @@ impl NodeExecutor for LocalNodeExecutor {
     }
 
     fn shutdown(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_pool_selects_the_least_busy_worker() -> anyhow::Result<()> {
+        let executor = LocalNodeExecutor::new_with_pool_size(Duration::from_secs(1), 3)?;
+        executor.workers[0].in_flight.store(2, Ordering::Relaxed);
+        executor.workers[1].in_flight.store(1, Ordering::Relaxed);
+
+        let (worker_index, _worker, _guard) = executor.select_worker();
+        assert_eq!(worker_index, 2);
+        Ok(())
+    }
 }

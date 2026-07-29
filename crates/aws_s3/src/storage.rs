@@ -760,7 +760,7 @@ impl<RT: Runtime> Upload for S3Upload<RT> {
                     Err(e) => Either::Right(future::err(e)),
                 }
             })
-            .buffer_unordered(MAXIMUM_PARALLEL_UPLOADS)
+            .buffer_unordered(*MAXIMUM_PARALLEL_UPLOADS)
             .try_collect::<Vec<_>>()
             .await?;
         self.uploaded_parts.append(&mut uploaded_parts);

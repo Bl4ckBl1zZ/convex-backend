@@ -502,18 +502,19 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
             index_tablet_id,
         }: BootstrapMetadata = bootstrap_metadata;
 
-        let (index_documents, parsed_index_documents) = Self::load_raw_and_parsed_table_documents(
-            persistence_snapshot,
-            index_by_id,
-            index_tablet_id,
-        )
-        .await?;
-        let (table_documents, parsed_table_documents) = Self::load_raw_and_parsed_table_documents(
-            persistence_snapshot,
-            tables_by_id,
-            tables_tablet_id,
-        )
-        .await?;
+        let ((index_documents, parsed_index_documents), (table_documents, parsed_table_documents)) =
+            futures::try_join!(
+                Self::load_raw_and_parsed_table_documents(
+                    persistence_snapshot,
+                    index_by_id,
+                    index_tablet_id,
+                ),
+                Self::load_raw_and_parsed_table_documents(
+                    persistence_snapshot,
+                    tables_by_id,
+                    tables_tablet_id,
+                ),
+            )?;
 
         let (table_mapping, table_states) = Self::table_mapping_and_states(parsed_table_documents);
         let index_registry =
@@ -707,34 +708,45 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
     pub async fn get_meta_ids(
         persistence: &dyn PersistenceReader,
     ) -> anyhow::Result<BootstrapMetadata> {
-        let tables_by_id = persistence
-            .get_persistence_global(PersistenceGlobalKey::TablesByIdIndex)
-            .await?
-            .context("missing _tables.by_id global")?
-            .as_str()
-            .context("_tables.by_id is not string")?
-            .parse()?;
-        let index_by_id = persistence
-            .get_persistence_global(PersistenceGlobalKey::IndexByIdIndex)
-            .await?
-            .context("missing _index.by_id global")?
-            .as_str()
-            .context("_index.by_id is not string")?
-            .parse()?;
-        let tables_tablet_id: TabletId = persistence
-            .get_persistence_global(PersistenceGlobalKey::TablesTabletId)
-            .await?
-            .context("missing _tables table ID global")?
-            .as_str()
-            .context("_tables table ID is not string")?
-            .parse()?;
-        let index_tablet_id = persistence
-            .get_persistence_global(PersistenceGlobalKey::IndexTabletId)
-            .await?
-            .context("missing _index table ID global")?
-            .as_str()
-            .context("_index table ID is not string")?
-            .parse()?;
+        let (tables_by_id, index_by_id, tables_tablet_id, index_tablet_id): (
+            IndexId,
+            IndexId,
+            TabletId,
+            TabletId,
+        ) = futures::try_join!(
+            async {
+                let value = persistence
+                    .get_persistence_global(PersistenceGlobalKey::TablesByIdIndex)
+                    .await?
+                    .context("missing _tables.by_id global")?;
+                let value = value.as_str().context("_tables.by_id is not string")?;
+                anyhow::Ok(value.parse()?)
+            },
+            async {
+                let value = persistence
+                    .get_persistence_global(PersistenceGlobalKey::IndexByIdIndex)
+                    .await?
+                    .context("missing _index.by_id global")?;
+                let value = value.as_str().context("_index.by_id is not string")?;
+                anyhow::Ok(value.parse()?)
+            },
+            async {
+                let value = persistence
+                    .get_persistence_global(PersistenceGlobalKey::TablesTabletId)
+                    .await?
+                    .context("missing _tables table ID global")?;
+                let value = value.as_str().context("_tables table ID is not string")?;
+                anyhow::Ok(value.parse()?)
+            },
+            async {
+                let value = persistence
+                    .get_persistence_global(PersistenceGlobalKey::IndexTabletId)
+                    .await?
+                    .context("missing _index table ID global")?;
+                let value = value.as_str().context("_index table ID is not string")?;
+                anyhow::Ok(value.parse()?)
+            },
+        )?;
         Ok(BootstrapMetadata {
             tables_by_id,
             index_by_id,
