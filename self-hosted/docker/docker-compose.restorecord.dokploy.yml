@@ -109,7 +109,9 @@ services:
       args:
         CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
         VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:?VERGEN_GIT_SHA is required}
-        VERGEN_GIT_COMMIT_TIMESTAMP: ${VERGEN_GIT_COMMIT_TIMESTAMP:?VERGEN_GIT_COMMIT_TIMESTAMP is required}
+        VERGEN_GIT_COMMIT_TIMESTAMP:
+          ${VERGEN_GIT_COMMIT_TIMESTAMP:?VERGEN_GIT_COMMIT_TIMESTAMP is
+          required}
     restart: always
     init: true
     stop_grace_period: 30s
@@ -131,7 +133,9 @@ services:
 
       # Convex expects the PostgreSQL cluster URL and selects its existing
       # convex_self_hosted database. Do not append a database path here.
-      POSTGRES_URL: postgres://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432
+      POSTGRES_URL:
+        postgres://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is
+        required}@postgres:5432
       POSTGRES_MAX_CONNECTIONS: ${POSTGRES_MAX_CONNECTIONS:-32}
       DO_NOT_REQUIRE_SSL: "true"
       DISABLE_BEACON: "true"

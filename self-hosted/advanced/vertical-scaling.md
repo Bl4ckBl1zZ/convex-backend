@@ -51,15 +51,13 @@ mutations --> ordered validation --> bounded parallel PostgreSQL writes
 ```
 
 Queries, mutations, and deployment analysis have a dedicated isolate-worker
-pool. V8 and HTTP actions have a separate pool. Long-lived actions can no
-longer occupy all workers needed by latency-sensitive transactional functions.
+pool. V8 and HTTP actions have a separate pool. Long-lived actions can no longer
+occupy all workers needed by latency-sensitive transactional functions.
 
-Both V8 pools share one runnable-isolate limiter. A pool may use the full
-budget when the other is idle, but mixed traffic cannot exceed the combined
-budget.
-V8 functions release a CPU permit while awaiting supported asynchronous
-operations, allowing useful I/O overlap without allowing unbounded JavaScript
-execution.
+Both V8 pools share one runnable-isolate limiter. A pool may use the full budget
+when the other is idle, but mixed traffic cannot exceed the combined budget. V8
+functions release a CPU permit while awaiting supported asynchronous operations,
+allowing useful I/O overlap without allowing unbounded JavaScript execution.
 
 Mutation validation and publication remain ordered for transaction correctness.
 Persistence writes between those stages run concurrently, bounded by
@@ -76,25 +74,25 @@ application_cpus = cpu_count - reserved_cpu_count
 
 At least one application CPU is always retained. Defaults are bounded:
 
-| Setting | Derived default |
-| --- | ---: |
-| Runnable V8 isolate permits | `application_cpus * 2` |
-| Concurrent queries | `clamp(application_cpus * 4, 16, 512)` |
-| Concurrent mutations | `clamp(application_cpus * 2, 16, 256)` |
-| Concurrent V8 actions | `clamp(application_cpus * 8, 64, 1024)` |
-| Concurrent Node actions | `clamp(application_cpus * 8, 64, 1024)` |
-| Transaction isolate workers | `clamp(application_cpus * 4, 32, 256)` |
-| Action isolate workers | `clamp(application_cpus * 8, 64, 512)` |
+| Setting                     |                                                             Derived default |
+| --------------------------- | --------------------------------------------------------------------------: |
+| Runnable V8 isolate permits |                                                      `application_cpus * 2` |
+| Concurrent queries          |                                      `clamp(application_cpus * 4, 16, 512)` |
+| Concurrent mutations        |                                      `clamp(application_cpus * 2, 16, 256)` |
+| Concurrent V8 actions       |                                     `clamp(application_cpus * 8, 64, 1024)` |
+| Concurrent Node actions     |                                     `clamp(application_cpus * 8, 64, 1024)` |
+| Transaction isolate workers |                                      `clamp(application_cpus * 4, 32, 256)` |
+| Action isolate workers      |                                      `clamp(application_cpus * 8, 64, 512)` |
 | Parallel persistence writes | `min(clamp(application_cpus * 4, 8, 64), max(PostgreSQL pool - 16, 1), 40)` |
-| Local Node processes | `clamp(ceil(cpu_count / 4), 1, 16)` |
+| Local Node processes        |                                         `clamp(ceil(cpu_count / 4), 1, 16)` |
 
 Automatic reserved CPU count is one eighth of visible CPUs, with at least one
 reserved core on machines with more than one CPU. Reserved capacity is used by
 the Tokio runtime, ordered commits, PostgreSQL communication, subscription
 processing, and background workers.
 
-For example, a 10-CPU container automatically resolves to 9 application CPUs,
-18 runnable V8 permits, 36 query slots, 18 mutation slots, 72 action slots, 36
+For example, a 10-CPU container automatically resolves to 9 application CPUs, 18
+runnable V8 permits, 36 query slots, 18 mutation slots, 72 action slots, 36
 transaction workers, 72 action workers, 36 parallel persistence writes, and 3
 local Node processes.
 
@@ -113,13 +111,13 @@ COMMITTER_MAX_CONCURRENT_PERSISTENCE_WRITES
 ```
 
 Leave enough PostgreSQL connections for query reads, subscriptions, index
-workers, autovacuum monitoring, and administration. The automatic value
-reserves at least 16 connections and caps persistence concurrency at 40. An
-explicit override can exceed that safety bound, so benchmark the whole workload
-before doing so.
+workers, autovacuum monitoring, and administration. The automatic value reserves
+at least 16 connections and caps persistence concurrency at 40. An explicit
+override can exceed that safety bound, so benchmark the whole workload before
+doing so.
 
-Local Node processes compete with V8 and PostgreSQL on the same machine. Use
-the remote Node executor pool for sustained CPU-heavy Node workloads, or lower
+Local Node processes compete with V8 and PostgreSQL on the same machine. Use the
+remote Node executor pool for sustained CPU-heavy Node workloads, or lower
 `LOCAL_NODE_EXECUTOR_POOL_SIZE` when V8 traffic is the priority.
 
 ## Deliberate remaining limits
@@ -137,10 +135,10 @@ Vertical scaling does not mean removing every queue or concurrency bound:
 - Search, storage transfer, deployment analysis, and index-backfill limits
   remain separately overridable. They are I/O- and memory-sensitive and should
   not automatically track CPU count.
-- A local Node pool cannot share the in-process V8 semaphore because its
-  workers are separate operating-system processes. For mixed CPU-heavy V8 and
-  Node traffic, explicitly partition the host with
-  `FUNRUN_ISOLATE_ACTIVE_THREADS` and `LOCAL_NODE_EXECUTOR_POOL_SIZE`.
+- A local Node pool cannot share the in-process V8 semaphore because its workers
+  are separate operating-system processes. For mixed CPU-heavy V8 and Node
+  traffic, explicitly partition the host with `FUNRUN_ISOLATE_ACTIVE_THREADS`
+  and `LOCAL_NODE_EXECUTOR_POOL_SIZE`.
 
 The startup capacity log reports the resolved execution limits, but it cannot
 infer memory bandwidth, storage IOPS, workload conflict rate, or PostgreSQL
@@ -158,8 +156,8 @@ required for correctness.
 4. Track p95/p99 latency, rejected requests, V8 permit wait, isolate workers,
    commit queue time, `database_commit_persistence_permit_seconds`, PostgreSQL
    pool wait, CPU pressure, memory, WAL, and disk latency.
-5. Change only the saturated stage. Raising downstream concurrency cannot fix
-   an ordered commit or storage bottleneck.
+5. Change only the saturated stage. Raising downstream concurrency cannot fix an
+   ordered commit or storage bottleneck.
 
 The single ordered committer is intentional. Increasing mutation execution
 parallelism improves preparation and persistence overlap, but conflicting
@@ -173,21 +171,21 @@ The final development benchmark used the same debug backend binary, PostgreSQL
 Every measured request completed without a client error.
 
 Compatibility mode disables automatic sizing but retains this fork's
-architecture and correctness fixes. The table therefore compares capacity
-plans, not upstream against the fork.
+architecture and correctness fixes. The table therefore compares capacity plans,
+not upstream against the fork.
 
-| Workload | Capacity plan | QPS | p50 | p95 | p99 | Errors |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Cache-bypassing indexed query | Compatibility, 16 query slots | 774.1 | 98.4 ms | 168.7 ms | 210.3 ms | 0 |
-| Cache-bypassing indexed query | Vertical, 36 query slots, 18 V8 permits | 669.2 | 113.4 ms | 206.7 ms | 266.1 ms | 0 |
-| Indexed insert mutation | Compatibility, 16 mutation slots | 475.6 | 159.1 ms | 259.7 ms | 357.7 ms | 0 |
-| Indexed insert mutation | Rejected one-per-CPU V8 policy | 422.9 | 179.0 ms | 300.4 ms | 384.7 ms | 0 |
-| Indexed insert mutation | Vertical, 18 mutation slots, 18 V8 permits | 452.2 | 168.7 ms | 275.2 ms | 357.9 ms | 0 |
+| Workload                      | Capacity plan                              |   QPS |      p50 |      p95 |      p99 | Errors |
+| ----------------------------- | ------------------------------------------ | ----: | -------: | -------: | -------: | -----: |
+| Cache-bypassing indexed query | Compatibility, 16 query slots              | 774.1 |  98.4 ms | 168.7 ms | 210.3 ms |      0 |
+| Cache-bypassing indexed query | Vertical, 36 query slots, 18 V8 permits    | 669.2 | 113.4 ms | 206.7 ms | 266.1 ms |      0 |
+| Indexed insert mutation       | Compatibility, 16 mutation slots           | 475.6 | 159.1 ms | 259.7 ms | 357.7 ms |      0 |
+| Indexed insert mutation       | Rejected one-per-CPU V8 policy             | 422.9 | 179.0 ms | 300.4 ms | 384.7 ms |      0 |
+| Indexed insert mutation       | Vertical, 18 mutation slots, 18 V8 permits | 452.2 | 168.7 ms | 275.2 ms | 357.9 ms |      0 |
 
 The one-per-application-CPU V8 policy underutilized the host, so the automatic
 default now allows two runnable isolates per application CPU. This recovered
-6.9% mutation throughput in the controlled policy comparison. The simple
-query and single-hot-table mutation samples still favor the lower compatibility
+6.9% mutation throughput in the controlled policy comparison. The simple query
+and single-hot-table mutation samples still favor the lower compatibility
 admission limits. Extra capacity is useful for mixed and independent work, but
 it is not a universal throughput win when every request competes for the same
 CPU or commit stream.
@@ -202,5 +200,4 @@ These are directional debug-build results, not production capacity claims.
 Benchmark a release image, persistent production-class storage, fixed container
 CPU/memory limits, a steady database size, and the real traffic mix before
 selecting production values. If p95/p99 rises without a QPS gain, lower
-`APPLICATION_MAX_CONCURRENT_QUERIES` or
-`APPLICATION_MAX_CONCURRENT_MUTATIONS`.
+`APPLICATION_MAX_CONCURRENT_QUERIES` or `APPLICATION_MAX_CONCURRENT_MUTATIONS`.

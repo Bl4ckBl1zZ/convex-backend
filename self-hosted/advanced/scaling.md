@@ -25,13 +25,12 @@ for a production deployment.
 
 For a large single host, start with the hardware-aware capacity plan in
 [vertical-scaling.md](./vertical-scaling.md). It separates transactional and
-action isolate pools, gives them a shared CPU budget, and bounds parallel
-commit I/O independently from PostgreSQL read capacity.
+action isolate pools, gives them a shared CPU budget, and bounds parallel commit
+I/O independently from PostgreSQL read capacity.
 
 The [parallel pipeline architecture](./parallel-pipelines.md) removes
 unnecessary one-at-a-time table and search-index work while documenting the
-ordered stages that preserve transaction, cursor, and derived-state
-correctness.
+ordered stages that preserve transaction, cursor, and derived-state correctness.
 
 ## PostgreSQL first
 

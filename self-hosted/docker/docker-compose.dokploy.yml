@@ -23,7 +23,8 @@ services:
       test:
         [
           "CMD-SHELL",
-          "pg_isready -U convex -d convex_self_hosted && psql -U convex -d convex_self_hosted -Atqc 'SELECT 1' >/dev/null",
+          "pg_isready -U convex -d convex_self_hosted && psql -U convex -d
+          convex_self_hosted -Atqc 'SELECT 1' >/dev/null",
         ]
       interval: 5s
       timeout: 5s
@@ -60,7 +61,9 @@ services:
       CONVEX_SITE_ORIGIN: ${CONVEX_SITE_ORIGIN:-https://api.modularbots.io}
       # Convex derives convex_self_hosted from INSTANCE_NAME and rejects a
       # database path in this cluster URL.
-      POSTGRES_URL: postgresql://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432
+      POSTGRES_URL:
+        postgresql://convex:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is
+        required}@postgres:5432
       POSTGRES_MAX_CONNECTIONS: ${POSTGRES_MAX_CONNECTIONS:-64}
       DO_NOT_REQUIRE_SSL: "true"
       DISABLE_BEACON: "true"

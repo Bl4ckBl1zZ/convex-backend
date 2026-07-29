@@ -1,7 +1,7 @@
 # Horizontal scaling
 
-This fork separates stateless Node.js action processing from the stateful
-Convex database leader. It is the first safe horizontal scaling boundary for
+This fork separates stateless Node.js action processing from the stateful Convex
+database leader. It is the first safe horizontal scaling boundary for
 self-hosted Convex: Node executor containers do not connect to PostgreSQL,
 acquire the deployment lease, or start background maintenance workers.
 
@@ -52,20 +52,20 @@ round-robin ordering to break ties.
 
 The shared secret is mandatory and is sent in the
 `x-convex-node-executor-secret` header. Keep port 3002 on a private network.
-Possession of this secret grants access to an arbitrary-code execution
-service, so do not reuse the Convex instance secret or expose an executor
-directly to the internet.
+Possession of this secret grants access to an arbitrary-code execution service,
+so do not reuse the Convex instance secret or expose an executor directly to the
+internet.
 
 ## Failure behavior
 
-The backend does not retry an executor request after a transport failure. A
-Node action may have made an external API call before the connection failed;
-automatic retry on another executor could duplicate that side effect. The
-failed worker enters a short exponential cooldown and becomes eligible again
-later so transient failures recover without operator action. If every worker
-is cooling down, requests fail fast instead of queuing behind known-bad
-endpoints. `NODE_EXECUTOR_FAILURE_COOLDOWN_SECONDS` controls the base cooldown
-and defaults to 5 seconds. Use container health checks and an orchestrator with
+The backend does not retry an executor request after a transport failure. A Node
+action may have made an external API call before the connection failed;
+automatic retry on another executor could duplicate that side effect. The failed
+worker enters a short exponential cooldown and becomes eligible again later so
+transient failures recover without operator action. If every worker is cooling
+down, requests fail fast instead of queuing behind known-bad endpoints.
+`NODE_EXECUTOR_FAILURE_COOLDOWN_SECONDS` controls the base cooldown and defaults
+to 5 seconds. Use container health checks and an orchestrator with
 unhealthy-container replacement to restart persistently unhealthy workers.
 Monitor `remote_node_executor_failure_total` by failure type alongside the
 existing Node executor duration and function metrics.
@@ -88,9 +88,8 @@ For CPU-bound work, useful concurrency is usually close to the CPU allocation
 per executor. For I/O-heavy work it can be higher. Benchmark p95/p99 latency,
 timeouts, leader CPU, executor CPU, and memory before raising the permit.
 
-Each executor keeps an independent package cache. The Compose overlay gives
-each one a persistent volume to avoid repeated package downloads after a
-restart.
+Each executor keeps an independent package cache. The Compose overlay gives each
+one a persistent volume to avoid repeated package downloads after a restart.
 
 ## What remains for backend read replicas
 
@@ -108,5 +107,5 @@ The repository already contains `FollowerRetentionManager` and
 `DatabaseSnapshot`, but the self-hosted `Application` is still parameterized by
 a writable `Database`. Serving replicas before that interface is split would
 risk stale results and split-brain workers. The intended next milestone is a
-read-only application implementation behind the existing `ApplicationApi`
-trait, followed by a leader-aware gateway.
+read-only application implementation behind the existing `ApplicationApi` trait,
+followed by a leader-aware gateway.
