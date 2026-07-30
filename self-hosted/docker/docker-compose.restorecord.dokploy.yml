@@ -102,16 +102,8 @@ services:
         max-file: "5"
 
   backend:
-    image: convex-backend:restorecord-scale
-    build:
-      context: ../..
-      dockerfile: self-hosted/docker-build/Dockerfile.backend
-      args:
-        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
-        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:?VERGEN_GIT_SHA is required}
-        VERGEN_GIT_COMMIT_TIMESTAMP:
-          ${VERGEN_GIT_COMMIT_TIMESTAMP:?VERGEN_GIT_COMMIT_TIMESTAMP is
-          required}
+    image: ${CONVEX_BACKEND_IMAGE:-ghcr.io/bl4ckbl1zz/convex-backend:latest}
+    pull_policy: always
     restart: always
     init: true
     stop_grace_period: 30s

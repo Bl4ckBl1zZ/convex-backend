@@ -129,6 +129,7 @@ e.g., instead of setting `CONVEX_DEPLOY_KEY`, you'll need to set
 - [Hardware-aware vertical scaling](./advanced/vertical-scaling.md)
 - [Parallel pipeline architecture](./advanced/parallel-pipelines.md)
 - [2026-07-29 upstream sync report](./advanced/upstream-sync-2026-07-29.md)
+- [Fork backend container image](./advanced/ghcr-image.md)
 
 # Limitations
 
