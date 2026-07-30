@@ -58,6 +58,10 @@ NODE_VERSION=$(cat /nvmrc | tr -d 'v\n')
 apt-get install -y --no-install-recommends nodejs=${NODE_VERSION}-1nodesource1
 EOF
 
+# pnpm prepares the pinned docusaurus-openapi-docs git dependency with the
+# package manager declared by that repository.
+RUN npm install --global yarn@1.22.1
+
 # Ensure this file is copied so we'll restart here if the file changes
 COPY rust-toolchain /rust-toolchain
 # Dummy command to just fetch the toolchain and cargo index
