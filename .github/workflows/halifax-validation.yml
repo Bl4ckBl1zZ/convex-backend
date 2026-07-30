@@ -1,0 +1,15 @@
+name: Halifax validation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate Halifax runner
+    runs-on: "halifax-bl4ckbl1zz-convex-backend-3d0004a0"
+    timeout-minutes: 10
+    steps:
+      - name: Verify disposable runner
+        run: |
+          test -n "${RUNNER_NAME}"
+          echo "Halifax runner is ready"
