@@ -7,13 +7,16 @@ ghcr.io/bl4ckbl1zz/convex-backend
 ```
 
 The `Publish Fork Backend Image` GitHub Actions workflow builds the image from
-every commit merged into `main`. It currently publishes a Linux amd64 image for
-the x86-64 Dokploy hosts.
+every commit merged into `main`. It publishes native Linux amd64 and arm64
+images behind one multi-platform manifest, so Docker automatically selects the
+correct image for each Dokploy host.
 
 ## Tags
 
 - `latest` and `main` point to the newest successful build from `main`.
 - `sha-<full-git-sha>` is immutable and identifies the exact source revision.
+- `sha-<full-git-sha>-amd64` and `sha-<full-git-sha>-arm64` identify the
+  platform-specific images used to construct the multi-platform manifest.
 
 Use `latest` for automatic updates or set `CONVEX_BACKEND_IMAGE` to an immutable
 tag or digest for controlled production rollouts:
