@@ -12,7 +12,7 @@ on:
 
 jobs:
   tag_images_as_latest:
-    runs-on: ubuntu-latest
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     steps:
       - name: Login to GitHub Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4

@@ -9,7 +9,7 @@ on:
 jobs:
   release_dashboard:
     name: Build Convex Dashboard
-    runs-on: [self-hosted, aws, x64, xlarge]
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     steps:
       - name: Check out code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -91,7 +91,7 @@ jobs:
             # so build on the oldest-generation arm64 pool.
             os: "['self-hosted', 'aws', 'arm64', 'xlarge-c8g']"
     name: Build Convex Backend
-    runs-on: ${{ fromJSON(matrix.os) }}
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     steps:
       - name: Check out code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

@@ -21,7 +21,7 @@ jobs:
     strategy:
       matrix:
         arch: [x64, arm64]
-    runs-on: [self-hosted, aws, "${{ matrix.arch }}", xlarge]
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -75,7 +75,7 @@ jobs:
             digest: ${{ steps.build-image.outputs.digest }}
 
   read:
-    runs-on: ubuntu-latest
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     needs: [build]
     steps:
       - uses: cloudposse/github-action-matrix-outputs-read@33cac12fa9282a7230a418d859b93fdbc4f27b5a # v1
