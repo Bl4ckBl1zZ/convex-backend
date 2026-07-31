@@ -15,7 +15,7 @@ on:
 jobs:
   test_self_hosted_backend:
     name: Test self-hosted backend
-    runs-on: ubuntu-latest
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     timeout-minutes: 10
 
     services:
