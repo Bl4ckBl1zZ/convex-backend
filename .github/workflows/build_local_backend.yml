@@ -19,7 +19,7 @@ env:
 jobs:
   build:
     name: Build Convex Backend
-    runs-on: ubuntu-24.04
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     timeout-minutes: 90
 
     steps:
