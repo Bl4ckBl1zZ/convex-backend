@@ -8,7 +8,7 @@ on:
 
 jobs:
   send:
-    runs-on: ubuntu-slim
+    runs-on: halifax-bl4ckbl1zz-convex-backend-3d0004a0
     timeout-minutes: 5
     steps:
       - uses: int128/datadog-actions-metrics@262ee4930e40245b2d9806da14213982073ae952 # v1
