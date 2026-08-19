@@ -1,0 +1,582 @@
+name: Upstream Sync
+
+# Keeps this fork current with get-convex/convex-backend.
+#
+# Every day this merges upstream/main into a rolling `upstream-sync/main`
+# branch and opens one pull request. Clean merges are handed to GitHub's
+# auto-merge and land as soon as the required checks pass. Conflicts are
+# resolved by Claude against the invariants in .github/UPSTREAM_SYNC.md when
+# ANTHROPIC_API_KEY is configured, and reported for a human otherwise.
+#
+# Setup: see .github/UPSTREAM_SYNC.md and the SYNC_PAT / ANTHROPIC_API_KEY
+# secrets. SYNC_PAT is required -- the default GITHUB_TOKEN cannot push
+# changes to .github/workflows/** and cannot trigger the CI that gates the
+# merge.
+
+on:
+  schedule:
+    # 05:17 UTC daily. Off the hour to avoid GitHub's cron rush.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref to merge"
+        type: string
+        default: main
+      automerge:
+        description: "Enable auto-merge on the resulting PR"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/get-convex/convex-backend.git
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+  SYNC_BRANCH: upstream-sync/main
+  SYNC_LABEL: upstream-sync
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    name: Merge upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Require a sync token
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ -n "${SYNC_PAT}" ]; then
+            echo "SYNC_PAT is configured."
+            exit 0
+          fi
+          {
+            echo "## Upstream sync is not configured"
+            echo
+            echo 'This workflow needs a `SYNC_PAT` repository secret containing a'
+            echo 'fine-grained personal access token scoped to this repository with:'
+            echo
+            echo '- Contents: read and write'
+            echo '- Pull requests: read and write'
+            echo '- Workflows: read and write'
+            echo
+            echo 'The default `GITHUB_TOKEN` cannot be used: it is forbidden from'
+            echo 'pushing changes under `.github/workflows/**` (which upstream syncs'
+            echo 'routinely contain), and pull requests it opens do not trigger the'
+            echo 'CI runs that gate the automatic merge.'
+            echo
+            echo 'See `.github/UPSTREAM_SYNC.md`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+
+      - name: Checkout fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Fetch upstream and plan
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "upstream-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --prune origin
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+
+          UPSTREAM_SHA="$(git rev-parse FETCH_HEAD)"
+          BEHIND="$(git rev-list --count "HEAD..${UPSTREAM_SHA}")"
+          AHEAD="$(git rev-list --count --no-merges "${UPSTREAM_SHA}..HEAD")"
+
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$(git rev-parse --short "${UPSTREAM_SHA}")" >> "$GITHUB_OUTPUT"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${AHEAD}" >> "$GITHUB_OUTPUT"
+          echo "ai=${HAS_ANTHROPIC_KEY}" >> "$GITHUB_OUTPUT"
+
+          EXISTING="$(gh pr list --state open --label "$SYNC_LABEL" \
+            --json number --jq '.[0].number // empty')"
+          echo "existing_pr=${EXISTING}" >> "$GITHUB_OUTPUT"
+
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "action=skip" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream ${UPSTREAM_REF}."
+            echo "Already up to date with upstream \`${UPSTREAM_REF}\`." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "action=sync" >> "$GITHUB_OUTPUT"
+            echo "${BEHIND} upstream commit(s) to merge; fork is ${AHEAD} commit(s) ahead."
+          fi
+
+      - name: Prepare sync branch
+        id: branch
+        if: steps.plan.outputs.action == 'sync'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          EXISTING_PR: ${{ steps.plan.outputs.existing_pr }}
+        run: |
+          set -euo pipefail
+
+          # Reuse the open sync PR's branch when there is one, so upstream churn
+          # updates a single PR instead of stacking new ones. Recreate from main
+          # if that branch can no longer take main's commits cleanly.
+          BRANCH="$SYNC_BRANCH"
+          RECREATE=1
+
+          if [ -n "$EXISTING_PR" ]; then
+            BRANCH="$(gh pr view "$EXISTING_PR" --json headRefName --jq .headRefName)"
+            echo "Reusing branch ${BRANCH} from open PR #${EXISTING_PR}."
+            git checkout -B "$BRANCH" "origin/${BRANCH}"
+            if git merge --no-edit origin/main; then
+              RECREATE=0
+            else
+              git merge --abort || true
+              echo "::warning::${BRANCH} conflicts with main; recreating it from main."
+            fi
+          fi
+
+          if [ "$RECREATE" -eq 1 ]; then
+            BRANCH="$SYNC_BRANCH"
+            git checkout -B "$BRANCH" origin/main
+          fi
+
+          echo "name=${BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream
+        id: merge
+        if: steps.plan.outputs.action == 'sync'
+        env:
+          UPSTREAM_SHA: ${{ steps.plan.outputs.upstream_sha }}
+        run: |
+          set -uo pipefail
+
+          git merge --no-ff --no-commit "$UPSTREAM_SHA" && rc=0 || rc=$?
+          set -e
+
+          CONFLICTS="$(git diff --name-only --diff-filter=U | sort)"
+
+          if [ "$rc" -eq 0 ] && [ -z "$CONFLICTS" ]; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+            echo "Merged cleanly."
+            exit 0
+          fi
+
+          echo "status=conflict" >> "$GITHUB_OUTPUT"
+          COUNT="$(printf '%s\n' "$CONFLICTS" | grep -c . || true)"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          {
+            echo "files<<CONFLICT_EOF"
+            printf '%s\n' "$CONFLICTS"
+            echo "CONFLICT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%s\n' "$CONFLICTS" > "${RUNNER_TEMP}/conflicts.txt"
+          echo "::warning::${COUNT} conflicted file(s)"
+          printf '%s\n' "$CONFLICTS"
+
+      # ---------------------------------------------------------------- #
+      # Conflict path. Only pays for a toolchain when there is a conflict
+      # AND Claude can act on it, so clean syncs stay a two-minute job.
+      # ---------------------------------------------------------------- #
+
+      - name: Setup Rust
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai ==
+          'true'
+        uses: ./.github/actions/setup-rust
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          r2-access-key: ${{ secrets.R2_ACCESS_KEY_ID }}
+          r2-secret-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Install Clippy
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai ==
+          'true'
+        run: rustup component add clippy
+
+      - name: Install mise tools
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai ==
+          'true'
+        uses: jdx/mise-action@dba19683ed58901619b14f395a24841710cb4925 # v4.1.0
+        with:
+          cache: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: NPM install globals
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai ==
+          'true'
+        run: npm ci --prefix scripts
+
+      - name: Resolve conflicts with Claude
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai ==
+          'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.SYNC_PAT }}
+          claude_args: |
+            --model claude-opus-5
+            --max-turns 250
+            --allowedTools Bash,Read,Edit,Write,Grep,Glob
+          prompt: |
+            You are resolving a git merge in the long-lived fork
+            Bl4ckBl1zZ/convex-backend. `git merge upstream/main` is in progress in
+            the current working directory and has stopped on conflicts.
+
+            Upstream commit being merged: ${{ steps.plan.outputs.upstream_sha }}
+            (${{ steps.plan.outputs.behind }} commits of upstream history).
+
+            FIRST, read `.github/UPSTREAM_SYNC.md` in full. It is the
+            specification for this merge: it lists the fork's invariants, the
+            resolution principle, the lockfile procedure, and the exact
+            verification commands. Follow it.
+
+            Conflicted files:
+            ```
+            ${{ steps.merge.outputs.files }}
+            ```
+
+            Your task:
+
+            1. Resolve every conflicted file. `git diff --name-only
+               --diff-filter=U` must come back empty when you are done.
+            2. Adopt upstream's API: renames, new arguments, moved modules,
+               changed signatures. Re-express the fork's behavior through them.
+               Do not delete a fork invariant to make a conflict go away, and do
+               not revert an upstream fix.
+            3. Fix the fallout in files git merged cleanly. Upstream refactors
+               routinely break fork-only code that had no textual conflict —
+               `crates/node_executor/src/remote.rs` and the scenario-runner
+               package are fork-only and are never conflicted, but do break.
+            4. Verify with the commands in the "Verification" section of
+               `.github/UPSTREAM_SYNC.md`. The JS build must run before any cargo
+               command. Run the four targeted regression tests; each one guards a
+               specific fork invariant, so a failure means the resolution changed
+               fork behavior.
+            5. Write a report to `.sync-report.md` in the repository root:
+               for each conflicted area, one line on what upstream changed, what
+               the fork needed, and how you reconciled them. Call out anything you
+               were unsure about, anything you could not verify, and any invariant
+               you had to bend. Be specific and honest — a human reviews this
+               before it ships.
+
+            Hard rules:
+
+            - Do NOT run `git commit`, `git merge --abort`, `git reset`,
+              `git rebase`, `git push`, or any `gh` command. The workflow commits
+              and pushes. Leave the merge in progress.
+            - Do NOT edit `.github/UPSTREAM_SYNC.md`.
+            - If a conflict genuinely cannot be resolved without dropping a fork
+              invariant, leave that file conflicted and say so plainly in
+              `.sync-report.md`. A reported failure is much better than a quiet
+              wrong resolution.
+
+      - name: Verify resolution
+        id: verify
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai ==
+          'true'
+        run: |
+          set -euo pipefail
+
+          if [ -f .sync-report.md ]; then
+            cp .sync-report.md "${RUNNER_TEMP}/sync-report.md"
+            rm -f .sync-report.md
+          fi
+
+          UNRESOLVED="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$UNRESOLVED" ]; then
+            echo "::error::Conflicts remain unresolved after the Claude pass."
+            printf '%s\n' "$UNRESOLVED"
+            {
+              echo "## Upstream sync needs a human"
+              echo
+              echo "Claude could not resolve every conflict. Still conflicted:"
+              echo
+              printf '%s\n' "$UNRESOLVED" | sed 's/^/- `/; s/$/`/'
+              if [ -f "${RUNNER_TEMP}/sync-report.md" ]; then
+                echo
+                echo "### Report"
+                echo
+                cat "${RUNNER_TEMP}/sync-report.md"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Belt and braces: a resolution that left markers behind compiles in
+          # some languages and is always wrong.
+          MARKED=""
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            if grep -qE '^(<{7}|>{7}) ' -- "$f"; then
+              MARKED="${MARKED}${f}"$'\n'
+            fi
+          done < "${RUNNER_TEMP}/conflicts.txt"
+
+          if [ -n "$MARKED" ]; then
+            echo "::error::Conflict markers left in resolved files:"
+            printf '%s' "$MARKED"
+            exit 1
+          fi
+
+          echo "All conflicts resolved."
+
+      - name: Report unresolvable conflicts
+        if:
+          steps.merge.outputs.status == 'conflict' && steps.plan.outputs.ai !=
+          'true'
+        run: |
+          set -euo pipefail
+          {
+            echo "## Upstream sync stopped on conflicts"
+            echo
+            echo "Merging \`${UPSTREAM_REF}\` at \`${{ steps.plan.outputs.upstream_short }}\`"
+            echo "produced ${{ steps.merge.outputs.count }} conflicted file(s), and no"
+            echo '`ANTHROPIC_API_KEY` secret is configured to resolve them automatically.'
+            echo
+            printf '%s\n' '${{ steps.merge.outputs.files }}' | sed 's/^/- `/; s/$/`/'
+            echo
+            echo "Resolve locally:"
+            echo
+            echo '```bash'
+            echo "git fetch upstream && git checkout -b ${SYNC_BRANCH} origin/main"
+            echo "git merge ${{ steps.plan.outputs.upstream_sha }}"
+            echo '```'
+            echo
+            echo 'Follow `.github/UPSTREAM_SYNC.md`, then push the branch and open a PR'
+            echo "labelled \`${SYNC_LABEL}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          git merge --abort || true
+          exit 1
+
+      # ---------------------------------------------------------------- #
+      # Commit, push, PR.
+      # ---------------------------------------------------------------- #
+
+      - name: Commit merge
+        id: commit
+        if:
+          steps.merge.outputs.status == 'clean' || steps.verify.outcome ==
+          'success'
+        env:
+          UPSTREAM_SHA: ${{ steps.plan.outputs.upstream_sha }}
+          UPSTREAM_SHORT: ${{ steps.plan.outputs.upstream_short }}
+          BEHIND: ${{ steps.plan.outputs.behind }}
+          RESOLVED:
+            ${{ steps.merge.outputs.status == 'conflict' && 'true' || 'false' }}
+          CONFLICT_COUNT: ${{ steps.merge.outputs.count }}
+        run: |
+          set -euo pipefail
+
+          rm -f .sync-report.md
+
+          {
+            echo "Merge upstream ${UPSTREAM_REF} at ${UPSTREAM_SHORT}"
+            echo
+            echo "Merges ${BEHIND} commit(s) from get-convex/convex-backend into the fork."
+            if [ "$RESOLVED" = "true" ]; then
+              echo
+              echo "Resolved ${CONFLICT_COUNT} conflicted file(s) against the invariants"
+              echo "in .github/UPSTREAM_SYNC.md."
+            fi
+            echo
+            echo "Upstream-Commit: ${UPSTREAM_SHA}"
+          } > "${RUNNER_TEMP}/commit-msg.txt"
+
+          if [ -z "$(git status --porcelain)" ] && ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "Nothing to commit."
+            echo "committed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # -u, not -A: git already staged upstream's additions during the
+          # merge, so anything untracked is a stray file from the resolver and
+          # must not ride along in the merge commit.
+          UNTRACKED="$(git ls-files --others --exclude-standard)"
+          if [ -n "$UNTRACKED" ]; then
+            echo "::warning::Ignoring untracked files left in the workspace:"
+            printf '%s\n' "$UNTRACKED"
+          fi
+
+          git add -u
+          git commit --no-verify -F "${RUNNER_TEMP}/commit-msg.txt"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          git --no-pager log -1 --stat --format='%H%n%s' | head -40
+
+      - name: Push sync branch
+        if: steps.commit.outputs.committed == 'true'
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: git push --force-with-lease origin "HEAD:refs/heads/${BRANCH}"
+
+      - name: Open or update pull request
+        id: pr
+        if: steps.commit.outputs.committed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          EXISTING_PR: ${{ steps.plan.outputs.existing_pr }}
+          UPSTREAM_SHORT: ${{ steps.plan.outputs.upstream_short }}
+          BEHIND: ${{ steps.plan.outputs.behind }}
+          RESOLVED:
+            ${{ steps.merge.outputs.status == 'conflict' && 'true' || 'false' }}
+          CONFLICT_COUNT: ${{ steps.merge.outputs.count }}
+          CONFLICT_FILES: ${{ steps.merge.outputs.files }}
+        run: |
+          set -euo pipefail
+
+          BODY="${RUNNER_TEMP}/pr-body.md"
+          {
+            echo "Automated merge of \`get-convex/convex-backend@${UPSTREAM_SHORT}\`"
+            echo "into this fork — ${BEHIND} upstream commit(s)."
+            echo
+            if [ "$RESOLVED" = "true" ]; then
+              echo "### Conflicts resolved automatically"
+              echo
+              echo "${CONFLICT_COUNT} file(s) conflicted and were resolved by Claude against"
+              echo 'the invariants in `.github/UPSTREAM_SYNC.md`.'
+              echo
+              printf '%s\n' "$CONFLICT_FILES" | sed 's/^/- `/; s/$/`/'
+              echo
+              if [ -f "${RUNNER_TEMP}/sync-report.md" ]; then
+                echo "<details><summary>Resolution report</summary>"
+                echo
+                cat "${RUNNER_TEMP}/sync-report.md"
+                echo
+                echo "</details>"
+                echo
+              fi
+              echo "> Review the resolution before merging. The four fork regression tests"
+              echo "> in CI guard the behavioral invariants, but they do not cover"
+              echo "> everything."
+            else
+              echo "The merge was clean — no conflicts."
+            fi
+            echo
+            echo "### Upstream commits"
+            echo
+            echo "<details><summary>${BEHIND} commit(s)</summary>"
+            echo
+            echo '```'
+            git --no-pager log --oneline --no-merges "origin/main..${{ steps.plan.outputs.upstream_sha }}" | head -300
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "---"
+            echo
+            echo "Opened by \`.github/workflows/upstream-sync.yml\`."
+            echo "Must be merged with a **merge commit** — squashing or rebasing detaches"
+            echo "the fork from upstream history and makes every later sync re-conflict."
+            echo
+            # Satisfies the inherited upstream CLA check on this fork's PRs.
+            echo "By submitting this pull request, I confirm that you can use, modify, copy, and redistribute this contribution, under the terms of your choice."
+          } > "$BODY"
+
+          for label in "$SYNC_LABEL" automated; do
+            gh label create "$label" --color 0e8a16 --description "Upstream sync automation" 2>/dev/null || true
+          done
+
+          if [ -n "$EXISTING_PR" ]; then
+            PR="$EXISTING_PR"
+            gh pr edit "$PR" \
+              --title "Merge upstream convex-backend@${UPSTREAM_SHORT}" \
+              --body-file "$BODY"
+            echo "Updated PR #${PR}."
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "Merge upstream convex-backend@${UPSTREAM_SHORT}" \
+              --body-file "$BODY" \
+              --label "$SYNC_LABEL" \
+              --label automated
+            PR="$(gh pr list --state open --head "$BRANCH" --json number --jq '.[0].number')"
+            echo "Opened PR #${PR}."
+          fi
+
+          if [ "$RESOLVED" = "true" ]; then
+            gh label create ai-resolved --color d93f0b \
+              --description "Merge conflicts resolved by Claude" 2>/dev/null || true
+            gh pr edit "$PR" --add-label ai-resolved
+          fi
+
+          echo "number=${PR}" >> "$GITHUB_OUTPUT"
+          echo "url=$(gh pr view "$PR" --json url --jq .url)" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        id: automerge
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          PR: ${{ steps.pr.outputs.number }}
+          RESOLVED:
+            ${{ steps.merge.outputs.status == 'conflict' && 'true' || 'false' }}
+          REQUESTED:
+            ${{ github.event_name != 'workflow_dispatch' || inputs.automerge }}
+          MERGE_AI: ${{ vars.UPSTREAM_SYNC_AUTOMERGE_AI_RESOLVED }}
+        run: |
+          set -euo pipefail
+
+          if [ "$REQUESTED" = "false" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=disabled for this run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Clean merges land on their own. Conflict resolutions only do so if
+          # the repository has explicitly opted in, because a resolution can be
+          # plausible, compile, pass the regression tests, and still be wrong.
+          if [ "$RESOLVED" = "true" ] && [ "${MERGE_AI,,}" != "true" ]; then
+            gh pr comment "$PR" --body \
+              "Auto-merge is **not** enabled: this PR contains automatically resolved merge conflicts. Review it and merge with a merge commit, or set the repository variable \`UPSTREAM_SYNC_AUTOMERGE_AI_RESOLVED=true\` to land these unattended."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=conflict resolution awaiting review" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --merge, never --squash/--rebase. See .github/UPSTREAM_SYNC.md.
+          if gh pr merge "$PR" --auto --merge; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "reason=will merge when required checks pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not enable auto-merge on #${PR}; leaving it open."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "reason=auto-merge could not be enabled" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        if: always() && steps.plan.outputs.action == 'sync'
+        run: |
+          {
+            echo "## Upstream sync"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream | \`${{ steps.plan.outputs.upstream_short }}\` (${{ steps.plan.outputs.behind }} commits) |"
+            echo "| Merge | ${{ steps.merge.outputs.status || 'not attempted' }} |"
+            if [ -n "${{ steps.pr.outputs.number }}" ]; then
+              echo "| Pull request | ${{ steps.pr.outputs.url }} |"
+              echo "| Auto-merge | ${{ steps.automerge.outputs.enabled || 'false' }} — ${{ steps.automerge.outputs.reason || 'n/a' }} |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
