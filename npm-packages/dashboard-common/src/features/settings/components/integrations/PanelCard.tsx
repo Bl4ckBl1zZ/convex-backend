@@ -21,13 +21,16 @@ import {
   LogIntegration,
   ExceptionReportingIntegration,
   AuthIntegration,
+  AnalyticsIntegration,
   integrationToLogo,
   STREAMING_EXPORT_DESCRIPTION,
   STREAMING_IMPORT_DESCRIPTION,
   LOG_STREAMS_DESCRIPTION,
+  ANALYTICS_EXPORT_DESCRIPTION,
   AUTHENTICATION_DESCRIPTION,
 } from "@common/lib/integrationHelpers";
 import { useState, useCallback } from "react";
+import { FivetranSyncStatus } from "./FivetranSyncProgress";
 import { IntegrationTitle } from "./IntegrationTitle";
 import { IntegrationOverflowMenu } from "./IntegrationOverflowMenu";
 import { IntegrationStatus } from "./IntegrationStatus";
@@ -37,6 +40,7 @@ import { SentryConfigurationForm } from "./SentryConfigurationForm";
 import { WebhookConfigurationForm } from "./WebhookConfigurationForm";
 import { PostHogLogsConfigurationForm } from "./PostHogLogsConfigurationForm";
 import { PostHogErrorTrackingConfigurationForm } from "./PostHogErrorTrackingConfigurationForm";
+import { S3ExportConfigurationForm } from "./S3ExportConfigurationForm";
 import { WorkOSConfigurationForm } from "./WorkOSConfigurationForm";
 import { WorkOSIntegrationStatus } from "./WorkOSIntegrationStatus";
 import { WorkOSIntegrationOverflowMenu } from "./WorkOSIntegrationOverflowMenu";
@@ -46,6 +50,7 @@ export type PanelCardProps = {
   integration:
     | LogIntegration
     | ExceptionReportingIntegration
+    | AnalyticsIntegration
     | AuthIntegration
     | { kind: ExportIntegrationType }
     | { kind: ImportIntegrationType };
@@ -129,19 +134,14 @@ export function PanelCard({
             description={STREAMING_EXPORT_DESCRIPTION}
           />
           <div className="ml-auto">
+            {/* The listing endpoint 403s without the entitlement, so a team
+                that can't have a sync never asks for one. */}
             {unavailableReason === "MissingEntitlement" ? (
               <ProBadge teamSlug={teamSlug} />
             ) : (
-              <Button
-                href={exportSetupLink(integration.kind)}
-                target="_blank"
-                className="flex items-center gap-2"
-                inline
-                variant="neutral"
-              >
-                <div>Get Started</div>
-                <ExternalLinkIcon />
-              </Button>
+              <FivetranSyncStatus
+                setupHref={exportSetupLink(integration.kind)}
+              />
             )}
           </div>
         </div>
@@ -172,14 +172,19 @@ export function PanelCard({
         integration.kind === "datadog" ||
         integration.kind === "webhook" ||
         integration.kind === "postHogLogs" ||
-        integration.kind === "postHogErrorTracking") && (
+        integration.kind === "postHogErrorTracking" ||
+        integration.kind === "s3Export") && (
         <div className="flex flex-wrap items-center justify-between gap-2">
           {isModalOpen &&
             renderForm(integration, closeModal, onAddedIntegration)}
           <IntegrationTitle
             logo={logo}
             integrationKind={integration.kind}
-            description={LOG_STREAMS_DESCRIPTION}
+            description={
+              integration.kind === "s3Export"
+                ? ANALYTICS_EXPORT_DESCRIPTION
+                : LOG_STREAMS_DESCRIPTION
+            }
           />
           <div className="flex items-center gap-4">
             <IntegrationStatus integration={integration} />
@@ -223,7 +228,11 @@ function importSetupLink(kind: ImportIntegrationType): string {
 }
 
 function renderForm(
-  integration: LogIntegration | ExceptionReportingIntegration | AuthIntegration,
+  integration:
+    | LogIntegration
+    | ExceptionReportingIntegration
+    | AnalyticsIntegration
+    | AuthIntegration,
   closeModal: () => void,
   onAddedIntegration?: (kind: string) => void,
 ) {
@@ -331,6 +340,22 @@ function renderForm(
             />
           </div>
         </Modal>
+      );
+    case "s3Export":
+      return (
+        <LogIntegrationSidePanel
+          closeModal={closeModal}
+          title="Configure Streaming Export to AWS S3"
+          description="Mirror this deployment's data into an S3 bucket you own, in Apache Iceberg format, so it can be queried by your analytics engine."
+        >
+          {(closePanel) => (
+            <S3ExportConfigurationForm
+              integration={integration}
+              onClose={closePanel}
+              {...addedIntegrationProp}
+            />
+          )}
+        </LogIntegrationSidePanel>
       );
     case "workos":
       return (

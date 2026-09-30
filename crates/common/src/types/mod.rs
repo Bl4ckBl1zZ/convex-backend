@@ -16,6 +16,8 @@ pub use value::{
 
 mod actions;
 mod admin_key;
+mod ai_gateway;
+mod attribution;
 mod backend_info;
 mod backend_state;
 mod deployments;
@@ -48,6 +50,11 @@ pub use admin_key::{
     AdminKeyParts,
     SystemKey,
 };
+pub use ai_gateway::AI_GATEWAY_URL;
+pub use attribution::{
+    AttributedCaller,
+    AttributionClaims,
+};
 pub use backend_info::{
     BackendInfo,
     DEFAULT_PROVISION_CONCURRENCY,
@@ -79,6 +86,7 @@ pub use functions::{
     AllowedVisibility,
     FunctionCaller,
     ModuleEnvironment,
+    QueryInvocation,
     UdfIdentifier,
     UdfType,
     UdfTypeJson,
@@ -91,7 +99,11 @@ pub use index::{
     IndexDiff,
     IndexId,
     IndexName,
+    IndexRef,
     IndexTableIdentifier,
+    IndexWriteMode,
+    PersistenceIndexId,
+    PrevIndexEntry,
     StableIndexName,
     TabletIndexName,
     INDEX_BY_CREATION_TIME_DESCRIPTOR,
@@ -121,6 +133,21 @@ pub use timestamp::{
 tuple_struct_u64!(MemberId);
 tuple_struct_u64!(TeamId);
 tuple_struct_u64!(DeploymentId);
+
+impl DeploymentId {
+    /// A stable stand-in ID for a deployment big brain has no row for
+    /// (self-hosted backends, statically configured conductors). Derived from
+    /// the name so it survives restarts -- an ID-keyed persistence layout
+    /// stores rows under it -- and kept within `u32`, the widest ID such
+    /// layouts accept.
+    pub fn stable_from_name(name: &str) -> Self {
+        let digest = crate::sha256::Sha256::hash(name.as_bytes());
+        let bytes: [u8; 4] = digest.as_ref()[..4]
+            .try_into()
+            .expect("a SHA-256 digest has at least four bytes");
+        Self(u64::from(u32::from_be_bytes(bytes)))
+    }
+}
 tuple_struct_u64!(ProjectId);
 tuple_struct_u64!(CustomRoleId);
 // The autoincrement primary key of the `authorized_devices` table in big brain.
@@ -147,6 +174,7 @@ pub type CursorMs = f64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceVersion {
     V5,
+    V6,
 }
 
 impl PersistenceVersion {
@@ -156,13 +184,14 @@ impl PersistenceVersion {
     /// and return base_version here.
     pub fn index_key_version(&self, base_version: u8) -> u8 {
         match self {
-            PersistenceVersion::V5 => base_version,
+            PersistenceVersion::V5 | PersistenceVersion::V6 => base_version,
         }
     }
 
     pub fn version(&self) -> usize {
         match self {
             PersistenceVersion::V5 => 5,
+            PersistenceVersion::V6 => 6,
         }
     }
 }

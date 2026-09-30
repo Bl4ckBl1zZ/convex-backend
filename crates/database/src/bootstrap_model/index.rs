@@ -38,8 +38,8 @@ use common::{
     types::{
         IndexDescriptor,
         IndexDiff,
-        IndexId,
         IndexName,
+        IndexRef,
         StableIndexName,
         TableName,
         TabletIndexName,
@@ -61,7 +61,6 @@ use value::{
 };
 
 use crate::{
-    bootstrap_model::index_backfills::IndexBackfillModel,
     patch_value,
     query::TableFilter,
     reads::TransactionReadSet,
@@ -356,9 +355,6 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
     ) -> anyhow::Result<()> {
         for index in indexes {
             self.enable_index(&index).await?;
-            IndexBackfillModel::new(self.tx)
-                .delete_index_backfill(index.id())
-                .await?;
         }
         Ok(())
     }
@@ -373,10 +369,12 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
             IndexConfig::Database {
                 spec,
                 on_disk_state,
+                persistence_index_id,
             } => match on_disk_state {
                 DatabaseIndexState::Enabled => IndexConfig::Database {
                     spec,
                     on_disk_state: DatabaseIndexState::Backfilled { staged: true },
+                    persistence_index_id,
                 },
                 _ => {
                     anyhow::bail!("Index is not enabled, so it cannot be disabled");
@@ -870,12 +868,12 @@ impl<'a, RT: Runtime> IndexModel<'a, RT> {
     }
 
     /// Returns by_id indexes for *all tablets*, including hidden ones.
-    pub async fn by_id_indexes(&mut self) -> anyhow::Result<BTreeMap<TabletId, IndexId>> {
+    pub async fn by_id_indexes(&mut self) -> anyhow::Result<BTreeMap<TabletId, IndexRef>> {
         let all_indexes = self.get_all_indexes()?;
-        Ok(all_indexes
+        all_indexes
             .filter(|index| index.name.is_by_id())
-            .map(|index| (*index.name.table(), index.id().internal_id().into()))
-            .collect())
+            .map(|index| Ok((*index.name.table(), IndexRef::try_from(index)?)))
+            .collect()
     }
 
     pub async fn by_id_index_metadata(

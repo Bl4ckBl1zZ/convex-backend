@@ -2,6 +2,7 @@ import { Meta, StoryObj } from "@storybook/nextjs";
 import { mocked, fn } from "storybook/test";
 import {
   useDeleteAccount,
+  useMfaStatus,
   useProfileEmails,
   useUpdateProfileName,
 } from "api/profile";
@@ -11,6 +12,7 @@ import {
   usePaginatedPersonalAccessTokens,
 } from "api/personalAccessTokens";
 import { useDiscordAccounts, useUnlinkDiscordAccount } from "api/discord";
+import { useDirectorySyncOffers } from "api/directorySync";
 import { Profile } from "../../pages/profile";
 
 const now = Date.now();
@@ -43,6 +45,7 @@ const meta = {
     ]);
     mocked(useUpdateProfileName).mockReturnValue(fn());
     mocked(useDeleteAccount).mockReturnValue(fn());
+    mocked(useMfaStatus).mockReturnValue({ enabled: false });
     mocked(usePaginatedPersonalAccessTokens).mockReturnValue({
       data: {
         items: [
@@ -67,6 +70,7 @@ const meta = {
     mocked(useDeletePersonalAccessToken).mockReturnValue(fn());
     mocked(useDiscordAccounts).mockReturnValue([]);
     mocked(useUnlinkDiscordAccount).mockReturnValue(fn());
+    mocked(useDirectorySyncOffers).mockReturnValue([]);
   },
 } satisfies Meta<typeof Profile>;
 
@@ -74,3 +78,20 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+// Teams whose directory lists one of your verified emails. Directory Sync
+// offers a team rather than adding you to it, so this is where a provisioned
+// member accepts.
+export const AvailableTeams: Story = {
+  parameters: {
+    screenshotSelector: "#available-teams",
+    // The section sits below Profile information and Emails, past the bottom
+    // of the default 700px capture viewport.
+    screenshotViewport: { width: 1024, height: 1100 },
+  },
+  beforeEach: () => {
+    mocked(useDirectorySyncOffers).mockReturnValue([
+      { teamId: 14, teamName: "Acme Corp", email: "nicolas@acme.dev" },
+    ]);
+  },
+};

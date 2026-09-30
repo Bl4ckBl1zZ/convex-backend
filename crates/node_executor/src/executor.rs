@@ -22,7 +22,10 @@ use common::{
         JsError,
     },
     execution_context::ExecutionContext,
-    knobs::NODE_ANALYZE_MAX_RETRIES,
+    knobs::{
+        GET_SERVICE_TOKEN_GUARANTEED_LIFETIME,
+        NODE_ANALYZE_MAX_RETRIES,
+    },
     log_lines::{
         run_function_and_collect_log_lines,
         LogLine,
@@ -606,6 +609,8 @@ impl TryFrom<ExecutorRequest> for JsonValue {
                     "sourcePackage": JsonValue::from(r.source_package),
                     "backendAddress": backend_address,
                     "timeoutSecs": timeout.as_secs_f64(),
+                    "serviceTokenGuaranteedLifetimeSecs":
+                        GET_SERVICE_TOKEN_GUARANTEED_LIFETIME.as_secs_f64(),
                     "backendCallbackToken": r.callback_token,
                     "authHeader": r.auth_header,
                     "userIdentity": r.user_identity.map(JsonValue::try_from).transpose()?,
@@ -975,7 +980,22 @@ fn parse_streamed_response(s: &str) -> anyhow::Result<Vec<ResponsePart>> {
 
 pub enum NodeExecutorStreamPart {
     Chunk(Bytes),
-    InvokeComplete(Result<(), InvokeResponse>),
+    InvokeComplete(InvokeCompletion),
+}
+
+/// How the executor transport reported the end of an invocation.
+pub enum InvokeCompletion {
+    /// The invocation completed without any failure signal.
+    Success,
+    /// The transport authoritatively reported a failure (e.g. AWS Lambda set
+    /// an error code). Returned to the caller, discarding any streamed
+    /// payload.
+    ExplicitError(InvokeResponse),
+    /// A failure inferred from out-of-band signals (e.g. the AWS Lambda
+    /// platform log tail). Returned to the caller only when the stream
+    /// produced no result payload: the signal may describe a crash that
+    /// happened after a complete response was already streamed.
+    ImplicitError(InvokeResponse),
 }
 
 pub async fn handle_node_executor_stream(
@@ -1024,19 +1044,36 @@ pub async fn handle_node_executor_stream(
                     }
                 }
             },
-            NodeExecutorStreamPart::InvokeComplete(result) => {
-                if let Err(e) = result {
-                    return Ok(Err(e));
+            NodeExecutorStreamPart::InvokeComplete(completion) => {
+                let error_if_no_result = match completion {
+                    InvokeCompletion::ExplicitError(e) => return Ok(Err(e)),
+                    InvokeCompletion::ImplicitError(e) => Some(e),
+                    InvokeCompletion::Success => None,
+                };
+                let parsed = String::from_utf8(remaining_chunks.concat())
+                    .map_err(anyhow::Error::from)
+                    .and_then(|decoded_str| parse_streamed_response(&decoded_str));
+                match parsed {
+                    Ok(parts) => {
+                        for part in parts {
+                            match part {
+                                ResponsePart::LogLine(log_line) => {
+                                    log_line_sender.send(log_line)?;
+                                },
+                                ResponsePart::Result(result) => result_values.push(result),
+                            };
+                        }
+                    },
+                    // A crash can truncate the stream mid-line or mid-character;
+                    // prefer the inferred failure over the decode error when we
+                    // have one.
+                    Err(e) if error_if_no_result.is_none() => return Err(e),
+                    Err(_) => {},
                 }
-                let decoded_str = String::from_utf8(remaining_chunks.concat())?;
-                let parts = parse_streamed_response(&decoded_str)?;
-                for part in parts {
-                    match part {
-                        ResponsePart::LogLine(log_line) => {
-                            log_line_sender.send(log_line)?;
-                        },
-                        ResponsePart::Result(result) => result_values.push(result),
-                    };
+                if result_values.is_empty()
+                    && let Some(e) = error_if_no_result
+                {
+                    return Ok(Err(e));
                 }
                 break;
             },

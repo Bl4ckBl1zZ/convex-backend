@@ -58,7 +58,9 @@ use crate::{
             syscall_name_for_error,
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
+        OpProvider,
+        SyscallProvider,
     },
     helpers,
     isolate::{
@@ -79,7 +81,7 @@ pub struct SchemaEnvironment {
     unix_timestamp: UnixTimestamp,
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
+impl OpProvider for SchemaEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         tracing::warn!(
             "Unexpected Console access at schema evaluation time: {}",
@@ -127,7 +129,9 @@ impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
             "Getting the table mapping unsupported when evaluating schema"
         ))
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for SchemaEnvironment {
     async fn lookup_source(
         &mut self,
         path: &str,
@@ -154,12 +158,21 @@ impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
             format!("Syscall {name} unsupported when evaluating schema")
         ));
     }
+}
+
+impl<RT: Runtime> JsEnvironment<RT> for SchemaEnvironment {
+    type AsyncResolver = v8::Global<v8::PromiseResolver>;
+    type SyscallProvider = Self;
+
+    fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+        self
+    }
 
     fn start_async_syscall(
         &mut self,
         name: String,
         _args: JsonValue,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}InSchema", syscall_name_for_error(&name)),
@@ -173,7 +186,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for SchemaEnvironment {
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}InSchema", request.name_for_error()),
@@ -231,7 +244,7 @@ impl SchemaEnvironment {
         drop(isolate_context);
         drop(timeout);
 
-        handle.take_termination_error(None, "schema")??;
+        handle.take_termination_error("schema")??;
         result
     }
 

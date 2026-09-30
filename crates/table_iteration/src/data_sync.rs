@@ -98,6 +98,7 @@
 //! ```
 
 use std::{
+    cmp,
     collections::{
         BTreeMap,
         BTreeSet,
@@ -125,7 +126,7 @@ use common::{
     },
     runtime::Runtime,
     types::{
-        IndexId,
+        IndexRef,
         RepeatableTimestamp,
         Timestamp,
     },
@@ -133,7 +134,6 @@ use common::{
 use errors::ErrorMetadata;
 use futures::{
     pin_mut,
-    StreamExt,
     TryStreamExt,
 };
 use value::{
@@ -321,6 +321,7 @@ pub struct DataSyncIterator<RT: Runtime> {
     runtime: RT,
     persistence: Arc<dyn PersistenceReader>,
     retention_validator: Arc<dyn RetentionValidator>,
+    min_ts: RepeatableTimestamp,
     page_size_limit: usize,
     page_bytes_limit: usize,
     max_rows_read: usize,
@@ -328,6 +329,11 @@ pub struct DataSyncIterator<RT: Runtime> {
 }
 
 impl<RT: Runtime> DataSyncIterator<RT> {
+    /// `min_ts` is a floor on the snapshot each page reads at (see
+    /// [`Self::latest_ts`]); pass a fresh timestamp like
+    /// `Database::now_ts_for_reads` or a transaction's begin timestamp so the
+    /// sync doesn't lag behind the committer's persisted repeatable timestamp.
+    ///
     /// `page_size_limit` bounds entries emitted per page and `page_bytes_limit`
     /// bounds their total byte size (both soft: a single transaction is never
     /// split, so it may push a page over). `max_rows_read` bounds rows read
@@ -338,6 +344,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         runtime: RT,
         persistence: Arc<dyn PersistenceReader>,
         retention_validator: Arc<dyn RetentionValidator>,
+        min_ts: RepeatableTimestamp,
         page_size_limit: usize,
         page_bytes_limit: usize,
         max_rows_read: usize,
@@ -354,6 +361,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             runtime,
             persistence,
             retention_validator,
+            min_ts,
             page_size_limit,
             page_bytes_limit,
             max_rows_read,
@@ -373,7 +381,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
     pub async fn next_page(
         &self,
         cursor: Option<DataSyncCursor>,
-        target_tables: &BTreeMap<TabletId, IndexId>,
+        target_tables: &BTreeMap<TabletId, IndexRef>,
     ) -> anyhow::Result<DataSyncPage> {
         let page = self.next_page_inner(cursor, target_tables, false).await?;
         Ok(DataSyncPage {
@@ -389,15 +397,34 @@ impl<RT: Runtime> DataSyncIterator<RT> {
     pub async fn next_page_with_prev_revs(
         &self,
         cursor: Option<DataSyncCursor>,
-        target_tables: &BTreeMap<TabletId, IndexId>,
+        target_tables: &BTreeMap<TabletId, IndexRef>,
     ) -> anyhow::Result<DataSyncPage<DataSyncEntry>> {
         self.next_page_inner(cursor, target_tables, true).await
+    }
+
+    /// The timestamp each page reads at: the max of `min_ts` and the
+    /// committer's persisted repeatable timestamp, which lags live writes by a
+    /// few seconds. It bounds reads and feeds the freshness heuristic.
+    ///
+    /// The max satisfies every constraint the iterator needs:
+    ///
+    /// 1. Repeatable, since the max of two repeatable timestamps is repeatable.
+    /// 2. Weakly monotonically increasing across pages, since `min_ts` is fixed
+    ///    and the persisted repeatable timestamp only increases — so any
+    ///    `synced_ts` produced by a prior page stays `<=` it.
+    /// 3. Within retention, since the persisted repeatable timestamp is and the
+    ///    max is at least as recent.
+    async fn latest_ts(&self) -> anyhow::Result<RepeatableTimestamp> {
+        Ok(cmp::max(
+            self.min_ts,
+            new_static_repeatable_recent(self.persistence.as_ref()).await?,
+        ))
     }
 
     async fn next_page_inner(
         &self,
         cursor: Option<DataSyncCursor>,
-        target_tables: &BTreeMap<TabletId, IndexId>,
+        target_tables: &BTreeMap<TabletId, IndexRef>,
         include_prev_revs: bool,
     ) -> anyhow::Result<DataSyncPage<DataSyncEntry>> {
         self.runtime
@@ -405,10 +432,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             .wait("data_sync_before_page")
             .await;
 
-        // The latest repeatable timestamp bounds reads and is used by the
-        // freshness heuristic. It increases monotonically, so any `synced_ts`
-        // produced by a prior page is `<= latest`.
-        let latest = new_static_repeatable_recent(self.persistence.as_ref()).await?;
+        let latest = self.latest_ts().await?;
 
         // Cold start, or reconcile an existing cursor against `target_tables`.
         let mut cursor = match cursor {
@@ -474,7 +498,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         &self,
         cursor: &mut DataSyncCursor,
         latest: RepeatableTimestamp,
-        target_tables: &BTreeMap<TabletId, IndexId>,
+        target_tables: &BTreeMap<TabletId, IndexRef>,
     ) -> anyhow::Result<(Vec<DataSyncEntry>, DataSyncStatus)> {
         let TableCursor::InProgress {
             current_table,
@@ -502,24 +526,20 @@ impl<RT: Runtime> DataSyncIterator<RT> {
             index_key: current_id
                 .map(|id| CursorPosition::After(IndexKey::new(vec![], id).to_bytes())),
         };
-        let stream = snapshot.index_scan(
+        let mut stream = snapshot.index_scan(
             by_id,
             current_table,
             &scan_cursor.interval(),
             Order::Asc,
             self.page_size_limit,
         );
-        let page: Vec<_> = stream.take(self.page_size_limit).try_collect().await?;
-        let count_limited = page.len() >= self.page_size_limit;
-        if page.is_empty() {
-            cover!(coverage::BY_ID_EMPTY_PAGE);
-        }
+        let mut count_limited = false;
 
-        let mut entries = Vec::with_capacity(page.len());
+        let mut entries = Vec::with_capacity(self.page_size_limit);
         let mut new_current_id = current_id;
         let mut page_bytes = 0usize;
         let mut bytes_limited = false;
-        for (_key, latest_doc) in page {
+        while let Some((_key, latest_doc)) = stream.try_next().await? {
             let value = latest_doc.value;
             page_bytes += value.size();
             let id = value.id_with_table_id();
@@ -542,6 +562,14 @@ impl<RT: Runtime> DataSyncIterator<RT> {
                 bytes_limited = true;
                 break;
             }
+            if entries.len() >= self.page_size_limit {
+                count_limited = true;
+                break;
+            }
+        }
+
+        if entries.is_empty() {
+            cover!(coverage::BY_ID_EMPTY_PAGE);
         }
 
         cursor.num_docs_synced = cursor.num_docs_synced.saturating_add(entries.len() as u64);
@@ -584,7 +612,7 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         &self,
         cursor: &mut DataSyncCursor,
         latest: RepeatableTimestamp,
-        target_tables: &BTreeMap<TabletId, IndexId>,
+        target_tables: &BTreeMap<TabletId, IndexRef>,
         include_prev_revs: bool,
     ) -> anyhow::Result<(Vec<DataSyncEntry>, DataSyncStatus)> {
         cover!(coverage::TS_PAGE);
@@ -602,8 +630,22 @@ impl<RT: Runtime> DataSyncIterator<RT> {
         if let Some(start) = cursor.synced_ts.succ_opt()
             && start <= *latest
         {
-            let stream = repeatable_persistence
-                .load_documents(TimestampRange::new(start..=*latest), Order::Asc);
+            let range = TimestampRange::new(start..=*latest);
+            let single_table = if target_tables.len() == 1 {
+                target_tables.first_key_value().map(|(tablet, _)| tablet)
+            } else {
+                None
+            };
+            let stream = match single_table {
+                Some(&tablet) => {
+                    cover!(coverage::TS_SINGLE_TABLE_FILTER);
+                    repeatable_persistence.load_documents_from_table(tablet, range, Order::Asc)
+                },
+                None => {
+                    cover!(coverage::TS_MULTI_TABLE_SCAN);
+                    repeatable_persistence.load_documents(range, Order::Asc)
+                },
+            };
             pin_mut!(stream);
 
             let mut rows_read = 0usize;
@@ -817,7 +859,7 @@ fn is_captured(id: &InternalDocumentId, cursor: &DataSyncCursor) -> bool {
 /// targets are done.
 fn advance_to_next_table(
     synced_tables: &BTreeSet<TabletId>,
-    target_tables: &BTreeMap<TabletId, IndexId>,
+    target_tables: &BTreeMap<TabletId, IndexRef>,
 ) -> TableCursor {
     match target_tables
         .keys()
@@ -843,7 +885,7 @@ fn advance_to_next_table(
 /// start a newly-added table if we were otherwise `Synced`.
 fn reconcile_target_tables(
     cursor: &mut DataSyncCursor,
-    target_tables: &BTreeMap<TabletId, IndexId>,
+    target_tables: &BTreeMap<TabletId, IndexRef>,
 ) {
     let synced_before = cursor.synced_tables.len();
     cursor

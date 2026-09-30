@@ -1,10 +1,10 @@
-import { HeaderGroup } from "react-table";
+import { HeaderGroup } from "@tanstack/react-table";
 import { GenericDocument } from "convex/server";
 import classNames from "classnames";
-import omit from "lodash/omit";
 import { RefObject } from "react";
 import { ColumnHeader } from "@common/features/data/components/Table/ColumnHeader";
 import { DataCellProps } from "@common/features/data/components/Table/DataCell/DataCell";
+import { SortOption } from "@common/features/data/components/IndexFilterBar/filterModel";
 
 export function TableHeader({
   headerGroups,
@@ -16,6 +16,8 @@ export function TableHeader({
   topBorderAnimation,
   openContextMenu,
   sort,
+  getSortOption,
+  onSortColumn,
   localStorageKey,
   tableContainerRef,
 }: {
@@ -31,33 +33,37 @@ export function TableHeader({
     order: "asc" | "desc";
     field: string;
   };
+  getSortOption: (field: string) => SortOption;
+  onSortColumn: (field: string) => void;
   localStorageKey: string;
-  tableContainerRef: RefObject<HTMLDivElement>;
+  tableContainerRef: RefObject<HTMLDivElement | null>;
 }) {
   return (
     <div className="group">
       {/* Header */}
       {headerGroups.map((headerGroup) => (
         <div
-          key={headerGroup.getHeaderGroupProps().key}
-          {...omit(headerGroup.getHeaderGroupProps(), "key")}
+          key={headerGroup.id}
+          role="row"
           // The FixedSizeList controlling the table width somehow adds an extra pixel to the data rows,
           // so add one here too.
-          className="mr-px border-x border-x-transparent"
+          className="mr-px flex border-x border-x-transparent"
         >
-          {headerGroup.headers.map((column, columnIndex) => (
+          {headerGroup.headers.map((header, columnIndex) => (
             <ColumnHeader
               key={columnIndex}
               isLastColumn={columnIndex === headerGroup.headers.length - 1}
               isResizingColumn={isResizingColumn}
-              column={column}
+              header={header}
               columnIndex={columnIndex}
               allRowsSelected={allRowsSelected}
               hasFilters={hasFilters}
               isSelectionExhaustive={isSelectionExhaustive}
               toggleAll={toggleAll}
               openContextMenu={openContextMenu}
-              sort={sort.field === column.Header ? sort.order : undefined}
+              sort={sort.field === header.column.id ? sort.order : undefined}
+              sortOption={getSortOption(header.column.id)}
+              onSort={() => onSortColumn(header.column.id)}
               localStorageKey={localStorageKey}
               tableContainerRef={tableContainerRef}
             />

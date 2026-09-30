@@ -41,6 +41,7 @@ use common::{
     },
     types::{
         IndexId,
+        IndexRef,
         RepeatableTimestamp,
         TabletIndexName,
     },
@@ -50,9 +51,11 @@ use database::{
     IndexBackfillModel,
     IndexModel,
     IndexWorkerMetadataModel,
+    SearchFlusherWakeSubscriber,
     TableScanCursor,
     Token,
 };
+use errors::ErrorMetadataAnyhowExt;
 use futures::{
     stream,
     StreamExt,
@@ -175,6 +178,20 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         }
     }
 
+    /// Live flushers subscribe to be woken as soon as an in-memory index
+    /// passes the soft limit, instead of waiting for the next poll. Backfill
+    /// flushers don't build in-memory index contents, so they have nothing to
+    /// wake up for.
+    pub(crate) fn wake_subscriber(&self) -> Option<SearchFlusherWakeSubscriber> {
+        match self.flusher_type {
+            FlusherType::LiveFlush => Some(
+                self.database
+                    .subscribe_search_flusher_wake(Self::search_type()),
+            ),
+            FlusherType::Backfill => None,
+        }
+    }
+
     fn index_type_name(&self) -> &'static str {
         match Self::search_type() {
             SearchType::Vector => "vector",
@@ -232,7 +249,23 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         build_args: T::BuildIndexArgs,
     ) -> anyhow::Result<u64> {
         let timer = build_one_search_index_timer(T::search_type());
+        match self.build_one_inner(job, build_args).await {
+            Ok(num_documents) => {
+                timer.finish();
+                Ok(num_documents)
+            },
+            Err(e) => {
+                timer.finish_with(e.metric_status_label_value());
+                Err(e)
+            },
+        }
+    }
 
+    async fn build_one_inner(
+        &self,
+        job: IndexBuild<T>,
+        build_args: T::BuildIndexArgs,
+    ) -> anyhow::Result<u64> {
         let result = self.build_multipart_segment(&job, build_args).await?;
         tracing::debug!(
             "Built a {} segment for: {result:#?}",
@@ -264,7 +297,6 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
             index_stats.num_non_deleted_documents(),
             Self::search_type(),
         );
-        timer.finish();
 
         Ok(new_segment_stats.num_documents())
     }
@@ -353,7 +385,7 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
                 let job = IndexBuild {
                     index_name: name.clone(),
                     index_id: index_id.internal_id().into(),
-                    by_id: by_id_metadata.id().internal_id().into(),
+                    by_id: IndexRef::try_from(&by_id_metadata)?,
                     index_config: config,
                     metadata_id: index_id,
                     build_reason,
@@ -589,7 +621,7 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
         params: Params<RT, T>,
         rate_limit_pages_per_second: NonZeroU32,
         index_name: TabletIndexName,
-        by_id: IndexId,
+        by_id: IndexRef,
         build_type: MultipartBuildType,
         snapshot_ts: RepeatableTimestamp,
         spec: T::Spec,
@@ -728,7 +760,7 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
 async fn incremental_table_scan_stream<'a, T: SearchIndex>(
     reader: &'a PersistenceSnapshot,
     start_cursor: Option<IndexKeyBytes>,
-    by_id: IndexId,
+    by_id: IndexRef,
     tablet_id: TabletId,
     schema: &'a T::Schema,
     threshold_bytes: usize,
@@ -801,7 +833,7 @@ fn build_incremental_doc_stream<'a, T: SearchIndex>(
     new_ts: RepeatableTimestamp,
     table_number: TableNumber,
     tablet_id: TabletId,
-    by_id: IndexId,
+    by_id: IndexRef,
     schema: &'a T::Schema,
     threshold_bytes: usize,
     start_cursor: Option<IndexKeyBytes>,
@@ -840,7 +872,7 @@ fn build_incremental_doc_stream<'a, T: SearchIndex>(
 pub(crate) struct IndexBuild<T: SearchIndex> {
     pub(crate) index_name: TabletIndexName,
     pub(crate) index_id: IndexId,
-    pub(crate) by_id: IndexId,
+    pub(crate) by_id: IndexRef,
     pub(crate) metadata_id: ResolvedDocumentId,
     pub(crate) index_config: SearchIndexConfig<T>,
     pub(crate) build_reason: BuildReason,

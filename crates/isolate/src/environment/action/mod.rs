@@ -1,6 +1,7 @@
 mod async_syscall;
 mod fetch;
 mod phase;
+mod service_token;
 mod storage;
 mod stream;
 mod syscall;
@@ -11,7 +12,10 @@ mod task_order;
 use std::{
     cmp::Ordering,
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        OnceLock,
+    },
     time::Duration,
 };
 
@@ -56,6 +60,7 @@ use deno_core::v8::{
     self,
     scope,
 };
+use errors::ErrorMetadata;
 use futures::{
     future::BoxFuture,
     select_biased,
@@ -128,6 +133,7 @@ pub use self::{
 };
 use self::{
     phase::ActionPhase,
+    service_token::ServiceTokenCache,
     task::{
         TaskId,
         TaskRequest,
@@ -144,7 +150,6 @@ use crate::{
     client::{
         ActionRequestParams,
         EnvironmentData,
-        SharedIsolateHeapStats,
     },
     context_cache::ContextCache,
     environment::{
@@ -155,7 +160,9 @@ use crate::{
             MAX_LOG_LINES,
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
+        OpProvider,
+        SyscallProvider,
     },
     execution_scope::ExecutionScope,
     helpers::{
@@ -167,17 +174,14 @@ use crate::{
         HttpRequestV8,
         HttpResponseV8,
     },
-    isolate::{
-        Isolate,
-        IsolateHeapStats,
-    },
+    isolate::Isolate,
     metrics::{
         self,
         log_isolate_request_cancelled,
         log_unawaited_pending_op,
     },
     module_cache::V8ModuleSource,
-    ops::OpProvider,
+    ops::V8OpProvider,
     request_scope::{
         RequestScope,
         StreamListener,
@@ -185,7 +189,7 @@ use crate::{
     strings,
     termination::{
         ContextTerminationReason,
-        IsolateHandle,
+        ExecutionHandle,
         IsolateTerminationReason,
     },
     timeout::{
@@ -237,7 +241,7 @@ pub struct ActionEnvironment<RT: Runtime> {
     task_responses: mpsc::UnboundedReceiver<TaskResponse>,
     phase: ActionPhase<RT>,
     syscall_trace: Arc<Mutex<SyscallTrace>>,
-    heap_stats: SharedIsolateHeapStats,
+    http_action_route: Arc<OnceLock<HttpActionRoute>>,
 }
 
 impl<RT: Runtime> Drop for ActionEnvironment<RT> {
@@ -268,13 +272,13 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         fetch_client: Arc<dyn FetchClient>,
         log_line_sender: mpsc::UnboundedSender<LogLine>,
         http_response_streamer: Option<HttpActionResponseStreamer>,
-        heap_stats: SharedIsolateHeapStats,
         context: ExecutionContext,
     ) -> Self {
         let syscall_trace = Arc::new(Mutex::new(SyscallTrace::new()));
         let (task_retval_sender, task_responses) = mpsc::unbounded_channel();
         let resources = Arc::new(Mutex::new(BTreeMap::new()));
         let convex_origin_override = Arc::new(Mutex::new(None));
+        let http_action_route = Arc::new(OnceLock::new());
         let task_executor = TaskExecutor {
             rt: rt.clone(),
             identity: identity.clone(),
@@ -293,7 +297,9 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             udf_path,
             component_path,
             convex_origin_override: convex_origin_override.clone(),
+            http_action_route: http_action_route.clone(),
             deployment,
+            service_token: Arc::new(ServiceTokenCache::default()),
         };
         let (pending_task_sender, pending_task_receiver) = spsc::unbounded_channel();
         let running_tasks = rt.spawn("task_executor", task_executor.go(pending_task_receiver));
@@ -319,7 +325,15 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 convex_origin_override,
             ),
             syscall_trace,
-            heap_stats,
+            http_action_route,
+        }
+    }
+
+    /// Called only after a lookup succeeds. An unmatched route's path is the
+    /// raw request path, which no token or usage record should keep.
+    fn set_http_action_route(&self, route: HttpActionRoute) {
+        if self.http_action_route.set(route).is_err() {
+            tracing::warn!("HTTP action route was already set for this request");
         }
     }
 
@@ -344,7 +358,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         anyhow::ensure!(component_function_path.component == self.phase.component());
         let udf_path = &component_function_path.udf_path;
 
-        let heap_stats = self.heap_stats.clone();
         let (handle, state, mut timeout) =
             isolate.start_request(context_cache, permit, self).await?;
         if let Some(tx) = function_started {
@@ -367,8 +380,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         )
         .await;
         // Override the returned result if we hit a termination error.
-        let termination_error = handle
-            .take_termination_error(Some(heap_stats.get()), &format!("http action: {udf_path}"));
+        let termination_error = handle.take_termination_error(&format!("http action: {udf_path}"));
 
         // Perform a microtask checkpoint one last time before taking the environment
         // to ensure the microtask queue is empty. Otherwise, JS from this request may
@@ -482,6 +494,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             },
             Some(route) => route,
         };
+        scope
+            .state_mut()?
+            .environment
+            .set_http_action_route(route.clone());
 
         let run_str = strings::runRequest.create(&scope)?.into();
         let v8_function: v8::Local<v8::Function> = router
@@ -500,7 +516,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 scope
                     .state_mut()?
                     .environment
-                    .send_stream(stream_id, Some(body));
+                    .send_stream(stream_id, Some(body))?;
                 Some(stream_id)
             },
             None => None,
@@ -566,7 +582,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         let stream_id = state.create_request_stream()?;
         state
             .environment
-            .send_stream(stream_id, Some(sender_closed));
+            .send_stream(stream_id, Some(sender_closed))?;
 
         Ok(stream_id)
     }
@@ -652,7 +668,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         &mut self,
         stream_id: uuid::Uuid,
         stream: Option<BoxStream<'static, anyhow::Result<bytes::Bytes>>>,
-    ) {
+    ) -> anyhow::Result<()> {
         let task_id = self.next_task_id.increment();
         self.pending_task_sender
             .send(TaskRequest {
@@ -660,7 +676,11 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 variant: TaskRequestEnum::AsyncOp(AsyncOpRequest::SendStream { stream, stream_id }),
                 parent_trace: EncodedSpan::from_parent(),
             })
-            .expect("TaskExecutor went away?");
+            .map_err(|_| {
+                anyhow!(ErrorMetadata::operational_internal_server_error())
+                    .context("TaskExecutor went away")
+            })?;
+        Ok(())
     }
 
     #[fastrace::trace]
@@ -675,7 +695,6 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         function_started: Option<oneshot::Sender<()>>,
     ) -> anyhow::Result<ActionOutcome> {
         let start_unix_timestamp = self.rt.unix_timestamp();
-        let heap_stats = self.heap_stats.clone();
 
         let (handle, state, mut timeout) =
             isolate.start_request(context_cache, permit, self).await?;
@@ -701,13 +720,10 @@ impl<RT: Runtime> ActionEnvironment<RT> {
         isolate_context.checkpoint();
         *isolate_clean = true;
 
-        match handle.take_termination_error(
-            Some(heap_stats.get()),
-            &format!(
-                "{:?}",
-                request_params.path_and_args.path().clone().for_logging()
-            ),
-        ) {
+        match handle.take_termination_error(&format!(
+            "{:?}",
+            request_params.path_and_args.path().clone().for_logging()
+        )) {
             Ok(Ok(..)) => (),
             Ok(Err(e)) => {
                 result = Ok(Err(e));
@@ -986,7 +1002,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
     async fn run_inner<'a, 's, 'i, T, S>(
         scope: &mut ExecutionScope<'a, 's, 'i, RT, Self>,
         timeout: &mut Timeout<RT>,
-        handle: IsolateHandle,
+        handle: ExecutionHandle,
         udf_type: UdfType,
         v8_function: v8::Local<'_, v8::Function>,
         v8_args: &[v8::Local<'_, v8::Value>],
@@ -1037,7 +1053,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
             // queue.
             scope.perform_microtask_checkpoint();
             pump_message_loop(scope);
-            scope.record_heap_stats()?;
+            scope.record_heap_stats(&handle)?;
             let request_stream_state = scope.state()?.request_stream_state.as_ref();
             if let Some(request_stream_state) = request_stream_state {
                 handle.update_request_stream_bytes(request_stream_state.bytes_read());
@@ -1327,7 +1343,11 @@ impl<RT: Runtime> ActionEnvironment<RT> {
                 variant: request,
                 parent_trace: EncodedSpan::from_parent(),
             })
-            .expect("TaskExecutor went away?");
+            .map_err(|_| {
+                self.task_promise_resolvers.remove(&task_id);
+                anyhow!(ErrorMetadata::operational_internal_server_error())
+                    .context("TaskExecutor went away")
+            })?;
         Ok(())
     }
 
@@ -1338,7 +1358,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
     }
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for ActionEnvironment<RT> {
+impl<RT: Runtime> OpProvider for ActionEnvironment<RT> {
     fn trace(&mut self, level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         // - 1 to reserve for the [ERROR] log line
 
@@ -1400,7 +1420,9 @@ impl<RT: Runtime> IsolateEnvironment<RT> for ActionEnvironment<RT> {
     fn get_all_table_mappings(&mut self) -> anyhow::Result<NamespacedTableMapping> {
         anyhow::bail!("get_all_table_mappings unsupported in actions")
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for ActionEnvironment<RT> {
     // We lookup all modules' sources upfront when initializing the action
     // environment, so this function always returns immediately.
     async fn lookup_source(
@@ -1416,12 +1438,21 @@ impl<RT: Runtime> IsolateEnvironment<RT> for ActionEnvironment<RT> {
     fn syscall(&mut self, name: &str, args: JsonValue) -> anyhow::Result<JsonValue> {
         self.syscall_impl(name, args)
     }
+}
+
+impl<RT: Runtime> JsEnvironment<RT> for ActionEnvironment<RT> {
+    type AsyncResolver = v8::Global<v8::PromiseResolver>;
+    type SyscallProvider = Self;
+
+    fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+        self
+    }
 
     fn start_async_syscall(
         &mut self,
         name: String,
         args: JsonValue,
-        resolver: v8::Global<v8::PromiseResolver>,
+        resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         self.start_task(TaskRequestEnum::AsyncSyscall { name, args }, resolver)
     }
@@ -1429,15 +1460,13 @@ impl<RT: Runtime> IsolateEnvironment<RT> for ActionEnvironment<RT> {
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
-        resolver: v8::Global<v8::PromiseResolver>,
+        resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         self.start_task(TaskRequestEnum::AsyncOp(request), resolver)
     }
 
-    fn record_heap_stats(&self, mut isolate_stats: IsolateHeapStats) {
-        // Add the memory allocated by the environment itself.
-        isolate_stats.environment_heap_size = self.syscall_trace.lock().heap_size();
-        self.heap_stats.store(isolate_stats);
+    fn environment_heap_size(&self) -> usize {
+        self.syscall_trace.lock().heap_size()
     }
 
     fn user_timeout(&self) -> std::time::Duration {

@@ -23,6 +23,7 @@ mod preloaded;
 pub mod query;
 pub mod reads;
 mod retention;
+mod search_flusher_wake;
 mod search_index_bootstrap;
 mod snapshot_manager;
 mod stack_traces;
@@ -38,6 +39,7 @@ mod transaction;
 mod transaction_id_generator;
 mod transaction_index;
 mod virtual_tables;
+mod write_batcher;
 mod write_limits;
 mod write_log;
 mod write_throughput_limiter;
@@ -54,12 +56,12 @@ pub use database_index_workers::{
     index_writer::{
         IndexRateLimit,
         IndexWriter,
-        IndexWriterMode,
         PERFORM_BACKFILL_LABEL,
     },
     IndexWorker,
 };
 pub use execution_size::{
+    FileStorageSize,
     FunctionExecutionSize,
     TransactionLimits,
 };
@@ -76,9 +78,14 @@ pub use reads::{
     OVER_LIMIT_HELP,
 };
 pub use schema_registry::SchemaRegistry;
+pub use search_flusher_wake::{
+    SearchFlusherWakeSignals,
+    SearchFlusherWakeSubscriber,
+};
 pub use search_index_bootstrap::FINISHED_BOOTSTRAP_UPDATES;
 pub use table_iteration::{
     data_sync::{
+        DataSyncCursor,
         DataSyncIterator,
         DataSyncStatus,
     },
@@ -145,6 +152,11 @@ pub use self::{
             INDEX_DOC_ID_INDEX,
             INDEX_WORKER_METADATA_TABLE,
         },
+        next_persistence_index_id::{
+            types::NextPersistenceIndexIdMetadata,
+            NextPersistenceIndexIdTable,
+            NEXT_PERSISTENCE_INDEX_ID_TABLE,
+        },
         schema::{
             types::{
                 SchemaDiff,
@@ -157,11 +169,23 @@ pub use self::{
             SCHEMA_STATE_FIELD,
         },
         schema_validation_progress::{
-            types::SchemaValidationProgressMetadata,
+            legacy::LegacySchemaValidationProgressMetadata,
+            types::SchemaValidationProgress,
             SchemaValidationProgressModel,
             SchemaValidationProgressTable,
-            SCHEMA_VALIDATION_PROGRESS_BY_SCHEMA_ID,
+            SCHEMA_VALIDATION_PROGRESS_BY_VALIDATION_ID,
             SCHEMA_VALIDATION_PROGRESS_TABLE,
+        },
+        schema_validations::{
+            types::{
+                SchemaValidationMetadata,
+                ValidationState,
+            },
+            SchemaValidationModel,
+            SchemaValidationTable,
+            ValidationAttemptUpdate,
+            SCHEMA_VALIDATIONS_BY_SCHEMA_ID_AND_TABLE_NAME,
+            SCHEMA_VALIDATIONS_TABLE,
         },
         system_metadata::SystemMetadataModel,
         table::{
@@ -193,6 +217,7 @@ pub use self::{
     retention::{
         latest_retention_min_snapshot_ts,
         FollowerRetentionManager,
+        IndexRetentionSource,
         LeaderRetentionManager,
         LeaderRetentionWorkers,
         RetentionType,

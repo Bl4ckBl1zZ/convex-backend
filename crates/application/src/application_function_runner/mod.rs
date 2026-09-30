@@ -36,6 +36,7 @@ use common::{
     execution_context::{
         ExecutionContext,
         RequestContext,
+        RequestId,
     },
     fastrace_helpers::EncodedSpan,
     knobs::{
@@ -68,11 +69,14 @@ use common::{
     },
     types::{
         AllowedVisibility,
+        AttributedCaller,
+        AttributionClaims,
+        DeploymentMetadata,
         FunctionCaller,
         ModuleEnvironment,
         NodeDependency,
+        QueryInvocation,
         Timestamp,
-        UdfIdentifier,
         UdfType,
     },
 };
@@ -102,16 +106,15 @@ use futures::{
     FutureExt,
 };
 use keybroker::{
+    DeploymentOp,
     Identity,
     KeyBroker,
 };
 use model::{
+    backend_info::BackendInfoModel,
     backend_state::BackendStateModel,
     components::handles::FunctionHandlesModel,
-    config::{
-        module_loader::ModuleLoader,
-        types::ModuleConfig,
-    },
+    config::types::ModuleConfig,
     environment_variables::{
         types::{
             EnvVarName,
@@ -156,6 +159,7 @@ use node_executor::{
     ExecuteRequest,
     NodeActions,
 };
+use roles::RequireDeploymentOp;
 use serde_json::Value as JsonValue;
 use storage::Storage;
 use sync_types::{
@@ -210,6 +214,7 @@ use self::metrics::{
     UdfExecutorResult,
 };
 use crate::{
+    ai_gateway_jwt::AiGatewayJwtMinter,
     application_function_runner::metrics::{
         function_run_timer,
         function_total_timer,
@@ -226,6 +231,7 @@ use crate::{
         FunctionExecutionLog,
         OutstandingFunctionState,
     },
+    source_map_cache::SourceMapCache,
     ActionError,
     ActionReturn,
     MutationError,
@@ -660,8 +666,8 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     // Used for analyze, schema, etc.
     node_actions: NodeActions<RT>,
 
-    pub(crate) module_cache: Arc<dyn ModuleLoader<RT>>,
-    modules_storage: Arc<dyn Storage>,
+    source_map_cache: SourceMapCache<RT>,
+    pub(crate) modules_storage: Arc<dyn Storage>,
     file_storage: TransactionalFileStorage<RT>,
 
     function_log: FunctionExecutionLog<RT>,
@@ -670,6 +676,8 @@ pub struct ApplicationFunctionRunner<RT: Runtime> {
     cache_manager: CacheManager<RT>,
     default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
     node_action_limiter: Limiter<RT>,
+    ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
+    deployment: DeploymentMetadata,
 }
 
 impl<RT: Runtime> ApplicationFunctionRunner<RT> {
@@ -681,11 +689,13 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         node_actions: NodeActions<RT>,
         file_storage: TransactionalFileStorage<RT>,
         modules_storage: Arc<dyn Storage>,
-        module_cache: Arc<dyn ModuleLoader<RT>>,
+        source_map_cache: SourceMapCache<RT>,
         function_log: FunctionExecutionLog<RT>,
         audit_log_client: AuditLogClient,
         default_system_env_vars: BTreeMap<EnvVarName, EnvVarValue>,
         cache: QueryCache,
+        ai_gateway_jwt_minter: Option<Arc<dyn AiGatewayJwtMinter>>,
+        deployment: DeploymentMetadata,
     ) -> Self {
         let isolate_functions = FunctionRouter::new(
             function_runner,
@@ -717,7 +727,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             key_broker,
             isolate_functions,
             node_actions,
-            module_cache,
+            source_map_cache,
             modules_storage,
             file_storage,
             function_log,
@@ -725,7 +735,56 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
             cache_manager,
             default_system_env_vars,
             node_action_limiter,
+            ai_gateway_jwt_minter,
+            deployment,
         }
+    }
+
+    /// Called with a typed caller via [`ActionCallbacks`], or with flat
+    /// claims from Conductor's gRPC handler.
+    pub async fn mint_ai_gateway_jwt(
+        &self,
+        identity: &Identity,
+        attribution: AttributionClaims,
+        request_id: &RequestId,
+    ) -> anyhow::Result<String> {
+        match identity {
+            // Deploy keys and dashboard members carry an op set, from the key's
+            // `allowed_operations` or the member's custom roles, so hold them to
+            // it.
+            Identity::DeploymentAdmin(_) | Identity::ActingUser(..) => {
+                identity.require_operation(DeploymentOp::UseAiGateway)?
+            },
+            // End users authenticate against the app's own auth config and have
+            // no op set. Gating them would reject the ordinary case of an app
+            // user triggering an action that calls the gateway.
+            Identity::System(_) | Identity::User(_) | Identity::Unknown(_) => {},
+        }
+        let mut tx = self.database.begin_system().await?;
+        self.bail_if_backend_not_running(&mut tx).await?;
+        let ai_gateway_disabled = BackendInfoModel::new(&mut tx)
+            .get()
+            .await?
+            .and_then(|backend_info| backend_info.ai_gateway_disabled)
+            .unwrap_or(false);
+        if ai_gateway_disabled {
+            anyhow::bail!(ErrorMetadata::forbidden(
+                "AiGatewayDisabled",
+                "The Convex AI gateway is not enabled for your team. Upgrade to a paid plan to \
+                 enable it, or contact support@convex.dev if you believe this is an error."
+            ));
+        }
+        let Some(minter) = self.ai_gateway_jwt_minter.as_ref() else {
+            // `bad_request` shows this message to the developer; a bare
+            // anyhow error would show a generic internal error instead.
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "AiGatewayUnavailable",
+                "`getServiceToken(\"ai-gateway\")` isn't available on this deployment because the \
+                 AI gateway is a Convex Cloud service. Deploy to Convex Cloud, or call your model \
+                 provider directly with your own API key."
+            ));
+        };
+        minter.mint(&self.deployment, attribution, request_id).await
     }
 
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
@@ -816,6 +875,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 caller,
                 tx.usage_tracker,
                 context.clone(),
+                QueryInvocation::Fresh,
             )
             .await;
         Ok((result, log_lines))
@@ -867,14 +927,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("mutation"));
         }
-        let write_source = {
-            let component_path = path.clone().debug_into_component_path();
-            if path.is_system() {
-                WriteSource::SystemUdf(Arc::new(UdfIdentifier::Function(component_path)))
-            } else {
-                WriteSource::Udf(Arc::new(UdfIdentifier::Function(component_path)))
-            }
-        };
+        let write_source = WriteSource::mutation(path.clone().debug_into_component_path());
 
         let mut backoff = Backoff::new(
             *UDF_EXECUTOR_OCC_INITIAL_BACKOFF,
@@ -1157,7 +1210,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         )
         .await?;
 
-        let (path_and_args, returns_validator) = match validate_result {
+        let (path_and_args, returns_validator, _) = match validate_result {
             Ok(tuple) => tuple,
             Err(js_err) => {
                 let mutation_outcome = ValidatedUdfOutcome::from_error(
@@ -1347,7 +1400,10 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
 
         // Fetch the returns_validator now to be used at a later ts.
         let (path_and_args, returns_validator) = match validate_result {
-            Ok((path_and_args, returns_validator)) => (path_and_args, returns_validator),
+            // We don't need to store visibility_info for non-queries.
+            Ok((path_and_args, returns_validator, _visibility_info)) => {
+                (path_and_args, returns_validator)
+            },
             Err(js_error) => {
                 return Ok(ActionCompletion {
                     outcome: ValidatedActionOutcome::from_error(
@@ -1440,12 +1496,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     .await?
                     .context("no source package?")?;
                 let source_maps_callback = async {
-                    let module_version = self
-                        .module_cache
-                        .get_module_with_metadata(&module, &source_package)
-                        .await?;
                     let mut source_maps = BTreeMap::new();
-                    if let Some(source_map) = module_version.source_map.clone() {
+                    if let Some(source_map) = self
+                        .source_map_cache
+                        .get_source_map(
+                            &self.deployment.name,
+                            &self.modules_storage,
+                            &module,
+                            &source_package,
+                        )
+                        .await?
+                    {
                         source_maps.insert(path.udf_path.module().clone(), source_map);
                     }
                     Ok(source_maps)
@@ -1888,9 +1949,19 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         ts: Timestamp,
         journal: Option<QueryJournal>,
         caller: FunctionCaller,
+        invocation: QueryInvocation,
     ) -> anyhow::Result<QueryReturn> {
         let result = self
-            .run_query_at_ts_inner(request_context, path, args, identity, ts, journal, caller)
+            .run_query_at_ts_inner(
+                request_context,
+                path,
+                args,
+                identity,
+                ts,
+                journal,
+                caller,
+                invocation,
+            )
             .await;
         match result.as_ref() {
             Ok(udf_outcome) => {
@@ -1921,6 +1992,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
         ts: Timestamp,
         journal: Option<QueryJournal>,
         caller: FunctionCaller,
+        invocation: QueryInvocation,
     ) -> anyhow::Result<QueryReturn> {
         if path.is_system() && !(identity.is_admin() || identity.is_system()) {
             anyhow::bail!(unauthorized_error("query"));
@@ -1939,6 +2011,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                 journal,
                 caller.clone(),
                 usage_tracker.clone(),
+                invocation,
             )
             .await;
 
@@ -1957,6 +2030,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                         start,
                         caller,
                         context,
+                        invocation,
                     )
                     .await?;
                 Err(e)
@@ -2039,6 +2113,17 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
 #[async_trait]
 impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
     #[fastrace::trace]
+    async fn create_ai_gateway_token(
+        &self,
+        identity: Identity,
+        caller: AttributedCaller,
+        request_id: RequestId,
+    ) -> anyhow::Result<String> {
+        self.mint_ai_gateway_jwt(&identity, AttributionClaims::from(caller), &request_id)
+            .await
+    }
+
+    #[fastrace::trace]
     async fn execute_query(
         &self,
         identity: Identity,
@@ -2059,6 +2144,7 @@ impl<RT: Runtime> ActionCallbacks for ApplicationFunctionRunner<RT> {
                     parent_scheduled_job: context.parent_scheduled_job,
                     parent_execution_id: Some(context.execution_id),
                 },
+                QueryInvocation::Fresh,
             )
             .await?
             .result;

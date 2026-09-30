@@ -69,6 +69,17 @@ pub struct InsightReadLimitCall {
     pub documents_read: u64,
 }
 
+/// Reported in place of a table name for usage that isn't attributed to a
+/// single table.
+pub const UNKNOWN_TABLE_NAME: &str = "-unknown-";
+
+fn serialize_unknown_table_name<S: serde::Serializer>(
+    _: &(),
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(UNKNOWN_TABLE_NAME)
+}
+
 // TODO(CX-5845): Use proper serializable types for constants rather than
 // Strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,12 +125,17 @@ pub enum UsageEvent {
         ingress: u64,
         egress: u64,
     },
+    /// All database bandwidth a single function execution used.
     DatabaseBandwidth {
         id: String,
         request_id: String,
         component_path: Option<String>,
         udf_id: String,
-        table_name: String,
+        /// Bandwidth is aggregated across tables, but the downstream pipeline
+        /// still expects a `table_name` column, so it's always
+        /// [`UNKNOWN_TABLE_NAME`].
+        #[serde(serialize_with = "serialize_unknown_table_name", skip_deserializing)]
+        table_name: (),
         ingress: u64,
         // Includes ingress for tables that have virtual tables
         ingress_v2: u64,
@@ -171,7 +187,11 @@ pub enum UsageEvent {
         table_name: String,
         index_name: String,
         num_searches: u64,
+        /// Total index size per search
         bytes_searched: u64,
+        /// Index size scaled by the share of documents matching each search's
+        /// filter conditions.
+        filtered_bytes_searched: u64,
     },
     VectorQuery {
         id: String,

@@ -63,6 +63,7 @@ use common::{
     },
     types::{
         FunctionCaller,
+        QueryInvocation,
         UdfType,
     },
     RequestId,
@@ -72,6 +73,7 @@ use database::{
     ResolvedQuery,
     TimestampedIndexCache,
     Transaction,
+    WriteSource,
 };
 use errors::{
     ErrorMetadata,
@@ -231,6 +233,7 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
             match executor.run_once().await {
                 Ok(()) => backoff.reset(),
                 Err(mut e) => {
+                    metrics::log_scheduled_job_executor_error();
                     let delay = backoff.fail(&mut executor.context.rt.rng());
                     tracing::error!("Scheduled job executor failed, sleeping {delay:?}");
                     report_error(&mut e).await;
@@ -287,6 +290,8 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
 
         let now = self.context.rt.system_time();
         let next_job_ready_time = self.next_job_ready_time.map(SystemTime::from);
+        metrics::log_running_jobs(self.running_job_ids.len());
+
         // Only log stats if:
         // - next_job_ready_time differs by >=30 seconds from the last logged value; or
         // - we're lagging and >=30 seconds have elapsed
@@ -358,13 +363,11 @@ impl<RT: Runtime> ScheduledJobExecutor<RT> {
 
     fn log_scheduled_job_stats(&self, next_job_ready_time: Option<SystemTime>, now: SystemTime) {
         metrics::log_num_running_jobs(self.running_job_ids.len());
-        if let Some(next_job_ts) = next_job_ready_time {
-            metrics::log_scheduled_job_execution_lag(
-                now.duration_since(next_job_ts).unwrap_or(Duration::ZERO),
-            );
-        } else {
-            metrics::log_scheduled_job_execution_lag(Duration::ZERO);
-        }
+        let backlog = next_job_ready_time.map_or(Duration::ZERO, |next_job_ts| {
+            now.duration_since(next_job_ts).unwrap_or(Duration::ZERO)
+        });
+        metrics::log_scheduled_job_execution_lag(backlog);
+        metrics::log_scheduled_job_backlog(backlog);
         self.context.function_log.log_scheduled_job_stats(
             next_job_ready_time,
             now,
@@ -466,7 +469,13 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         let mut queries = BTreeMap::new();
         for namespace in namespaces {
             let mut query = ResolvedQuery::new(tx, namespace, index_query.clone())?;
-            if let Some(doc) = query.next(tx, None).await? {
+            let doc = {
+                let timer = metrics::query_scheduled_jobs_timer();
+                let doc = query.next(tx, None).await?;
+                timer.finish();
+                doc
+            };
+            if let Some(doc) = doc {
                 let job_metadata: ParsedDocument<ScheduledJobMetadata> = doc.parse()?;
                 let job_metadata_id = job_metadata.id();
                 let next_ts = job_metadata.next_ts.ok_or_else(|| {
@@ -483,7 +492,13 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
         }
         while let Some(((_min_next_ts, namespace), (min_job, mut query))) = queries.pop_first() {
             yield min_job;
-            if let Some(doc) = query.next(tx, None).await? {
+            let doc = {
+                let timer = metrics::query_scheduled_jobs_timer();
+                let doc = query.next(tx, None).await?;
+                timer.finish();
+                doc
+            };
+            if let Some(doc) = doc {
                 let job_metadata: ParsedDocument<ScheduledJobMetadata> = doc.parse()?;
                 let job_metadata_id = job_metadata.id();
                 let next_ts = job_metadata.next_ts.with_context(|| {
@@ -679,6 +694,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                                 self.rt.monotonic_now(),
                                 caller,
                                 context,
+                                QueryInvocation::Fresh,
                             )
                             .await?;
                     },
@@ -786,7 +802,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                             Err(e)
                         } else {
                             self.database
-                                .commit_with_write_source(tx, "scheduled_job_mutation_success")
+                                .commit_with_write_source(tx, WriteSource::mutation(path.clone()))
                                 .await
                         };
                         if let Err(err) = commit_result {
@@ -900,7 +916,7 @@ impl<RT: Runtime> ScheduledJobContext<RT> {
                     .await?;
                 // NOTE: We should not be getting developer errors here.
                 self.database
-                    .commit_with_write_source(tx, "scheduled_job_mutation_error")
+                    .commit_with_write_source(tx, WriteSource::mutation(job.path.clone()))
                     .await?;
             }
             self.function_log

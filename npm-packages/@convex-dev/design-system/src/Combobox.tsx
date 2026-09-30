@@ -13,7 +13,14 @@ import { cn } from "@ui/cn";
 import fuzzy from "fuzzy";
 import { Button, ButtonProps } from "@ui/Button";
 import { createPortal } from "react-dom";
-import { usePopper } from "react-popper";
+import {
+  useFloating,
+  autoUpdate,
+  offset as offsetMiddleware,
+  flip,
+  shift,
+} from "@floating-ui/react";
+import { usePortalContainer } from "./PortalContainer";
 import { Tooltip } from "./Tooltip";
 import { Spinner } from "./Spinner";
 import { useIsNarrowScreen } from "./useIsNarrowScreen";
@@ -83,6 +90,7 @@ export function Combobox<T>({
   icon?: React.ReactNode;
 }) {
   const [query, setQuery] = useState("");
+  const portalContainer = usePortalContainer();
   const [referenceElement, setReferenceElement] =
     useState<HTMLDivElement | null>(null);
   const [popperElement, setPopperElement] = useState<HTMLDivElement | null>(
@@ -104,28 +112,23 @@ export function Combobox<T>({
 
   // Restore focus to the button when the dropdown closes
   useEffect(() => {
-    if (wasOpen.current && !isOpen) {
+    if (
+      wasOpen.current &&
+      !isOpen &&
+      document.activeElement === document.body
+    ) {
       const button = referenceElement?.querySelector("button");
       button?.focus();
     }
     wasOpen.current = isOpen;
   }, [isOpen, referenceElement]);
 
-  const { styles, attributes, update } = usePopper(
-    referenceElement,
-    popperElement,
-    {
-      placement: "bottom-start",
-      modifiers: [
-        {
-          name: "offset",
-          options: {
-            offset: [0, 4], // x, y offset in pixels
-          },
-        },
-      ],
-    },
-  );
+  const { floatingStyles } = useFloating({
+    placement: "bottom-start",
+    middleware: [offsetMiddleware(4), flip(), shift()],
+    whileElementsMounted: autoUpdate,
+    elements: { reference: referenceElement, floating: popperElement },
+  });
 
   // Calculate width based on optionsWidth prop
   const getOptionsWidth = () => {
@@ -157,13 +160,12 @@ export function Combobox<T>({
     isEqual(selectedOption, o.value),
   );
 
-  // Update popper position when dropdown opens
+  // Reset the filter when the dropdown opens
   useEffect(() => {
     if (isOpen) {
-      void update?.();
       void onFilterChange?.("");
     }
-  }, [isOpen, update, onFilterChange]);
+  }, [isOpen, onFilterChange]);
 
   return (
     <HeadlessCombobox
@@ -274,9 +276,8 @@ export function Combobox<T>({
                     style={
                       isNarrow
                         ? undefined
-                        : { ...styles.popper, width: getOptionsWidth() }
+                        : { ...floatingStyles, width: getOptionsWidth() }
                     }
-                    {...(isNarrow ? {} : attributes.popper)}
                     className={
                       isNarrow ? "fixed inset-0 z-50 flex items-end" : "z-50"
                     }
@@ -413,7 +414,7 @@ export function Combobox<T>({
                       </div>
                     </HeadlessComboboxOptions>
                   </div>,
-                  document.body,
+                  portalContainer ?? document.body,
                 )}
             </div>
           </>

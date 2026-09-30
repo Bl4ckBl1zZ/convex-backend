@@ -62,12 +62,29 @@ pub enum V8ExternalString {
 }
 
 impl V8ExternalString {
+    pub fn to_source_string(&self) -> String {
+        match self {
+            Self::OneByte(s) => s.iter().map(|&b| char::from(b)).collect(),
+            Self::TwoByte(s) => String::from_utf16_lossy(s),
+        }
+    }
+
     fn new(s: &str) -> Self {
         if s.chars().all(|c| (c as u32) < 256) {
             // latin-1 (one-byte) case
             Self::OneByte(s.chars().map(|c| c as u32 as u8).collect::<Vec<_>>().into())
         } else {
             Self::TwoByte(s.encode_utf16().collect::<Vec<_>>().into())
+        }
+    }
+
+    /// The inverse of [`Self::new`], for consumers that need the source as
+    /// plain text rather than as a V8 string — the wasm runtime bundles module
+    /// text with esbuild and never builds a V8 string out of it.
+    pub fn to_utf8(&self) -> String {
+        match self {
+            Self::OneByte(s) => s.iter().map(|&byte| byte as char).collect(),
+            Self::TwoByte(s) => String::from_utf16_lossy(s),
         }
     }
 

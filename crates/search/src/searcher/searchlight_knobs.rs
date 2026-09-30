@@ -8,24 +8,18 @@
 //! variable.
 
 use std::{
+    num::NonZeroU64,
     path::PathBuf,
     sync::LazyLock,
 };
 
 use cmd_util::env::env_config;
-// Knobs available in backend that are also available in searchlight.
-#[allow(unused)]
-pub use common::knobs::{
-    ARCHIVE_FETCH_TIMEOUT_SECONDS,
-    CODEL_QUEUE_CONGESTED_EXPIRATION_MILLIS,
-    CODEL_QUEUE_IDLE_EXPIRATION_MILLIS,
+use common::knobs::{
     SEARCH_INDEX_COMPACTION_CONCURRENCY,
     VERTICAL_SCALING_CPU_COUNT,
     VERTICAL_SCALING_ENABLED,
     VERTICAL_SCALING_RESERVED_CPU_COUNT,
 };
-
-// Searchlight only knobs.
 
 fn vertical_search_default(
     compatibility_default: usize,
@@ -73,9 +67,14 @@ pub static IN_PROCESS_SEARCH_CACHE_PATH: LazyLock<Option<PathBuf>> = LazyLock::n
     (!path.is_empty()).then(|| PathBuf::from(path))
 });
 
-/// Maximum size of the in-process searcher's on-disk segment cache.
+/// Maximum size of the in-process searcher's on-disk segment cache. Defaults to
+/// upstream's `MAX_ARCHIVE_CACHE_SIZE_BYTES`.
 pub static IN_PROCESS_SEARCH_CACHE_SIZE_BYTES: LazyLock<u64> = LazyLock::new(|| {
-    env_config("IN_PROCESS_SEARCH_CACHE_SIZE_BYTES", bytesize::mib(500u64)).max(1)
+    env_config(
+        "IN_PROCESS_SEARCH_CACHE_SIZE_BYTES",
+        MAX_ARCHIVE_CACHE_SIZE_BYTES.get(),
+    )
+    .max(1)
 });
 
 /// Maximum number of general-purpose blocking search tasks running at once.
@@ -210,6 +209,18 @@ pub static MAX_CONCURRENT_TEXT_SEARCHES: LazyLock<usize> = LazyLock::new(|| {
         vertical_search_default(20, 4, 16, 128),
     )
     .max(1)
+});
+
+/// The size in bytes of the archive disk cache the in-process searcher keeps
+/// under its local storage path. It bounds the bytes of unpacked text and
+/// vector segments retained on disk; a working set larger than this re-fetches
+/// and re-extracts segments as they cycle through the cache, so raise it to
+/// trade disk for fetch traffic.
+pub static MAX_ARCHIVE_CACHE_SIZE_BYTES: LazyLock<NonZeroU64> = LazyLock::new(|| {
+    env_config(
+        "MAX_ARCHIVE_CACHE_SIZE_BYTES",
+        NonZeroU64::new(bytesize::mib(500u64)).unwrap(),
+    )
 });
 
 #[cfg(test)]

@@ -47,16 +47,12 @@ export type NavigationTarget = {
   keywords?: string[];
 };
 
-export type DeploymentPageFlags = {
-  usageLimitsEnabled: boolean;
-};
-
 // Data-plane pages, matching the deployment sidebar plus the settings
 // subpages. `uriPrefix` is `/t/{team}/{project}/{deploymentName}`.
-export function deploymentNavigation(
-  uriPrefix: string,
-  { usageLimitsEnabled }: DeploymentPageFlags,
-): { pages: NavigationTarget[]; settings: NavigationTarget[] } {
+export function deploymentNavigation(uriPrefix: string): {
+  pages: NavigationTarget[];
+  settings: NavigationTarget[];
+} {
   const pages: NavigationTarget[] = [
     { label: "Health", href: `${uriPrefix}/`, Icon: PulseIcon },
     { label: "Data", href: `${uriPrefix}/data`, Icon: TableIcon },
@@ -92,16 +88,12 @@ export function deploymentNavigation(
       href: `${uriPrefix}/settings/environment-variables`,
       Icon: DEPLOYMENT_SETTINGS_PAGE_ICONS["environment-variables"],
     },
-    ...(usageLimitsEnabled
-      ? [
-          {
-            label: "Usage Limits",
-            parent: "Deployment Settings",
-            href: `${uriPrefix}/settings/usage-limits`,
-            Icon: DEPLOYMENT_SETTINGS_PAGE_ICONS["usage-limits"],
-          },
-        ]
-      : []),
+    {
+      label: "Usage Limits",
+      parent: "Deployment Settings",
+      href: `${uriPrefix}/settings/usage-limits`,
+      Icon: DEPLOYMENT_SETTINGS_PAGE_ICONS["usage-limits"],
+    },
     {
       label: "Authentication",
       parent: "Deployment Settings",
@@ -278,10 +270,10 @@ export function teamNavigation(
       Icon: TEAM_SETTINGS_PAGE_ICONS.referrals,
     },
     {
-      label: "Single Sign-On",
+      label: "Team Authentication",
       parent: "Team Settings",
-      href: `${uriPrefix}/settings/sso`,
-      Icon: TEAM_SETTINGS_PAGE_ICONS.sso,
+      href: `${uriPrefix}/settings/team-authentication`,
+      Icon: TEAM_SETTINGS_PAGE_ICONS["team-authentication"],
     },
     {
       label: "OAuth Applications",
@@ -319,6 +311,18 @@ export function teamSectionNavigation(teamSlug: string): NavigationTarget[] {
       Icon: TEAM_SETTINGS_PAGE_ICONS.members,
     },
   ];
+}
+
+export function teamSwitchDestination(
+  teamSlug: string,
+  currentPathname: string,
+): string {
+  const teamRoute = "/t/[team]";
+  const suffix = currentPathname.startsWith(`${teamRoute}/settings`)
+    ? currentPathname.slice(teamRoute.length)
+    : "";
+  // A suffix with its own dynamic segment has no value to substitute in.
+  return suffix.includes("[") ? `/t/${teamSlug}` : `/t/${teamSlug}${suffix}`;
 }
 
 // Sections within the profile page.

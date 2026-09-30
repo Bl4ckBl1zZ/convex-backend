@@ -1,14 +1,17 @@
 import { DatabricksQueryId, DateRange, useUsageQuery } from "api/usage";
+import { DeploymentType } from "generatedApi";
 
 const QUERY_IDS_: {
   summary: DatabricksQueryId;
+  backupStorageEstimate: DatabricksQueryId;
   functionBreakdown: DatabricksQueryId;
   deploymentsByClassAndRegion: DatabricksQueryId;
   deploymentCountByType: DatabricksQueryId;
   deploymentCountByStatus: DatabricksQueryId;
 } = {
   summary: "b63fe48d-320c-401a-8682-0a0b36b50e2b",
-  functionBreakdown: "90ec3ee0-720f-4e67-94a2-75ecd278b3c6",
+  backupStorageEstimate: "b58b3969-d916-460a-a7b6-210af082b24a",
+  functionBreakdown: "76c86baa-418e-4d7f-ac21-46f397030595",
   deploymentsByClassAndRegion: "dfc73057-1948-4b99-a3bf-9ae802a395ee",
   deploymentCountByType: "34801c2e-06a8-4cc5-8ecc-dd412b908763",
   deploymentCountByStatus: "4bc3e942-951a-440a-be2a-7c833b77eee1",
@@ -27,8 +30,11 @@ const BY_PROJECT_QUERY_IDS_: {
   fileStorageByProject: DatabricksQueryId;
   searchStorageByProject: DatabricksQueryId;
   dataEgressByProject: DatabricksQueryId;
+  auditLogBandwidthByProject: DatabricksQueryId;
   searchQueriesByProject: DatabricksQueryId;
   deploymentCountByProject: DatabricksQueryId;
+  aiGatewayCostByProject: DatabricksQueryId;
+  aiGatewayCostByModel: DatabricksQueryId;
 } = {
   databaseStorageByProjectAndClass: "489b0f87-6b3a-4dfe-a327-f2965b5c2977",
   databaseStorageByTable: "017c5977-3002-40ca-96af-31868e70e611",
@@ -42,8 +48,11 @@ const BY_PROJECT_QUERY_IDS_: {
   fileStorageByProject: "72add9df-4ef2-47fe-9942-194dfbb72088",
   searchStorageByProject: "87f2b0b2-024c-4c2a-bf81-8a3c0cab1b82",
   dataEgressByProject: "67ce838f-b2d0-4cda-9a2e-580c6d134466",
+  auditLogBandwidthByProject: "158b5d9c-a1d5-469d-a7ca-b610cb59c978",
   searchQueriesByProject: "48ae8bb1-ec17-41db-9e35-7c774296c5ac",
   deploymentCountByProject: "0b6c9ab3-c17c-4ad5-bfca-8f0300e494f6",
+  aiGatewayCostByProject: "e0b23b66-f3de-42ba-a2e0-547c927519d5",
+  aiGatewayCostByModel: "b09fd03c-c13c-42f1-821b-d315e1238045",
 };
 
 // --- Types ---
@@ -62,11 +71,23 @@ export type UsageSummaryRow = {
   dataEgress: number;
   searchQueries: number;
   actionComputeUser: number; // GB-hours — corrected non-node compute for business plans
+  auditLogBandwidth: number;
   // Current deployment count gauge (team-wide; not filtered by project/component).
   deploymentCount: number;
   pausedDeploymentCount: number;
   idleDeploymentCount: number;
 };
+
+export type BackupStorageSummary = {
+  databaseStorage: number;
+  fileStorage: number;
+};
+
+// Function name of the row the breakdown query emits per project to carry the
+// functions that fall outside the top-N it returns, so project totals stay exact.
+export const REST_OF_FUNCTIONS = "_rest";
+
+export type UsageDeploymentType = DeploymentType | "local";
 
 export interface AggregatedFunctionMetrics {
   function: string;
@@ -80,7 +101,9 @@ export interface AggregatedFunctionMetrics {
   actionComputeConvexTime: number; // GB-hours
   actionComputeNodeTime: number; // GB-hours
   dataEgress: number; // bytes
-  deploymentName?: string;
+  aiGatewayCost: number; // dollars
+  // Null on the `_rest` row, which spans every deployment type.
+  deploymentType: UsageDeploymentType | null;
   componentPath: string;
 }
 
@@ -143,6 +166,7 @@ export function useUsageTeamSummary(
   period: DateRange | null,
   projectId: number | null,
   componentPrefix: string | null,
+  options: { deploymentName?: string; skip?: boolean } = {},
 ) {
   const { data, error } = useUsageQuery({
     queryId: QUERY_IDS_.summary,
@@ -150,6 +174,8 @@ export function useUsageTeamSummary(
     projectId,
     period,
     componentPrefix,
+    deploymentName: options.deploymentName,
+    skip: options.skip,
   });
 
   if (error) {
@@ -180,6 +206,7 @@ export function useUsageTeamSummary(
         deploymentCount,
         pausedDeploymentCount,
         idleDeploymentCount,
+        auditLogBandwidth,
       ]) =>
         ({
           deploymentClass,
@@ -198,8 +225,41 @@ export function useUsageTeamSummary(
           deploymentCount: Number(deploymentCount),
           pausedDeploymentCount: Number(pausedDeploymentCount),
           idleDeploymentCount: Number(idleDeploymentCount),
+          auditLogBandwidth: Number(auditLogBandwidth),
         }) satisfies UsageSummaryRow,
     ),
+    error: undefined,
+  };
+}
+
+export function useBackupStorageSummary(
+  teamId: number,
+  projectId: number,
+  deploymentName: string | undefined,
+  skip = false,
+) {
+  const { data, error } = useUsageQuery({
+    queryId: QUERY_IDS_.backupStorageEstimate,
+    teamId,
+    projectId,
+    deploymentName,
+    period: null,
+    componentPrefix: null,
+    skip,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  const row = data?.[0];
+  return {
+    data: row
+      ? {
+          databaseStorage: Number(row[0]),
+          fileStorage: Number(row[1]),
+        }
+      : undefined,
     error: undefined,
   };
 }
@@ -237,8 +297,9 @@ export function useUsageTeamMetricsByFunction(
         actionComputeConvexTime,
         actionComputeNodeTime,
         dataEgress,
-        deploymentName,
+        deploymentType,
         componentPath,
+        aiGatewayCost,
       ]) => ({
         function: functionName,
         projectId: Number(projectIdField),
@@ -251,8 +312,10 @@ export function useUsageTeamMetricsByFunction(
         actionComputeConvexTime: Number(actionComputeConvexTime) / 60 / 60,
         actionComputeNodeTime: Number(actionComputeNodeTime) / 60 / 60,
         dataEgress: Number(dataEgress),
-        deploymentName,
+        // SQL NULL arrives as "" (see useUsageQuery).
+        deploymentType: (deploymentType || null) as UsageDeploymentType | null,
         componentPath,
+        aiGatewayCost: Number(aiGatewayCost),
       }),
     ),
     error: undefined,
@@ -676,6 +739,102 @@ export function useDataEgressPerDayByProject(
         ],
       }),
     ),
+    error: undefined,
+  };
+}
+
+export function useAuditLogBandwidthPerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  projectId: number | null,
+  componentPrefix: string | null,
+): { data: DailyMetricByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: BY_PROJECT_QUERY_IDS_.auditLogBandwidthByProject,
+    teamId,
+    projectId,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, auditLogEgress]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      value: Number(auditLogEgress),
+    })),
+    error: undefined,
+  };
+}
+
+// Measured in dollars
+export function useAiGatewayCostPerDayByProject(
+  teamId: number,
+  period: DateRange | null,
+  projectId: number | null,
+  componentPrefix: string | null,
+): { data: DailyMetricByProject[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: BY_PROJECT_QUERY_IDS_.aiGatewayCostByProject,
+    teamId,
+    projectId,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  return {
+    data: data?.map(([_teamId, projectId, ds, aiGatewayCost]) => ({
+      ds,
+      projectId: parseProjectId(projectId),
+      value: Number(aiGatewayCost),
+    })),
+    error: undefined,
+  };
+}
+
+// Measured in dollars
+export function useAiGatewayCostPerDayByModel(
+  teamId: number,
+  period: DateRange | null,
+  projectId: number | null,
+  componentPrefix: string | null,
+): { data: DailyPerTagMetrics[] | undefined; error: any } {
+  const { data, error } = useUsageQuery({
+    queryId: BY_PROJECT_QUERY_IDS_.aiGatewayCostByModel,
+    teamId,
+    projectId,
+    period,
+    componentPrefix,
+  });
+
+  if (error) {
+    return { data: undefined, error };
+  }
+
+  if (data === undefined) {
+    return { data: undefined, error: undefined };
+  }
+
+  const byDay = new Map<string, { tag: string; value: number }[]>();
+  for (const [_teamId, model, ds, aiGatewayCost] of data) {
+    if (ds === null || ds === undefined) {
+      continue;
+    }
+    const metrics = byDay.get(ds) ?? [];
+    // SQL NULL arrives as "" (see useUsageQuery).
+    metrics.push({ tag: model || "unknown", value: Number(aiGatewayCost) });
+    byDay.set(ds, metrics);
+  }
+  return {
+    data: [...byDay.entries()].map(([ds, metrics]) => ({ ds, metrics })),
     error: undefined,
   };
 }

@@ -11,6 +11,7 @@ use common::{
     persistence::{
         DocumentLogEntry,
         DocumentPrevTsQuery,
+        IndexBackfillEntry,
         PersistenceIndexEntry,
     },
     types::Timestamp,
@@ -19,6 +20,12 @@ use common::{
 
 pub trait ApproxSize {
     fn approx_size(&self) -> usize;
+}
+
+impl<T: ApproxSize> ApproxSize for &T {
+    fn approx_size(&self) -> usize {
+        (*self).approx_size()
+    }
 }
 
 impl<T: ApproxSize> ApproxSize for Option<T> {
@@ -74,7 +81,13 @@ impl ApproxSize for DocumentLogEntry {
 
 impl ApproxSize for PersistenceIndexEntry {
     fn approx_size(&self) -> usize {
-        self.index_id.size() + self.key.len() + InternalDocumentId::MIN.size()
+        self.index.id().size() + self.key.len() + InternalDocumentId::MIN.size()
+    }
+}
+
+impl ApproxSize for IndexBackfillEntry {
+    fn approx_size(&self) -> usize {
+        self.index.id().size() + self.key.len() + self.value.approx_size()
     }
 }
 
@@ -152,4 +165,40 @@ pub fn smart_chunks<T: ApproxSize>(items: &[T]) -> impl Iterator<Item = &[T]> {
 pub fn smart_chunk_sizes() -> impl Iterator<Item = usize> {
     (1..=*MYSQL_CHUNK_SIZE)
         .filter(|len| *len <= *MYSQL_MAX_DYNAMIC_SMART_CHUNK_SIZE || len.is_power_of_two())
+}
+
+struct FillChunkIter<'a, T: ApproxSize> {
+    items: &'a [T],
+    max_bytes: usize,
+}
+
+impl<'a, T: ApproxSize> Iterator for FillChunkIter<'a, T> {
+    type Item = &'a [T];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.items.is_empty() {
+            return None;
+        }
+        let mut len = 0;
+        let mut total_bytes = 0;
+        for item in self.items {
+            total_bytes += item.approx_size();
+            if len > 0 && total_bytes > self.max_bytes {
+                break;
+            }
+            len += 1;
+        }
+        let (chunk, remaining) = self.items.split_at(len);
+        self.items = remaining;
+        Some(chunk)
+    }
+}
+
+/// Fills write chunks to the approximate byte budget, allowing arbitrary row
+/// counts. An oversized row gets a chunk of its own to ensure progress.
+pub fn fill_chunks<T: ApproxSize>(items: &[T]) -> impl Iterator<Item = &[T]> {
+    FillChunkIter {
+        items,
+        max_bytes: *MYSQL_MAX_CHUNK_BYTES,
+    }
 }

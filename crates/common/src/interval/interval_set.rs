@@ -106,6 +106,23 @@ impl TryFrom<Vec<IntervalProto>> for IntervalSet {
     }
 }
 
+impl IntoIterator for IntervalSet {
+    type Item = Interval;
+
+    type IntoIter = impl Iterator<Item = Interval>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::All => Either::Left(iter::once(Interval::all())),
+            Self::Intervals(intervals) => Either::Right(
+                intervals
+                    .into_iter()
+                    .map(|(start, end)| Interval { start, end }),
+            ),
+        }
+    }
+}
+
 impl IntervalSet {
     /// Construct an empty set.
     pub fn new() -> Self {
@@ -195,6 +212,10 @@ impl IntervalSet {
                         }
                     }
                 }
+                if merged_interval == Interval::all() {
+                    *self = IntervalSet::All;
+                    return;
+                }
                 cursor
                     .insert_after(merged_interval.start, merged_interval.end)
                     .expect("invariant broken?");
@@ -232,15 +253,23 @@ impl IntervalSet {
             .all(|(in_set, _)| in_set)
     }
 
+    /// Return an iterator over all the intervals within the set, borrowing
+    /// their bounds.
+    pub fn iter_ref(&self) -> impl Iterator<Item = IntervalRef<'_>> + '_ {
+        match self {
+            Self::All => Either::Left(iter::once(IntervalRef::all())),
+            Self::Intervals(intervals) => Either::Right(intervals.iter().map(
+                |(StartIncluded(start), end)| IntervalRef {
+                    start: start.as_slice(),
+                    end: end.as_ref(),
+                },
+            )),
+        }
+    }
+
     /// Return an iterator over all the intervals within the set.
     pub fn iter(&self) -> impl Iterator<Item = Interval> + '_ {
-        match self {
-            Self::All => Either::Left(std::iter::once(Interval::all())),
-            Self::Intervals(intervals) => Either::Right(intervals.iter().map(|(a, b)| Interval {
-                start: a.clone(),
-                end: b.clone(),
-            })),
-        }
+        self.iter_ref().map(|interval| interval.to_owned())
     }
 
     /// Computes the set-difference target - self.

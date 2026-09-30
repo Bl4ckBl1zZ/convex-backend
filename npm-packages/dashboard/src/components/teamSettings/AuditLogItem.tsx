@@ -255,6 +255,24 @@ function EntryAction({
       return <span>updated the team</span>;
     case "team:delete":
       return <span>deleted the team</span>;
+    case "team:domain:create":
+      return (
+        <span>
+          added {metadata.current?.domain ? "the" : "a"} domain{" "}
+          {metadata.current?.domain && (
+            <span className="font-semibold">{metadata.current.domain}</span>
+          )}
+        </span>
+      );
+    case "team:domain:delete":
+      return (
+        <span>
+          removed {metadata.previous?.domain ? "the" : "a"} domain{" "}
+          {metadata.previous?.domain && (
+            <span className="font-semibold">{metadata.previous.domain}</span>
+          )}
+        </span>
+      );
     case "deployment:create": {
       const deploymentType =
         metadata.current?.deploymentType ?? metadata.current?.type;
@@ -428,6 +446,12 @@ function EntryAction({
               verb="viewed"
             />
           )}
+        </span>
+      );
+    case "member:token:createWithSsoAccess":
+      return (
+        <span>
+          created a personal access token with SSO access to this team
         </span>
       );
     case "team:token:update":
@@ -622,6 +646,43 @@ function EntryAction({
     }
     case "sso:update": {
       return <span>updated SSO settings</span>;
+    }
+    case "member:loginWithSso": {
+      return <span>signed in with SSO</span>;
+    }
+    case "directorySync:enable": {
+      return <span>enabled directory sync</span>;
+    }
+    case "directorySync:disable": {
+      return <span>disabled directory sync</span>;
+    }
+    case "directorySync:updateGroupMapping": {
+      const group = metadata.current?.group;
+      return (
+        <span>
+          updated the role for directory group
+          {group && (
+            <>
+              {" "}
+              <span className="font-semibold">{group}</span>
+            </>
+          )}
+        </span>
+      );
+    }
+    case "directorySync:deleteGroupMapping": {
+      const group = metadata.previous?.group;
+      return (
+        <span>
+          removed the role mapping for directory group
+          {group && (
+            <>
+              {" "}
+              <span className="font-semibold">{group}</span>
+            </>
+          )}
+        </span>
+      );
     }
     case "integration:workos:projectEnvironment:create": {
       return <span>created a project WorkOS environment</span>;
@@ -885,6 +946,9 @@ function AuditLogItemActor({
 }
 
 function deploymentDisplayName(deployment: PlatformDeploymentResponse) {
+  if (deployment.kind === "cloud") {
+    return `${deployment.reference}`;
+  }
   switch (deployment.deploymentType) {
     case "prod":
       return "a production deployment";
@@ -940,7 +1004,7 @@ function DeploymentSettingsLink({
       >
         {deploymentDisplayName(deployment)}
       </Link>
-      <span> of {project.name}</span>
+      <span> in {project.name}</span>
     </>
   );
 }

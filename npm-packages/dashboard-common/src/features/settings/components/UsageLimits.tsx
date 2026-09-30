@@ -38,7 +38,8 @@ export type UsageMetric =
   | "actionComputeCpuGbHours"
   | "databaseIoGb"
   | "searchQueryGb"
-  | "dataEgressGb";
+  | "dataEgressGb"
+  | "aiGatewayCostDollars";
 
 export type UsageLimitWindow = "day" | "month";
 
@@ -149,6 +150,15 @@ export const METRIC_CONFIG: Record<UsageMetric, MetricConfig> = {
     rawStep: 1,
     defaultAmount: 1000,
   },
+  aiGatewayCostDollars: {
+    name: "AI Gateway",
+    description:
+      "Raw USD cost of Convex-managed AI models through the AI Gateway.",
+    rawUnit: "USD",
+    rawUnitShort: "USD",
+    rawStep: 1,
+    defaultAmount: 100,
+  },
 };
 
 const METRIC_ORDER: UsageMetric[] = [
@@ -160,6 +170,7 @@ const METRIC_ORDER: UsageMetric[] = [
   "databaseIoGb",
   "searchQueryGb",
   "dataEgressGb",
+  "aiGatewayCostDollars",
 ];
 
 // Whether Convex sends a notification email when a usage limit is exceeded.
@@ -725,14 +736,20 @@ function UsageLimitMetricRow({
     <div className={cn(TABLE_GRID, "items-start py-3")}>
       {/* pt-0.5 vertically centers these one-line cells against the threshold
           cells' min-h-6 first line. */}
-      <div className="flex items-center gap-1.5 pt-0.5">
+      <div className="flex min-w-0 items-center gap-1.5 pt-0.5">
         <Tooltip
-          tip={config.description}
+          tip={
+            <>
+              <div className="font-medium">{config.name}</div>
+              {config.description}
+            </>
+          }
           side="right"
           delayDuration={TOOLTIP_DELAY_MS}
+          className="min-w-0"
         >
-          <span className="inline-flex items-center gap-1 text-left text-sm font-medium text-content-primary">
-            {config.name}
+          <span className="flex min-w-0 items-center gap-1 text-left text-sm font-medium text-content-primary">
+            <span className="truncate">{config.name}</span>
             <QuestionMarkCircledIcon className="shrink-0 text-content-tertiary" />
           </span>
         </Tooltip>
@@ -741,6 +758,7 @@ function UsageLimitMetricRow({
             tip={unbilledReason}
             side="right"
             delayDuration={TOOLTIP_DELAY_MS}
+            className="shrink-0"
           >
             <span className="flex items-center">
               <ExclamationTriangleIcon className="size-3.5 shrink-0 text-content-warning" />

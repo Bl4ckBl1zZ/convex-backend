@@ -36,6 +36,7 @@ use pb::common::{
     PendingDocumentUpdate as PendingDocumentUpdateProto,
     ResolvedDocument as ResolvedDocumentProto,
 };
+use serde::Serialize;
 use serde_json::{
     Number,
     Value as JsonValue,
@@ -73,6 +74,7 @@ use crate::{
         IndexKeyBytes,
     },
     pii::PII,
+    runtime::UnixTimestamp,
     types::Timestamp,
     value::Size,
 };
@@ -215,6 +217,16 @@ impl fmt::Debug for CreationTime {
 impl CreationTime {
     // CreationTime::ONE is a default for tests. We don't use zero because zero
     // is a likely value that a bug may produce in prod, so it is invalid.
+    /// Choose the transaction's initial `_creationTime` in milliseconds so that
+    /// `floor(creation_time_ms) * 1_000_000 >= snapshot_ts_ns`.
+    /// Queries and mutations use that floor for `Date.now()`, which must be at
+    /// least the snapshot timestamp and at most each new document's
+    /// `_creationTime`.
+    pub fn for_transaction(snapshot_ts: Timestamp, wall_clock: Timestamp) -> anyhow::Result<Self> {
+        let snapshot_ceil_ms = u64::from(snapshot_ts).div_ceil(1_000_000) as f64;
+        Self::try_from(timestamp_to_ms(wall_clock)?.max(snapshot_ceil_ms))
+    }
+
     pub fn increment(&mut self) -> anyhow::Result<Self> {
         let result = *self;
 
@@ -223,6 +235,13 @@ impl CreationTime {
 
         Ok(result)
     }
+}
+
+/// Set the UDF timestamp (`Date.now()`) based on the transaction's initial
+/// `CreationTime`. This ensures `_creationTime >= Date.now()` as the
+/// creation-time cursor advances.
+pub fn udf_unix_timestamp(creation_time: CreationTime) -> UnixTimestamp {
+    UnixTimestamp::from_millis(f64::from(creation_time).floor() as u64)
 }
 
 /// Documents store [`Value`]s.
@@ -260,6 +279,10 @@ impl DeveloperDocument {
 
     pub fn to_internal_json(&self) -> JsonValue {
         self.value.0.to_internal_json()
+    }
+
+    pub fn to_internal_json_serializable(&self) -> impl Serialize + '_ {
+        self.value.0.to_internal_json_serializable()
     }
 }
 
@@ -717,11 +740,25 @@ impl PendingDocument {
 
     /// Internal JSON with `{"$commitTs": null}` at each unresolved commit
     /// timestamp.
-    pub fn to_uncommitted_internal_json(&self) -> JsonValue {
-        match self {
-            Self::Concrete(document) => document.value().to_internal_json(),
-            Self::Pending { body, .. } => body.to_uncommitted_json(),
+    pub fn to_uncommitted_internal_json(&self) -> impl Serialize + '_ {
+        struct UncommittedJsonDocument<'a>(&'a PendingDocument);
+        impl<'a> Serialize for UncommittedJsonDocument<'a> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                match self.0 {
+                    PendingDocument::Concrete(document) => document
+                        .value()
+                        .to_internal_json_serializable()
+                        .serialize(serializer),
+                    PendingDocument::Pending { body, .. } => body
+                        .to_uncommitted_json_serializable()
+                        .serialize(serializer),
+                }
+            }
         }
+        UncommittedJsonDocument(self)
     }
 
     // Must be a document that does not contain unresolved commit timestamps
@@ -859,7 +896,7 @@ impl PendingDocumentUpdate {
 
     /// Internal JSON of the new document, with `{"$commitTs": null}` at each
     /// unresolved commit timestamp.
-    pub fn new_document_internal_json(&self) -> Option<JsonValue> {
+    pub fn new_document_internal_json(&self) -> Option<impl Serialize + '_> {
         self.new_document
             .as_ref()
             .map(PendingDocument::to_uncommitted_internal_json)
@@ -1088,6 +1125,14 @@ impl PackedDocument {
         Self { value, id, size }
     }
 
+    pub fn shrink(self) -> Self {
+        Self {
+            value: self.value.shrink(),
+            id: self.id,
+            size: self.size,
+        }
+    }
+
     pub fn unpack(&self) -> ResolvedDocument {
         let value =
             ConvexValue::try_from(self.value.as_ref()).expect("Couldn't unpack packed value");
@@ -1128,10 +1173,11 @@ impl PackedDocument {
             let value = self.value.as_ref().open_path(field_path);
             write_sort_key_or_undefined(value, out).expect("failed to unpack opened value");
         }
-        let Ok(()) = write_sort_key(
-            self.id().developer_id.encode_into(&mut Default::default()),
-            out,
-        );
+        let mut id_buffer = Default::default();
+        let id = self.id().developer_id.encode_into(&mut id_buffer);
+        // use `reserve_exact` for memory efficiency
+        out.reserve_exact(id.len() + 2);
+        let Ok(()) = write_sort_key(id, out);
         &buffer.0
     }
 
@@ -1254,7 +1300,7 @@ impl<D: ConvexSerializable> ParseDocument<D> for &PackedDocument {
         Ok(ParsedDocument {
             id: self.id,
             creation_time,
-            value: self.value.as_ref().parse()?,
+            value: self.value.parse()?,
         })
     }
 }

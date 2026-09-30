@@ -1,5 +1,6 @@
-import React, { useContext, useMemo } from "react";
+import React, { useContext, useEffect, useMemo } from "react";
 import { useQuery } from "convex/react";
+import { useRouter } from "next/router";
 import udfs from "@common/udfs";
 import { SidebarDetailLayout } from "@common/layouts/SidebarDetailLayout";
 import { EmptyData } from "@common/features/data/components/EmptyData";
@@ -22,18 +23,34 @@ import { SchemaJson } from "@common/lib/format";
 import { LoadingTransition } from "@ui/Loading";
 import { DeploymentPageTitle } from "@common/elements/DeploymentPageTitle";
 import { NoPermissionMessage } from "@common/elements/NoPermissionMessage";
+import { FiltersAppliedProperties } from "@common/features/data/lib/filterAnalytics";
 import { useDataPageSize } from "./Table/utils/useQueryFilteredTable";
 
 export function DataView({
   onTableCreated,
   onDocumentsAdded,
+  onFiltersApplied,
 }: {
   onTableCreated?: () => void;
   onDocumentsAdded?: (count: number) => void;
+  onFiltersApplied?: (properties: FiltersAppliedProperties) => void;
 }) {
-  const { useCurrentDeployment, ErrorBoundary } = useContext(
+  const { useCurrentDeployment, ErrorBoundary, deploymentsURI } = useContext(
     DeploymentInfoContext,
   );
+
+  // Older CLI versions link to `/data?showSchema=true` to show schema push
+  // progress; that view lives on the Schema page, so forward them there.
+  const router = useRouter();
+  useEffect(() => {
+    if (router.query.showSchema) {
+      const query: Record<string, string> = { showSchema: "true" };
+      if (typeof router.query.component === "string") {
+        query.component = router.query.component;
+      }
+      void router.replace({ pathname: `${deploymentsURI}/schema`, query });
+    }
+  }, [router, deploymentsURI]);
   const { useIsOperationAllowed } = useContext(PermissionsContext);
   const deployment = useCurrentDeployment() ?? {
     id: undefined,
@@ -137,6 +154,7 @@ export function DataView({
                         componentId={componentId ?? null}
                         activeSchema={activeSchema}
                         onDocumentsAdded={onDocumentsAdded}
+                        onFiltersApplied={onFiltersApplied}
                       />
                     </ErrorBoundary>
                   )}
@@ -150,27 +168,43 @@ export function DataView({
   );
 }
 
+const PAGE_TIMEOUT_MESSAGES = [
+  "Function execution timed out",
+  "Your request timed out performing too many system operations.",
+];
+
+function isPageTimeoutError(error: unknown) {
+  return (
+    error instanceof Error &&
+    error.message.startsWith(
+      "[CONVEX Q(_system/frontend/paginatedTableDocuments:default)]",
+    ) &&
+    PAGE_TIMEOUT_MESSAGES.some((message) => error.message.includes(message))
+  );
+}
+
 function HandleTimeout({
   error,
   resetError,
   setPageSize,
   currentPageSize,
 }: {
-  error: Error;
+  error: unknown;
   resetError(): void;
   currentPageSize: number;
   setPageSize: (pageSize: number) => void;
 }) {
-  if (
-    error.message.startsWith(
-      "[CONVEX Q(_system/frontend/paginatedTableDocuments:default)]",
-    ) &&
-    error.message.includes("Function execution timed out") &&
-    currentPageSize !== 1
-  ) {
-    setPageSize(Math.floor(Math.max(currentPageSize / 2, 1)));
-    resetError();
-  } else {
+  const canRetryWithSmallerPage =
+    isPageTimeoutError(error) && currentPageSize > 1;
+
+  useEffect(() => {
+    if (canRetryWithSmallerPage) {
+      setPageSize(Math.max(Math.floor(currentPageSize / 2), 1));
+      resetError();
+    }
+  }, [canRetryWithSmallerPage, currentPageSize, setPageSize, resetError]);
+
+  if (!canRetryWithSmallerPage) {
     throw error;
   }
   return null;
