@@ -35,14 +35,12 @@ services:
         max-file: "5"
 
   backend:
-    image: convex-backend:modularbots-scale
-    build:
-      context: ../..
-      dockerfile: self-hosted/docker-build/Dockerfile.backend
-      args:
-        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-4}
-        VERGEN_GIT_SHA: ${VERGEN_GIT_SHA:-e4cd335ddcc69b8ec1a7c74bcfe711a574ae0631}
-        VERGEN_GIT_COMMIT_TIMESTAMP: ${VERGEN_GIT_COMMIT_TIMESTAMP:-2026-07-18T16:35:27+02:00}
+    # Published by .github/workflows/publish_fork_backend.yml from main
+    # (18410974a: upstream 306d92ae7 plus this fork's scaling patches), so the
+    # production host no longer compiles the backend. Pinned by digest because
+    # :latest moves with every upstream sync; deploy ModularBots Dev
+    # (convex-dev) with a new digest before changing it here.
+    image: ghcr.io/bl4ckbl1zz/convex-backend@sha256:95364a6e343e864a9577529b30c320d04bb05c72c2992b6cd88bd1b2d5152d48
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -69,10 +67,22 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       DOCUMENT_RETENTION_DELAY: ${DOCUMENT_RETENTION_DELAY:-172800}
       HTTP_SERVER_MAX_CONCURRENT_REQUESTS: ${HTTP_SERVER_MAX_CONCURRENT_REQUESTS:-1024}
-      APPLICATION_MAX_CONCURRENT_QUERIES: ${APPLICATION_MAX_CONCURRENT_QUERIES:-64}
+      # Measured with the ModularBots load test (scripts/loadtest, 1,000 bots):
+      # explicit limits beat VERTICAL_SCALING_ENABLED, whose larger action and
+      # isolate pools queued mutations behind the committer. Keep V8 action
+      # slots near 2x V8_THREADS; more slots spread contention into mutations.
+      V8_THREADS: ${V8_THREADS:-12}
+      RUNTIME_WORKER_THREADS: ${RUNTIME_WORKER_THREADS:-12}
+      APPLICATION_MAX_CONCURRENT_QUERIES: ${APPLICATION_MAX_CONCURRENT_QUERIES:-96}
       APPLICATION_MAX_CONCURRENT_MUTATIONS: ${APPLICATION_MAX_CONCURRENT_MUTATIONS:-32}
-      APPLICATION_MAX_CONCURRENT_V8_ACTIONS: ${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-32}
+      APPLICATION_MAX_CONCURRENT_V8_ACTIONS: ${APPLICATION_MAX_CONCURRENT_V8_ACTIONS:-24}
       APPLICATION_MAX_CONCURRENT_NODE_ACTIONS: ${APPLICATION_MAX_CONCURRENT_NODE_ACTIONS:-16}
+      # Every flow run is a scheduled job; the default of 8 queued replies
+      # while action slots sat idle.
+      SCHEDULED_JOB_EXECUTION_PARALLELISM: ${SCHEDULED_JOB_EXECUTION_PARALLELISM:-64}
+      # Without headroom, isolates restart after most requests
+      # (TooMuchMemoryCarryOver).
+      ISOLATE_MAX_HEAP_EXTRA_SIZE: ${ISOLATE_MAX_HEAP_EXTRA_SIZE:-134217728}
       LOCAL_NODE_EXECUTOR_POOL_SIZE: ${LOCAL_NODE_EXECUTOR_POOL_SIZE:-4}
       MAX_BYTES_WRITTEN_PER_SECOND: ${MAX_BYTES_WRITTEN_PER_SECOND:-16777216}
       IN_PROCESS_SEARCH_CACHE_PATH: /convex/data/search-cache
