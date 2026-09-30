@@ -461,18 +461,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/data/sync/{sync_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get an active data sync
+         * @description Returns the progress of a single data sync (/v1/data/sync), identified by
+         *     the `syncId` that endpoint returns. The status is the same one
+         *     `/data/list_active_syncs` reports for each sync it lists.
+         *
+         *     A data sync is considered active for 3 days after the most recent API call
+         *     from `/data/sync`. Ids of syncs that are unknown or no longer active return
+         *     a 404.
+         *
+         *     The caller must have the `deployment:data:view` permission.
+         */
+        get: operations["get_active_sync"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /** Format: int64 */
         AccessTokenId: number;
-        /** @description The status of one active data sync, as of its most recent page. */
+        /** @description The status of one active data sync, as of its most recent page. Returned
+         *     by `/api/v1/data/sync/{syncId}` and for each sync listed by
+         *     `/api/v1/data/list_active_syncs`. */
         ActiveDataSync: {
             /** @description Unique id of the sync, assigned when it started (i.e. when
              *     `/api/v1/data/sync` was called without a cursor) and stable across its
              *     pages. */
-            syncId: string;
+            syncId: components["schemas"]["SyncId"];
             /**
              * Format: int64
              * @description Wall-clock time of the last `/data/sync` call made by this sync, as a
@@ -676,6 +706,9 @@ export interface components {
         }) | (components["schemas"]["CreatePostHogErrorTrackingLogStreamArgs"] & {
             /** @enum {string} */
             logStreamType: "postHogErrorTracking";
+        }) | (components["schemas"]["CreateS3ExportLogStreamArgs"] & {
+            /** @enum {string} */
+            logStreamType: "s3Export";
         });
         CreateLogStreamResponse: (components["schemas"]["CreateWebhookLogStreamResponse"] & {
             /** @enum {string} */
@@ -700,6 +733,10 @@ export interface components {
             id: string;
             /** @enum {string} */
             logStreamType: "postHogErrorTracking";
+        } | {
+            id: string;
+            /** @enum {string} */
+            logStreamType: "s3Export";
         };
         CreatePostHogErrorTrackingLogStreamArgs: {
             /** @description PostHog project token. */
@@ -717,6 +754,19 @@ export interface components {
             /** @description The topics this log stream is subscribed to. Omit to
              *     subscribe to all topics, including ones added in the future. */
             topics?: components["schemas"]["LogTopic"][] | null;
+        };
+        CreateS3ExportLogStreamArgs: {
+            /** @description Name of the S3 bucket to mirror into. */
+            bucket: string;
+            /** @description AWS region the bucket lives in, e.g. `us-east-1`. */
+            region: string;
+            /** @description Key prefix within the bucket. Omit to write at the bucket root. */
+            prefix?: string | null;
+            accessKeyId: string;
+            secretAccessKey: string;
+            selection?: null | components["schemas"]["Selection"];
+            /** @description How often the mirror is refreshed. */
+            period: components["schemas"]["SyncPeriod"];
         };
         CreateSentryLogStreamArgs: {
             /** @description Sentry Data Source Name (DSN) to route exceptions to. */
@@ -755,7 +805,7 @@ export interface components {
              *     tables are synced from scratch, possibly moving the sync into
              *     `snapshotting` state if necessary, and emit a truncate on the first page
              *     they appear so the consumer starts them from a clean slate. Deselected
-             *     tables stop being exported, with a truncate emitted. */
+             *     tables stop being synced. */
             selection?: components["schemas"]["Selection"];
         };
         /** @description One page returned by the data sync API. */
@@ -769,14 +819,14 @@ export interface components {
              *     A table is truncated whenever it (re)enters the export from scratch —
              *     the first page it is synced (including on a cold start), when it is
              *     newly selected, or when it is replaced by a bulk operation such as
-             *     `npx convex import` — and when it leaves the export after being
-             *     deselected. */
+             *     `npx convex import`. */
             truncates: components["schemas"]["DataSyncTruncate"][];
             /** @description Documents created, updated, or deleted in this page. */
             values: components["schemas"]["DataSyncValue"][];
             /** @description Unique id of the sync, assigned on the first page and stable across
-             *     the sync's lifetime. Identifies this sync in `/data/list_active_syncs`. */
-            syncId: string;
+             *     the sync's lifetime. Identifies this sync in `/data/sync/{syncId}` and
+             *     `/data/list_active_syncs`. */
+            syncId: components["schemas"]["SyncId"];
             /** @description Pagination information. The data sync endpoint is an infinite streaming
              *     endpoint, so `nextCursor` is always present and `hasMore` is always
              *     `true` — another page can always be fetched with the cursor. Use
@@ -787,9 +837,10 @@ export interface components {
         /** @description The sync has not yet reached a consistent snapshot. The entries emitted
          *     so far are an incomplete initial traversal of the selected tables.
          *     Syncs begin in this state. The sync's
-         *     progress can be monitored via `/data/list_active_syncs`, keyed by the
-         *     response's `syncId`. Syncs may return to this state if the table
-         *     selection has changes that requires large data sync. */
+         *     progress can be monitored via `/data/sync/{syncId}` or
+         *     `/data/list_active_syncs`, keyed by the response's `syncId`. Syncs may
+         *     return to this state if the table selection has changes that requires large
+         *     data sync. */
         DataSyncSnapshotting: {
             /**
              * @description Always `snapshotting`. (enum property replaced by openapi-typescript)
@@ -814,9 +865,10 @@ export interface components {
         /** @description The consistency state reported alongside a data sync page, discriminated
          *     by `type`. */
         DataSyncStatus: components["schemas"]["DataSyncSnapshotting"] | components["schemas"]["DataSyncStale"] | components["schemas"]["DataSyncUpToDate"];
-        /** @description A table whose contents were replaced wholesale (e.g. by `npx convex
-         *     import`). Reported separately from `values` since it carries none of the
-         *     per-document fields. */
+        /** @description An entry indicating that the table should be truncated. Emitted when a table
+         *     is newly syncing or replaced wholesale (e.g. by `npx convex import`).
+         *     Reported separately from `values` since it carries none of the per-document
+         *     fields. */
         DataSyncTruncate: {
             /** @description The path of the component the table is in. */
             component: string;
@@ -973,6 +1025,9 @@ export interface components {
         }) | (components["schemas"]["PostHogErrorTrackingLogStreamConfig"] & {
             /** @enum {string} */
             logStreamType: "postHogErrorTracking";
+        }) | (components["schemas"]["S3ExportLogStreamConfig"] & {
+            /** @enum {string} */
+            logStreamType: "s3Export";
         });
         /** @description Status of a log stream */
         LogStreamStatus: {
@@ -993,14 +1048,14 @@ export interface components {
             type: "deleting";
         };
         /** @enum {string} */
-        LogTopic: "verification" | "console" | "function_execution" | "exception" | "audit_log" | "scheduler_stats" | "scheduled_job_lag" | "current_storage_usage" | "concurrency_stats" | "storage_api_bandwidth" | "log_stream_egress" | "custom_audit";
+        LogTopic: "verification" | "console" | "function_execution" | "exception" | "audit_log" | "scheduler_stats" | "scheduled_job_lag" | "current_storage_usage" | "concurrency_stats" | "storage_api_bandwidth" | "ai_gateway_usage" | "log_stream_egress" | "custom_audit";
         /** Format: int64 */
         MemberId: number;
         /**
          * @description The user-facing unit a metric's limits and usage are expressed in.
          * @enum {string}
          */
-        MetricUnit: "calls" | "GB" | "Query-GB" | "GB-hours";
+        MetricUnit: "calls" | "GB" | "Query-GB" | "GB-hours" | "dollars";
         /** @description Current-window usage for a single metric. */
         MetricUsageResponse: {
             /** @description The unit `usage` is expressed in, matching the unit this metric's
@@ -1042,6 +1097,25 @@ export interface components {
             /** @enum {string} */
             logStreamType: "webhook";
         };
+        /** S3ExportConfig */
+        S3ExportLogStreamConfig: {
+            id: string;
+            /** @description Status of the integration */
+            status: components["schemas"]["LogStreamStatus"];
+            /** @description Name of the S3 bucket being mirrored into. */
+            bucket: string;
+            /** @description AWS region the bucket lives in. */
+            region: string;
+            /** @description Key prefix within the bucket. */
+            prefix?: string | null;
+            /** @description AWS access key ID used to write to the bucket. The matching secret
+             *     access key is write-only and is never returned. */
+            accessKeyId: string;
+            /** @description The components, tables, and columns being mirrored. */
+            selection: components["schemas"]["Selection"];
+            /** @description How often the mirror is refreshed. */
+            period: components["schemas"]["SyncPeriod"];
+        };
         /**
          * @description Progress of the historical-usage backfill. Only `complete` guarantees the
          *     reported usage reflects the full window. While the status is `pending` or
@@ -1080,6 +1154,14 @@ export interface components {
                 [key: string]: string;
             } | null;
         };
+        /** @description Unique id of a data sync, assigned by `/api/v1/data/sync` on the sync's
+         *     first page and stable across its lifetime. */
+        SyncId: string;
+        /**
+         * @description How often the mirror is refreshed from the deployment.
+         * @enum {string}
+         */
+        SyncPeriod: "continuous" | "hourly" | "daily";
         TableSelection: ({
             /** @description Whether columns not explicitly listed are exported */
             _other: components["schemas"]["InclusionDefault"];
@@ -1149,6 +1231,9 @@ export interface components {
         }) | (components["schemas"]["UpdatePostHogErrorTrackingSinkArgs"] & {
             /** @enum {string} */
             logStreamType: "postHogErrorTracking";
+        }) | (components["schemas"]["UpdateS3ExportSinkArgs"] & {
+            /** @enum {string} */
+            logStreamType: "s3Export";
         });
         UpdatePostHogErrorTrackingSinkArgs: {
             /** @description PostHog project token. */
@@ -1167,6 +1252,18 @@ export interface components {
              *     subscription, or pass `null` to subscribe to all topics (including ones
              *     added in the future). */
             topics?: components["schemas"]["LogTopic"][] | null;
+        };
+        UpdateS3ExportSinkArgs: {
+            /** @description Name of the S3 bucket to mirror into. */
+            bucket?: string | null;
+            /** @description AWS region the bucket lives in, e.g. `us-east-1`. */
+            region?: string | null;
+            /** @description Key prefix within the bucket. */
+            prefix?: string | null;
+            accessKeyId?: string | null;
+            secretAccessKey?: string | null;
+            selection?: null | components["schemas"]["Selection"];
+            period?: null | components["schemas"]["SyncPeriod"];
         };
         UpdateSentrySinkArgs: {
             /** @description Sentry Data Source Name (DSN) to route exceptions to. */
@@ -1203,7 +1300,7 @@ export interface components {
             enabled: boolean;
         };
         /** @enum {string} */
-        UsageLimitMetric: "functionCalls" | "databaseIoGb" | "dataEgressGb" | "searchQueryGb" | "queryMutationComputeGbHours" | "actionComputeConvexGbHours" | "actionComputeNodeJsGbHours" | "actionComputeCpuGbHours";
+        UsageLimitMetric: "functionCalls" | "databaseIoGb" | "dataEgressGb" | "searchQueryGb" | "queryMutationComputeGbHours" | "actionComputeConvexGbHours" | "actionComputeNodeJsGbHours" | "actionComputeCpuGbHours" | "aiGatewayCostDollars";
         UsageLimitResponse: {
             usageLimit: components["schemas"]["UsageLimitConfigResponse"];
         };
@@ -1264,6 +1361,7 @@ export type CreateLogStreamArgs = components['schemas']['CreateLogStreamArgs'];
 export type CreateLogStreamResponse = components['schemas']['CreateLogStreamResponse'];
 export type CreatePostHogErrorTrackingLogStreamArgs = components['schemas']['CreatePostHogErrorTrackingLogStreamArgs'];
 export type CreatePostHogLogsLogStreamArgs = components['schemas']['CreatePostHogLogsLogStreamArgs'];
+export type CreateS3ExportLogStreamArgs = components['schemas']['CreateS3ExportLogStreamArgs'];
 export type CreateSentryLogStreamArgs = components['schemas']['CreateSentryLogStreamArgs'];
 export type CreateWebhookLogStreamArgs = components['schemas']['CreateWebhookLogStreamArgs'];
 export type CreateWebhookLogStreamResponse = components['schemas']['CreateWebhookLogStreamResponse'];
@@ -1301,9 +1399,12 @@ export type PostHogLogsLogStreamConfig = components['schemas']['PostHogLogsLogSt
 export type ProjectId = components['schemas']['ProjectId'];
 export type RequestDestination = components['schemas']['RequestDestination'];
 export type RotateLogStreamSecretResponse = components['schemas']['RotateLogStreamSecretResponse'];
+export type S3ExportLogStreamConfig = components['schemas']['S3ExportLogStreamConfig'];
 export type SeedStatusResponse = components['schemas']['SeedStatusResponse'];
 export type Selection = components['schemas']['Selection'];
 export type SentryLogStreamConfig = components['schemas']['SentryLogStreamConfig'];
+export type SyncId = components['schemas']['SyncId'];
+export type SyncPeriod = components['schemas']['SyncPeriod'];
 export type TableSelection = components['schemas']['TableSelection'];
 export type TeamId = components['schemas']['TeamId'];
 export type UpdateAxiomSinkArgs = components['schemas']['UpdateAxiomSinkArgs'];
@@ -1314,6 +1415,7 @@ export type UpdateEnvVarsRequest = components['schemas']['UpdateEnvVarsRequest']
 export type UpdateLogStreamArgs = components['schemas']['UpdateLogStreamArgs'];
 export type UpdatePostHogErrorTrackingSinkArgs = components['schemas']['UpdatePostHogErrorTrackingSinkArgs'];
 export type UpdatePostHogLogsSinkArgs = components['schemas']['UpdatePostHogLogsSinkArgs'];
+export type UpdateS3ExportSinkArgs = components['schemas']['UpdateS3ExportSinkArgs'];
 export type UpdateSentrySinkArgs = components['schemas']['UpdateSentrySinkArgs'];
 export type UpdateWebhookSinkArgs = components['schemas']['UpdateWebhookSinkArgs'];
 export type UsageLimitConfigRequest = components['schemas']['UsageLimitConfigRequest'];
@@ -1768,6 +1870,28 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ListActiveSyncsResponse"];
+                };
+            };
+        };
+    };
+    get_active_sync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description `syncId` of the sync, as returned by /data/sync */
+                sync_id: components["schemas"]["SyncId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActiveDataSync"];
                 };
             };
         };

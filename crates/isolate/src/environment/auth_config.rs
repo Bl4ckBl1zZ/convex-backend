@@ -54,7 +54,9 @@ use crate::{
             syscall_name_for_error,
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
+        OpProvider,
+        SyscallProvider,
     },
     helpers,
     isolate::{
@@ -74,7 +76,7 @@ pub struct AuthConfigEnvironment {
     environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
+impl OpProvider for AuthConfigEnvironment {
     fn trace(&mut self, _level: LogLevel, messages: Vec<String>) -> anyhow::Result<()> {
         tracing::warn!(
             "Unexpected Console access when evaluating auth config file: {}",
@@ -144,7 +146,9 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
             "Getting the table mapping unsupported when evaluating auth config file"
         ))
     }
+}
 
+impl<RT: Runtime> SyscallProvider<RT> for AuthConfigEnvironment {
     async fn lookup_source(
         &mut self,
         path: &str,
@@ -171,12 +175,21 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
             format!("Syscall {name} unsupported when evaluating auth config file")
         ))
     }
+}
+
+impl<RT: Runtime> JsEnvironment<RT> for AuthConfigEnvironment {
+    type AsyncResolver = v8::Global<v8::PromiseResolver>;
+    type SyscallProvider = Self;
+
+    fn syscall_provider(&mut self) -> &mut Self::SyscallProvider {
+        self
+    }
 
     fn start_async_syscall(
         &mut self,
         name: String,
         _args: JsonValue,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringAuthConfig", syscall_name_for_error(&name)),
@@ -190,7 +203,7 @@ impl<RT: Runtime> IsolateEnvironment<RT> for AuthConfigEnvironment {
     fn start_async_op(
         &mut self,
         request: AsyncOpRequest,
-        _resolver: v8::Global<v8::PromiseResolver>,
+        _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
         anyhow::bail!(ErrorMetadata::bad_request(
             format!("No{}DuringAuthConfig", request.name_for_error()),
@@ -245,7 +258,7 @@ impl AuthConfigEnvironment {
         drop(isolate_context);
         drop(timeout);
 
-        handle.take_termination_error(None, "auth")??;
+        handle.take_termination_error("auth")??;
         result
     }
 

@@ -1,5 +1,5 @@
 [cmdk-root] {
-  @apply p-2 bg-background-secondary/90 dark:bg-background-secondary/70 backdrop-blur-xl border fixed left-1/2 top-1/3 z-50 -translate-x-1/2 -translate-y-1/2 shadow-xl max-w-[640px] w-[calc(100%-2rem)] overflow-hidden rounded-lg;
+  @apply px-1 py-1.5 bg-background-secondary/90 dark:bg-background-secondary/70 backdrop-blur-xl border fixed left-1/2 top-1/3 z-50 -translate-x-1/2 -translate-y-1/2 shadow-xl max-w-[640px] w-[calc(100%-2rem)] overflow-hidden rounded-2xl;
 }
 
 @media (max-height: 700px) {
@@ -8,8 +8,22 @@
   }
 }
 
+/* Opened from a trigger (the project switcher): a compact menu attached just
+   below it. `left`/`top` come from the trigger's rect as inline styles; this
+   only needs to undo the centered layout's translate and narrow the width. The
+   higher-specificity selector wins over the base and the media query above. */
+[cmdk-root].command-palette--anchored {
+  @apply w-[38rem] max-w-[calc(100vw-1rem)] translate-x-0 translate-y-0;
+}
+
+@media (max-height: 700px) {
+  [cmdk-root].command-palette--anchored {
+    @apply translate-x-0 translate-y-0;
+  }
+}
+
 [cmdk-input] {
-  @apply bg-transparent border-b rounded-b-none pl-10 pr-4 py-2.5 text-sm block rounded-sm placeholder:text-content-tertiary border-0 w-full focus:outline-hidden;
+  @apply bg-transparent border-b rounded-b-none pl-9 pr-3 pt-4 pb-2.5 text-sm block rounded-sm placeholder:text-content-tertiary border-0 w-full focus:outline-hidden;
 }
 
 [cmdk-overlay] {
@@ -17,7 +31,7 @@
 }
 
 [cmdk-item] {
-  @apply rounded-sm text-sm flex items-center gap-2 p-2 cursor-pointer;
+  @apply rounded-lg text-sm flex items-center gap-2 p-2 cursor-pointer;
 
   &[data-selected="true"] {
     @apply bg-background-secondary dark:bg-background-tertiary;
@@ -37,10 +51,36 @@
 
   /* Only size direct-child (leading) icons so nested decorations, like
      deployment type badges, keep their own dimensions. */
-  & > svg {
+  & > svg,
+  & > [data-item-primary] > svg {
     width: 18px;
     height: 18px;
     flex-shrink: 0;
+  }
+}
+
+[cmdk-item][data-placeholder] {
+  @apply cursor-default;
+  & [aria-busy] {
+    @apply bg-neutral-3/15;
+  }
+}
+
+[cmdk-item]:has([data-secondary-action]) {
+  @apply gap-0 p-0;
+
+  &[data-selected="true"],
+  &:active {
+    @apply bg-transparent;
+  }
+
+  & > [data-item-primary] {
+    @apply flex min-w-0 grow items-center gap-2 rounded-lg p-2;
+  }
+
+  &[data-selected="true"] > [data-item-primary],
+  & > [data-item-primary]:active {
+    @apply bg-background-secondary dark:bg-background-tertiary;
   }
 }
 
@@ -66,14 +106,22 @@
   animation: none;
 }
 
-*:not([hidden]) + [cmdk-group] {
+*:not([hidden]) + [cmdk-group]:not([data-pinned]) {
   @apply mt-2;
+}
+
+[cmdk-list].command-palette-list--pinned > [cmdk-list-sizer] {
+  @apply flex h-full flex-col;
+}
+
+[data-pinned] {
+  @apply mt-auto;
 }
 
 [cmdk-group-heading] {
   /* Headings scroll with their group (not sticky): floating them would need
      an opaque background band over the glass surface. */
-  @apply select-none text-xs text-content-tertiary p-2 py-1 flex items-center;
+  @apply select-none text-xs text-content-tertiary px-2 py-1 flex items-center;
 }
 
 [cmdk-empty] {

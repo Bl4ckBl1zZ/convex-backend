@@ -17,7 +17,10 @@ use common::{
         },
         IndexConfig,
     },
-    document::PackedDocument,
+    document::{
+        IndexKeyBuffer,
+        PackedDocument,
+    },
     document_index_keys::DatabaseIndexWrite,
     index::IndexKeyBytes,
     interval::{
@@ -43,6 +46,7 @@ use common::{
     types::{
         IndexId,
         IndexName,
+        IndexRef,
         RepeatableTimestamp,
         TabletIndexName,
         Timestamp,
@@ -60,7 +64,6 @@ use itertools::Itertools;
 use value::{
     DeveloperDocumentId,
     TableMapping,
-    TableName,
     TabletId,
 };
 
@@ -206,12 +209,13 @@ fn log_index_page_mismatch(
 impl IndexReader for IndexCacheReader {
     async fn index_page(
         &self,
-        index_id: IndexId,
+        index: IndexRef,
         tablet_id: TabletId,
         interval: &Interval,
         order: Order,
         max_results: usize,
     ) -> anyhow::Result<IndexPage> {
+        let index_id = index.id();
         let interval = Arc::new(interval.clone());
         let maybe_page = self.handle.get(
             index_id,
@@ -226,7 +230,7 @@ impl IndexReader for IndexCacheReader {
             if verify_cache_results {
                 let index_page = self
                     .reader
-                    .index_page(index_id, tablet_id, &interval, order, max_results)
+                    .index_page(index, tablet_id, &interval, order, max_results)
                     .await?;
                 if index_page != cached_page {
                     let index_name = self
@@ -257,7 +261,7 @@ impl IndexReader for IndexCacheReader {
         } else {
             let index_page = self
                 .reader
-                .index_page(index_id, tablet_id, &interval, order, max_results)
+                .index_page(index, tablet_id, &interval, order, max_results)
                 .await?;
             self.handle.populate(
                 index_id,
@@ -304,7 +308,7 @@ enum RangeFetchResult {
     /// Some documents may still have been served from the
     /// `DatabaseIndexSnapshotCache`.
     NonCached {
-        index_id: IndexId,
+        index: IndexRef,
         cache_results: Vec<DatabaseIndexSnapshotCacheResult>,
     },
 }
@@ -385,7 +389,7 @@ impl DatabaseIndexSnapshot {
         if let Some(range) = self
             .in_memory_indexes
             .range(
-                index.id(),
+                IndexRef::try_from(&index)?,
                 &range_request.interval,
                 range_request.order,
                 *range_request.index_name.table(),
@@ -393,12 +397,6 @@ impl DatabaseIndexSnapshot {
             )
             .await?
         {
-            Self::log_start_range_fetch(
-                range_request.printable_index_name.table(),
-                1,
-                0,
-                range_request.max_size,
-            );
             return Ok(RangeFetchResult::MemoryCached {
                 documents: range,
                 next_cursor: CursorPosition::End,
@@ -409,54 +407,10 @@ impl DatabaseIndexSnapshot {
         let cache_results =
             self.cache
                 .get(index.id(), &range_request.interval, range_request.order);
-        let cache_miss_count = cache_results
-            .iter()
-            .filter(|r| matches!(r, DatabaseIndexSnapshotCacheResult::CacheMiss(_)))
-            .count();
-        Self::log_start_range_fetch(
-            range_request.printable_index_name.table(),
-            cache_results.len() - cache_miss_count,
-            cache_miss_count,
-            range_request.max_size,
-        );
         Ok(RangeFetchResult::NonCached {
-            index_id: index.id(),
+            index: IndexRef::try_from(&index)?,
             cache_results,
         })
-    }
-
-    fn log_start_range_fetch(
-        _table_name: &TableName,
-        _num_cached_ranges: usize,
-        _num_cache_misses: usize,
-        _prefetch_size: usize,
-    ) {
-        // TODO: This event is reporting to Honeycomb too often
-        // Event::add_to_local_parent("start_range_fetch", || {
-        //     let table_name = if table_name.is_system() {
-        //         table_name.to_string()
-        //     } else {
-        //         format!("user_table")
-        //     };
-        //     let cached_ranges = num_cached_ranges.to_string();
-        //     let cache_misses = num_cache_misses.to_string();
-        //     let prefetch_size = prefetch_size.to_string();
-        //     [
-        //         (Cow::Borrowed("query.table"), Cow::Owned(table_name)),
-        //         (
-        //             Cow::Borrowed("query.cached_ranges"),
-        //             Cow::Owned(cached_ranges),
-        //         ),
-        //         (
-        //             Cow::Borrowed("query.cache_miss_ranges"),
-        //             Cow::Owned(cache_misses),
-        //         ),
-        //         (
-        //             Cow::Borrowed("query.prefetch_size"),
-        //             Cow::Owned(prefetch_size),
-        //         ),
-        //     ]
-        // });
     }
 
     /// Query the given indexes at the snapshot.
@@ -533,7 +487,7 @@ impl DatabaseIndexSnapshot {
                 None,
             )),
             RangeFetchResult::NonCached {
-                index_id,
+                index,
                 cache_results,
             } => {
                 let any_misses = cache_results
@@ -541,7 +495,7 @@ impl DatabaseIndexSnapshot {
                     .any(|result| matches!(result, DatabaseIndexSnapshotCacheResult::CacheMiss(_)));
                 let fut = Self::fetch_cache_misses(
                     self.reader.clone(),
-                    index_id,
+                    index,
                     range_request.clone(),
                     cache_results,
                 );
@@ -561,7 +515,7 @@ impl DatabaseIndexSnapshot {
                     .split(cursor.clone(), range_request.order);
                 Ok((
                     (fetch_result_vec, cursor),
-                    Some((index_id, cache_miss_results, interval_read)),
+                    Some((index.id(), cache_miss_results, interval_read)),
                 ))
             },
         }
@@ -575,6 +529,7 @@ impl DatabaseIndexSnapshot {
         cache_miss_results: Vec<(Timestamp, PackedDocument)>,
         interval_read: Interval,
     ) {
+        let mut buffer = IndexKeyBuffer::new();
         for (ts, doc) in cache_miss_results {
             // Populate all index point lookups that can result in the given
             // document.
@@ -589,7 +544,7 @@ impl DatabaseIndexSnapshot {
                 else {
                     continue;
                 };
-                let index_key = doc.index_key_owned(&fields[..]);
+                let index_key = doc.index_key(&fields[..], &mut buffer);
                 self.cache.populate(
                     index.id(),
                     index.metadata.name.is_by_id(),
@@ -608,7 +563,7 @@ impl DatabaseIndexSnapshot {
 
     async fn fetch_cache_misses(
         reader: Arc<dyn IndexReader>,
-        index_id: IndexId,
+        index: IndexRef,
         range_request: RangeRequest,
         cache_results: Vec<DatabaseIndexSnapshotCacheResult>,
     ) -> anyhow::Result<(
@@ -637,7 +592,7 @@ impl DatabaseIndexSnapshot {
                     // Query persistence.
                     let index_page = reader
                         .index_page(
-                            index_id,
+                            index,
                             *range_request.index_name.table(),
                             &interval,
                             range_request.order,
@@ -771,7 +726,7 @@ impl DatabaseIndexSnapshotCache {
         &mut self,
         index_id: IndexId,
         is_by_id: bool,
-        index_key_bytes: IndexKeyBytes,
+        index_key_bytes: &IndexKeyBytes,
         ts: Timestamp,
         doc: PackedDocument,
     ) -> bool {
@@ -792,7 +747,7 @@ impl DatabaseIndexSnapshotCache {
                 total_size: if is_by_id { Some(0) } else { None },
                 ..Default::default()
             });
-        index_docs.insert(index_key_bytes, ts, doc);
+        index_docs.insert(index_key_bytes.clone(), ts, doc);
         index_docs.interval_set.add(interval);
         true
     }
@@ -881,7 +836,7 @@ impl DatabaseIndexSnapshotCache {
         write: &DatabaseIndexWrite,
     ) -> bool {
         // Remove old entry from cache.
-        if let Some(old_key) = write.update.old.as_ref()
+        if let Some(old_key) = &write.update.old
             && let Some(index_docs) = self.documents.get_mut(&index_id)
             && let Some((_, old_doc)) = index_docs.remove(old_key)
             && is_by_id
@@ -890,15 +845,13 @@ impl DatabaseIndexSnapshotCache {
         }
         // Insert new entry if not a delete, but only for indexes where the
         // key falls within the range the cache is already tracking.
-        if let Some(doc) = write.new_document.clone()
-            && let Some(new_key) = write.update.new.clone()
-            && self
-                .documents
-                .get(&index_id)
-                .is_some_and(|index_docs| index_docs.interval_set.contains(&new_key))
+        if let Some(doc) = &write.new_document
+            && let Some(new_key) = &write.update.new
+            && let Some(index_docs) = self.documents.get(&index_id)
+            && index_docs.interval_set.contains(new_key)
         {
             // If the cache is too big, empty the cache
-            if !self.populate(index_id, is_by_id, new_key, ts, doc) {
+            if !self.populate(index_id, is_by_id, new_key, ts, doc.clone()) {
                 log_index_cache_cleared();
                 *self = Self::new();
                 return false;

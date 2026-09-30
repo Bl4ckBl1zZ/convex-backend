@@ -2,7 +2,6 @@ import { DeploymentInfo } from "@common/lib/deploymentContext";
 
 export const mockDeploymentInfo: DeploymentInfo = {
   ok: true,
-  usageLimitsEnabled: true,
   reportHttpError: () => {},
   captureException: () => {},
   captureMessage: () => {},
@@ -15,6 +14,8 @@ export const mockDeploymentInfo: DeploymentInfo = {
     slug: "team",
   }),
   useTeamMembers: () => [],
+  useCurrentMemberName: () => undefined,
+  useMemberPreference: () => ({ value: undefined, set: async () => {} }),
   useTeamEntitlements: () => ({}),
   useCurrentUsageBanner: () => null,
   useCurrentProject: () => ({
@@ -109,6 +110,9 @@ export const mockDeploymentInfo: DeploymentInfo = {
   deploymentsURI: "",
   isSelfHosted: true,
   workosIntegrationEnabled: false,
-  copyEnvVarNameAndValueEnabled: false,
+  s3ExportIntegrationEnabled: false,
   connectionStateCheckIntervalMs: 2500,
+  showFivetranSyncProgress: false,
+  openFeedbackForm: () => {},
+  captureEvent: () => {},
 };

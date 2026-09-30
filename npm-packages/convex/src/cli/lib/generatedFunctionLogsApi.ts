@@ -101,6 +101,10 @@ export interface components {
             /** Format: int64 */
             databaseReadDocuments: number;
             /** Format: int64 */
+            databaseWriteDocuments: number;
+            /** Format: int64 */
+            databaseWriteIndexRows: number;
+            /** Format: int64 */
             storageReadBytes: number;
             /** Format: int64 */
             storageWriteBytes: number;

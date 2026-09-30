@@ -1,5 +1,4 @@
 import { Command } from "cmdk";
-import { PlusIcon } from "@radix-ui/react-icons";
 import React, {
   useCallback,
   useContext,
@@ -10,7 +9,7 @@ import React, {
 } from "react";
 import { useRouter } from "next/router";
 import { Checkbox } from "@ui/Checkbox";
-import { KeyboardShortcut } from "@ui/KeyboardShortcut";
+import { KEYCAP_CLASSES, KeyboardShortcut } from "@ui/KeyboardShortcut";
 import { TimestampDistance } from "@common/elements/TimestampDistance";
 import {
   useCurrentProject,
@@ -25,11 +24,10 @@ import {
   PaletteConfirmContext,
   PaletteStatusContext,
 } from "./items";
-import { KBD_CLASSES } from "./Footer";
+import { useCopyAction } from "./copy";
+import { InfiniteScrollSentinel } from "./InfiniteScrollSentinel";
 import { REMOTE_VALUE_PREFIX } from "./navigation";
 
-// The backend deletes projects one API call at a time, so cap a single bulk
-// action to keep it from running long / timing out.
 const MAX_SELECTED = 100;
 
 // The drilled-into "Delete Projects" page: a searchable, multi-select list of
@@ -46,8 +44,14 @@ export function DeleteProjectsCommands({
   const team = useCurrentTeam();
   const currentProject = useCurrentProject();
 
-  const { projects, isLoading, hasMore, loadMore, debouncedQuery } =
-    useInfiniteProjects(team?.id ?? 0, search, false);
+  const {
+    projects,
+    isLoading,
+    isLoadingMore,
+    hasMore,
+    loadMore,
+    debouncedQuery,
+  } = useInfiniteProjects(team?.id ?? 0, search, false);
   const deleteProjects = useDeleteProjects(team?.id);
 
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
@@ -74,7 +78,7 @@ export function DeleteProjectsCommands({
           <span className="flex items-center gap-1 text-content-error">
             <KeyboardShortcut
               value={["CtrlOrCmd", "Shift", "Return"]}
-              className={KBD_CLASSES}
+              className={KEYCAP_CLASSES}
             />
             Delete
           </span>
@@ -193,15 +197,12 @@ export function DeleteProjectsCommands({
           />
         ))
       )}
-      {!stale && hasMore && (
-        <Command.Item
-          value={`${REMOTE_VALUE_PREFIX}delete-projects-load-more`}
-          className="animate-fadeInFromLoading"
-          onSelect={loadMore}
-        >
-          <PlusIcon className="text-content-secondary" />
-          Load more projects
-        </Command.Item>
+      {!stale && (
+        <InfiniteScrollSentinel
+          hasMore={hasMore}
+          isLoadingMore={!!isLoadingMore}
+          loadMore={loadMore}
+        />
       )}
     </Command.Group>
   );
@@ -222,9 +223,11 @@ function DeleteProjectItem({
   onToggle: (index: number) => void;
   shiftHeld: React.MutableRefObject<boolean>;
 }) {
+  const value = `${REMOTE_VALUE_PREFIX}delete-project:${project.id}`;
+  useCopyAction(value, { label: "slug", getText: () => project.slug });
   return (
     <Command.Item
-      value={`${REMOTE_VALUE_PREFIX}delete-project:${project.id}`}
+      value={value}
       className="animate-fadeInFromLoading"
       disabled={disabled}
       onMouseDown={(event) => {

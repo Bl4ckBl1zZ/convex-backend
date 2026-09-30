@@ -13,6 +13,9 @@ type Update =
       href: string;
     }
   | {
+      password: string;
+    }
+  | {
       port: string | null;
     }
   | {
@@ -26,6 +29,9 @@ type Update =
     }
   | {
       searchParams: [string, string][];
+    }
+  | {
+      username: string;
     };
 
 // Private symbols for URL to poke at the internals of URLSearchParams
@@ -62,8 +68,15 @@ class URLSearchParams {
         this.append(key, value);
       });
     } else {
+      // WebIDL record conversion: keys become USVStrings, so keys that differ
+      // only in lone surrogates collapse into one entry, keeping the first
+      // key's position and the last key's value.
+      const record = new Map<string, string>();
       for (const key in init) {
-        this.append(key, init[key]!);
+        record.set(key.toWellFormed(), String(init[key]));
+      }
+      for (const [key, value] of record) {
+        this.append(key, value);
       }
     }
   }
@@ -77,14 +90,19 @@ class URLSearchParams {
   }
 
   append(name: string, value: string): void {
-    this[_searchParamPairs].push([String(name), String(value)]);
+    this[_searchParamPairs].push([
+      String(name).toWellFormed(),
+      String(value).toWellFormed(),
+    ]);
     this._updateUrl();
   }
 
-  delete(name: string) {
-    this[_searchParamPairs] = this[_searchParamPairs].filter(([key]) => {
-      return key !== String(name);
-    });
+  delete(name: string, value?: string) {
+    const n = String(name);
+    const v = value === undefined ? undefined : String(value);
+    this[_searchParamPairs] = this[_searchParamPairs].filter(
+      ([key, val]) => key !== n || (v !== undefined && val !== v),
+    );
     this._updateUrl();
   }
 
@@ -126,14 +144,33 @@ class URLSearchParams {
   }
 
   set(name: string, value: string) {
-    this.delete(name);
-    this.append(name, value);
+    name = String(name);
+    value = String(value);
+    let found = false;
+    this[_searchParamPairs] = this[_searchParamPairs].filter((pair) => {
+      if (pair[0] !== name) {
+        return true;
+      }
+      if (found) {
+        return false;
+      }
+      found = true;
+      pair[1] = value;
+      return true;
+    });
+    if (!found) {
+      this[_searchParamPairs].push([name, value]);
+    }
     this._updateUrl();
+  }
+
+  get size(): number {
+    return this[_searchParamPairs].length;
   }
 
   sort() {
     this[_searchParamPairs].sort((a, b) => {
-      return a[0].localeCompare(b[0]);
+      return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
     });
     this._updateUrl();
   }
@@ -154,10 +191,6 @@ class URLSearchParams {
     return this[_searchParamPairs].map(([, value]) => value)[Symbol.iterator]();
   }
 
-  get [Symbol.toStringTag]() {
-    return "URLSearchParams";
-  }
-
   inspect() {
     let inner = "";
     if (this[_searchParamPairs].length !== 0) {
@@ -172,6 +205,13 @@ class URLSearchParams {
   }
 }
 
+Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, {
+  value: "URLSearchParams",
+  enumerable: false,
+  writable: false,
+  configurable: true,
+});
+
 type UrlInfo = {
   scheme: string;
   hash: string;
@@ -183,23 +223,39 @@ type UrlInfo = {
   href: string;
   username: string;
   password: string;
+  origin: string;
 };
 
 class URL {
   #urlInfo: UrlInfo;
   #searchParams: URLSearchParams;
 
+  static canParse(url: string | URL, base?: string | URL): boolean {
+    try {
+      new URL(url, base);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  static parse(url: string | URL, base?: string | URL): URL | null {
+    try {
+      return new URL(url, base);
+    } catch {
+      return null;
+    }
+  }
+
   constructor(url: string | URL, base?: string | URL) {
+    // Both arguments are USVStrings per WebIDL, so anything that isn't a URL
+    // object is stringified before parsing.
     let baseHref: string | null = null;
     if (base !== undefined) {
-      baseHref = typeof base === "string" ? base : base.href;
+      baseHref = base instanceof URL ? base.href : String(base);
     }
-    if (typeof url === "string") {
-      const urlInfo: UrlInfo = performOp("url/getUrlInfo", url, baseHref);
-      this.#urlInfo = urlInfo;
-    } else {
-      this.#urlInfo = { ...url.#urlInfo };
-    }
+    const href = url instanceof URL ? url.href : String(url);
+    this.#urlInfo = performOp("url/getUrlInfo", href, baseHref);
     this.#searchParams = new URLSearchParams(this.#urlInfo.search ?? "");
     this.#searchParams[_urlObjectUpdate] = this.#updateUrl.bind(this);
   }
@@ -245,24 +301,17 @@ class URL {
   }
 
   get origin() {
-    switch (this.#urlInfo.scheme) {
-      case "ftp":
-      case "http":
-      case "https":
-      case "ws":
-      case "wss":
-        return `${this.#urlInfo.scheme}://${this.host}`;
-      default:
-        return "null";
-    }
+    return this.#urlInfo.origin;
   }
 
   get password() {
     return this.#urlInfo.password;
   }
 
-  set password(_password: string) {
-    throwNotImplementedMethodError("set password", "URL");
+  set password(password: string) {
+    this.#updateUrl({
+      password: `${password}`,
+    });
   }
 
   get pathname() {
@@ -317,8 +366,10 @@ class URL {
     return this.#urlInfo.username;
   }
 
-  set username(_username: string) {
-    throwNotImplementedMethodError("set username", "URL");
+  set username(username: string) {
+    this.#updateUrl({
+      username: `${username}`,
+    });
   }
 
   toString() {
@@ -339,10 +390,6 @@ class URL {
     this.#searchParams[_searchParamPairs] = searchPairs;
   }
 
-  get [Symbol.toStringTag]() {
-    return "URL";
-  }
-
   inspect() {
     const object = {
       href: this.href,
@@ -360,6 +407,13 @@ class URL {
     return `${this.constructor.name} ${inspect(object)}`;
   }
 }
+
+Object.defineProperty(URL.prototype, Symbol.toStringTag, {
+  value: "URL",
+  enumerable: false,
+  writable: false,
+  configurable: true,
+});
 
 export const setupURL = (global: any) => {
   global.URL = URL;

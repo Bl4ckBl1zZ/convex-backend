@@ -82,7 +82,7 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
     ) -> anyhow::Result<SyncResult> {
         let result = streaming_export::data_sync(
-            &self.database,
+            &self.database.latest_database_snapshot()?,
             identity.clone(),
             cursor,
             StreamingExportFilter {
@@ -97,7 +97,30 @@ impl<RT: Runtime> Application<RT> {
         Ok(result)
     }
 
-    /// One page of the progress rows of active data syncs — those that
+    /// Mint a data sync cursor equivalent to a legacy `document_deltas` cursor,
+    /// letting a consumer switch protocols without re-reading its data.
+    #[fastrace::trace]
+    pub async fn data_sync_cursor_from_deltas(
+        &self,
+        identity: Identity,
+        cursor: Timestamp,
+        selection: StreamingExportSelection,
+        sync_client: DataSyncClient,
+    ) -> anyhow::Result<SyncCursor> {
+        streaming_export::data_sync_cursor_from_deltas(
+            &self.database.latest_database_snapshot()?,
+            identity,
+            cursor,
+            StreamingExportFilter {
+                selection,
+                ..Default::default()
+            },
+            sync_client,
+        )
+        .await
+    }
+
+    /// One page of the progress documents of active data syncs — those that
     /// fetched a page within the active window — most recently updated first.
     /// The returned cursor, if any, fetches the next page.
     pub async fn active_data_syncs(
@@ -131,14 +154,30 @@ impl<RT: Runtime> Application<RT> {
         Ok((syncs, next_cursor))
     }
 
-    /// Upsert this sync's `_data_sync_progress` row from the page's outcome.
+    /// The progress document of a single active data sync — one that fetched a
+    /// page within the active window — or `None` if no such sync exists.
+    pub async fn active_data_sync(
+        &self,
+        identity: Identity,
+        sync_id: &str,
+    ) -> anyhow::Result<Option<DataSyncProgressMetadata>> {
+        let now_ms = self.runtime.unix_timestamp().as_ms_since_epoch()?;
+        let mut tx = self.begin(identity).await?;
+        DataSyncProgressModel::new(&mut tx)
+            .active_sync(now_ms, sync_id)
+            .await
+    }
+
+    /// Upsert this sync's `_data_sync_progress` document from the page's
+    /// outcome.
     ///
-    /// If the sync has no row yet, this page records its creation: the insert
-    /// and its audit log entry are committed together and any failure fails
-    /// the page, so a client can never advance past a creation that wasn't
-    /// audit logged. Once the row exists, refreshes are best-effort: a
-    /// failure (e.g. an OCC with a concurrent page of the same sync, or table
-    /// summaries still bootstrapping) is reported without failing the page.
+    /// If the sync has no document yet, this page records its creation: the
+    /// insert and its audit log entry are committed together and any
+    /// failure fails the page, so a client can never advance past a
+    /// creation that wasn't audit logged. Once the document exists,
+    /// refreshes are best-effort: a failure (e.g. an OCC with a concurrent
+    /// page of the same sync, or table summaries still bootstrapping) is
+    /// reported without failing the page.
     async fn record_data_sync_progress(
         &self,
         result: &SyncResult,

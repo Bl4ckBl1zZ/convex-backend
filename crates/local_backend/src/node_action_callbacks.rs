@@ -38,10 +38,14 @@ use common::{
     knobs::V8_ACTION_USER_TIMEOUT,
     runtime::UnixTimestamp,
     types::{
+        AttributionClaims,
         FunctionCaller,
+        QueryInvocation,
         SessionId,
         SessionRequestSeqNumber,
         UdfIdentifier,
+        UdfType,
+        AI_GATEWAY_URL,
     },
     RequestContext,
     RequestId,
@@ -108,6 +112,50 @@ pub struct MutationIdentifierJson {
     pub request_id: SessionRequestSeqNumber,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateServiceTokenResponse {
+    pub token: String,
+}
+
+pub async fn create_service_token(
+    MtState(st): MtState<LocalAppState>,
+    ExtractActionIdentity {
+        identity,
+        component_id,
+    }: ExtractActionIdentity,
+    ExtractActionName(action_name): ExtractActionName,
+    ExtractExecutionContext(context): ExtractExecutionContext,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    let mut tx = st.application.begin(identity.clone()).await?;
+    let component_path = tx.must_component_path(component_id)?;
+    let attribution = match action_name {
+        Some(name) => AttributionClaims {
+            component_path: component_path.serialize(),
+            function_name: Some(name),
+            function_type: Some(UdfType::Action.to_lowercase_string().to_owned()),
+        },
+        None => AttributionClaims::unknown(),
+    };
+    let token = st
+        .application
+        .mint_ai_gateway_jwt(&identity, attribution, &context.request_id)
+        .await?;
+    Ok(Json(CreateServiceTokenResponse { token }))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetServiceUrlResponse {
+    pub url: String,
+}
+
+pub async fn get_service_url() -> impl IntoResponse {
+    Json(GetServiceUrlResponse {
+        url: AI_GATEWAY_URL.to_owned(),
+    })
+}
+
 impl TryFrom<MutationIdentifierJson> for SessionRequestIdentifier {
     type Error = anyhow::Error;
 
@@ -156,6 +204,7 @@ pub async fn internal_query_post(
                 parent_scheduled_job: context.parent_scheduled_job,
                 parent_execution_id: Some(context.execution_id),
             },
+            QueryInvocation::Fresh,
         )
         .await?;
     if req.format.is_some() {

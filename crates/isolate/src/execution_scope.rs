@@ -47,8 +47,9 @@ use crate::{
     bundled_js::system_udf_file,
     context_local_state::GetContextSlot,
     environment::{
-        IsolateEnvironment,
         ModuleCodeCacheResult,
+        SyscallProvider,
+        V8IsolateEnvironment,
     },
     helpers::{
         self,
@@ -65,7 +66,7 @@ use crate::{
         ModuleMap,
     },
     request_scope::RequestState,
-    termination::IsolateHandle,
+    termination::ExecutionHandle,
     IsolateHeapStats,
     Timeout,
 };
@@ -149,13 +150,13 @@ impl PendingDynamicImports {
 /// Most functionality for executing JS and manipulating objects executes within
 /// a [`v8::HandleScope`]. The [`ExecutionScope`] wrapper is a convenience
 /// struct that represents executing code within a [`RequestScope`].
-pub struct ExecutionScope<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> {
+pub struct ExecutionScope<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> {
     v8_scope: &'a mut v8::PinScope<'s, 'i>,
     v8_context: v8::Local<'s, v8::Context>,
     _pd: PhantomData<(RT, E)>,
 }
 
-impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Deref
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> Deref
     for ExecutionScope<'a, 's, 'i, RT, E>
 {
     type Target = v8::PinScope<'s, 'i>;
@@ -165,7 +166,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> Deref
     }
 }
 
-impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> DerefMut
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> DerefMut
     for ExecutionScope<'a, 's, 'i, RT, E>
 {
     fn deref_mut(&mut self) -> &mut v8::PinScope<'s, 'i> {
@@ -173,7 +174,9 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> DerefMut
     }
 }
 
-impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<'a, 's, 'i, RT, E> {
+impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>>
+    ExecutionScope<'a, 's, 'i, RT, E>
+{
     pub fn new(v8_scope: &'a mut v8::PinScope<'s, 'i>) -> Self {
         let v8_context = v8_scope.get_current_context();
         Self {
@@ -183,10 +186,10 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
         }
     }
 
-    pub fn handle(&self) -> &IsolateHandle {
+    pub fn handle(&self) -> &ExecutionHandle {
         self.v8_scope
             .get_slot()
-            .expect("IsolateHandle disappeared?")
+            .expect("ExecutionHandle disappeared?")
     }
 
     pub fn state(&mut self) -> anyhow::Result<&RequestState<RT, E>> {
@@ -225,7 +228,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
         Ok(f(state))
     }
 
-    pub fn record_heap_stats(&mut self) -> anyhow::Result<()> {
+    pub fn heap_stats(&mut self) -> anyhow::Result<IsolateHeapStats> {
         let stats = self.get_heap_statistics();
         let array_buffer_size = self
             .get_slot::<Arc<ArrayBufferMemoryLimit>>()
@@ -233,12 +236,16 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
             .used();
         self.with_state_mut(|state| {
             let streams_heap_size = state.streams.heap_size() + state.stream_listeners.heap_size();
-            state.environment.record_heap_stats(IsolateHeapStats::new(
-                stats,
-                streams_heap_size,
-                array_buffer_size,
-            ));
+            let mut stats = IsolateHeapStats::new(stats, streams_heap_size, array_buffer_size);
+            stats.environment_heap_size = state.environment.environment_heap_size();
+            stats
         })
+    }
+
+    pub fn record_heap_stats(&mut self, handle: &ExecutionHandle) -> anyhow::Result<()> {
+        let heap_stats = self.heap_stats()?;
+        handle.record_heap_stats(heap_stats);
+        Ok(())
     }
 
     pub fn module_map(&mut self) -> &ModuleMap {
@@ -298,6 +305,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
         timeout: &mut Timeout<RT>,
     ) -> anyhow::Result<Result<v8::Local<'s, v8::Module>, JsError>> {
         let timer = metrics::eval_user_module_timer(udf_type, is_dynamic);
+        let registered_before = self.module_map().registered();
         let module = match self.eval_module(name, timeout).await {
             Ok(id) => id,
             Err(e) => {
@@ -319,6 +327,8 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
             },
         };
         timer.finish();
+        let registered = self.module_map().registered() - registered_before;
+        metrics::log_modules_registered(udf_type, is_dynamic, registered);
         Ok(Ok(module))
     }
 
@@ -523,7 +533,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
                 .ok_or_else(|| SystemModuleNotFoundError::new(system_path))?;
             let result = V8ModuleSource::new(FullModuleSource {
                 source: source.into(),
-                source_map: source_map.as_ref().map(|s| s.to_string()),
+                source_map: source_map.map(Into::into),
             });
             timer.finish();
             // TODO: should we code-cache system UDFs?
@@ -533,6 +543,7 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
         let state = self.state_mut()?;
         let result = state
             .environment
+            .syscall_provider()
             .lookup_source(module_path, timeout)
             .await?
             .ok_or_else(|| ModuleNotFoundError::new(module_path))?;
@@ -672,7 +683,10 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: IsolateEnvironment<RT>> ExecutionScope<
         })?;
 
         let state = self.state_mut()?;
-        let result = state.environment.syscall(&op_name[..], args_v)?;
+        let result = state
+            .environment
+            .syscall_provider()
+            .syscall(&op_name[..], args_v)?;
 
         let value_s = serde_json::to_string(&result)?;
         let value_v8 = v8::String::new(self, &value_s[..])

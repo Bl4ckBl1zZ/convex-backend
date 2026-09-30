@@ -17,6 +17,7 @@ use common::{
         ComponentName,
         Resource,
     },
+    document::udf_unix_timestamp,
     errors::JsError,
     execution_context::ExecutionContext,
     http::{
@@ -24,7 +25,6 @@ use common::{
         RoutedHttpPath,
     },
     knobs::{
-        FUNRUN_ISOLATE_ACTIVE_THREADS,
         MAX_ACTION_ISOLATE_WORKERS,
         MAX_TRANSACTION_ISOLATE_WORKERS,
     },
@@ -54,10 +54,11 @@ use file_storage::TransactionalFileStorage;
 use futures::FutureExt;
 use indexing::index_reader::IndexReader;
 use isolate::{
-    client::EnvironmentData,
-    ConcurrencyLimiter,
+    client::{
+        EnvironmentData,
+        IsolateWorker,
+    },
     IsolateClient,
-    IsolateConfig,
 };
 use keybroker::{
     FunctionRunnerKeyBroker,
@@ -230,41 +231,24 @@ pub async fn validate_run_function_result(
 }
 
 impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
-    pub fn new(rt: RT, storage: S, max_percent_per_client: usize) -> anyhow::Result<Self> {
-        Self::_new(
-            rt,
-            storage,
-            max_percent_per_client,
-            *MAX_TRANSACTION_ISOLATE_WORKERS,
-            *MAX_ACTION_ISOLATE_WORKERS,
-        )
-    }
-
-    fn _new(
+    pub fn new<W: IsolateWorker<RT>>(
         rt: RT,
         storage: S,
         max_percent_per_client: usize,
-        max_transaction_isolate_workers: usize,
-        max_action_isolate_workers: usize,
+        transaction_isolate_worker: W,
+        action_isolate_worker: W,
     ) -> anyhow::Result<Self> {
-        let concurrency_limiter = if *FUNRUN_ISOLATE_ACTIVE_THREADS > 0 {
-            ConcurrencyLimiter::new(*FUNRUN_ISOLATE_ACTIVE_THREADS)
-        } else {
-            ConcurrencyLimiter::unlimited()
-        };
-        let transaction_isolate_client = IsolateClient::new_with_shared_limiter(
+        let transaction_isolate_client = IsolateClient::new(
             rt.clone(),
             max_percent_per_client,
-            max_transaction_isolate_workers,
-            IsolateConfig::new("transaction_funrun", concurrency_limiter.clone()),
-            true,
+            *MAX_TRANSACTION_ISOLATE_WORKERS,
+            transaction_isolate_worker,
         )?;
-        let action_isolate_client = IsolateClient::new_with_shared_limiter(
+        let action_isolate_client = IsolateClient::new(
             rt.clone(),
             max_percent_per_client,
-            max_action_isolate_workers,
-            IsolateConfig::new("action_funrun", concurrency_limiter.clone()),
-            false,
+            *MAX_ACTION_ISOLATE_WORKERS,
+            action_isolate_worker,
         )?;
         let index_cache = InMemoryIndexCache::new(rt.clone());
         let module_cache = ModuleCache::new(rt.clone());
@@ -279,10 +263,6 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             transaction_isolate_client,
             action_isolate_client,
         })
-    }
-
-    pub fn concurrency_limiter(&self) -> &isolate::ConcurrencyLimiter {
-        self.transaction_isolate_client.concurrency_limiter()
     }
 
     pub fn active_isolate_workers(&self) -> usize {
@@ -402,7 +382,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 // `unix_timestamp` below, the UDF is only deterministic modulo this
                 // system-generated input.
                 let rng_seed = self.rt.rng().random();
-                let unix_timestamp = self.rt.unix_timestamp();
+                let unix_timestamp = udf_unix_timestamp(transaction.next_creation_time());
                 let (tx, outcome) = self
                     .transaction_isolate_client
                     .execute_udf(

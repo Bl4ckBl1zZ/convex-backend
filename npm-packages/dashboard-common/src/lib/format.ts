@@ -43,6 +43,16 @@ export const prettier = (stmt: string, printWidth: number = 60) => {
   }
 };
 
+// Pretty-prints a JS expression. It’s wrapped in parentheses so that prettier
+// parses object literals as expressions instead of blocks; prettier keeps the
+// parentheses for some expression types, so they’re stripped afterwards.
+export function formatExpression(expression: string, printWidth?: number) {
+  const formatted = prettier(`(${expression})`, printWidth).replace(/;$/, "");
+  return formatted.startsWith("(") && formatted.endsWith(")")
+    ? formatted.slice(1, -1)
+    : formatted;
+}
+
 export function displaySchemaFromShape({
   shape,
   filterSystemFields = false,
@@ -456,6 +466,19 @@ export function formatDateTime(date: Date): string {
 
 export function formatDate(date: Date): string {
   return format(date, "MMMM dd, yyyy");
+}
+
+// Renders the calendar date an instant falls on in UTC, matching
+// `formatDate`'s shape. Use it for dates a backend pinned to UTC — billing
+// dates from Orb, say — which `formatDate` would render as the previous day
+// for anyone west of UTC.
+export function formatUtcDate(date: Date): string {
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    month: "long",
+    day: "2-digit",
+    year: "numeric",
+  }).format(date);
 }
 
 export function toNumericUTC(dateString: string) {

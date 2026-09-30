@@ -45,6 +45,7 @@ use database::{
     BootstrapComponentsModel,
     Database,
     Transaction,
+    WriteSource,
 };
 use errors::{
     ErrorMetadata,
@@ -154,6 +155,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             match executor.run_once().await {
                 Ok(()) => backoff.reset(),
                 Err(mut e) => {
+                    metrics::log_cron_job_executor_error();
                     // Only report OCCs that happen repeatedly
                     if !e.is_occ() || (backoff.failures() as usize) > *UDF_EXECUTOR_OCC_MAX_RETRIES
                     {
@@ -168,6 +170,7 @@ impl<RT: Runtime> CronJobExecutor<RT> {
     }
 
     async fn run_once(&mut self) -> anyhow::Result<()> {
+        metrics::log_cron_job_executor_poll();
         let mut tx = self.context.database.begin(Identity::Unknown(None)).await?;
         let backend_state = BackendStateModel::new(&mut tx).get_backend_state().await?;
         let is_backend_stopped = backend_state.is_stopped();
@@ -180,19 +183,24 @@ impl<RT: Runtime> CronJobExecutor<RT> {
             self.query_and_start_jobs(&mut tx).await?
         };
 
+        metrics::log_running_jobs(self.running_job_ids.len());
+
         let next_job_future = if let Some(next_job_ts) = self.next_job_ready_time {
             let now = self.context.rt.generate_timestamp()?;
             Either::Left(if next_job_ts < now {
                 metrics::log_cron_job_execution_lag(now - next_job_ts);
+                metrics::log_cron_job_backlog(now - next_job_ts);
                 // If we're behind, re-run this loop every 5 seconds to log the gauge above and
                 // track how far we're behind in our metrics.
                 self.context.rt.wait(Duration::from_secs(5))
             } else {
                 metrics::log_cron_job_execution_lag(Duration::from_secs(0));
+                metrics::log_cron_job_backlog(Duration::ZERO);
                 self.context.rt.wait(next_job_ts - now)
             })
         } else {
             metrics::log_cron_job_execution_lag(Duration::from_secs(0));
+            metrics::log_cron_job_backlog(Duration::ZERO);
             Either::Right(std::future::pending())
         };
 
@@ -371,7 +379,8 @@ impl<RT: Runtime> CronJobContext<RT> {
         })?;
         let mut value_str = match &value {
             PendingValue::Concrete(value) => value.to_string(),
-            pending => serde_json::to_string(&pending.to_uncommitted_json())?,
+            // TODO: implement Display for PendingValue
+            pending => serde_json::to_string(&pending.to_uncommitted_json_serializable())?,
         };
         if value_str.len() <= CRON_LOG_MAX_RESULT_LENGTH {
             Ok(CronJobResult::Default(value))
@@ -490,7 +499,7 @@ impl<RT: Runtime> CronJobContext<RT> {
                         Err(e)
                     } else {
                         self.database
-                            .commit_with_write_source(tx, "cron_commit_mutation")
+                            .commit_with_write_source(tx, WriteSource::mutation(path.clone()))
                             .await
                     };
                     if let Err(err) = commit_result {

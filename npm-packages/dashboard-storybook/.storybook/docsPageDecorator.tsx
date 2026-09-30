@@ -15,6 +15,7 @@ import {
 import {
   useProjectBySlug,
   useCurrentProject,
+  useCurrentProjectWithStatus,
   usePaginatedProjects,
   useProjectById,
 } from "../../dashboard/src/api/projects";
@@ -48,7 +49,6 @@ import {
   useDeploymentByName,
   useDeploymentRegions,
 } from "../../dashboard/src/api/deployments";
-import { deploymentAuth } from "../../dashboard/src/lib/deploymentAuth";
 import { useTeamUsageState } from "../../dashboard/src/api/usage";
 import { useReferralState } from "../../dashboard/src/api/referrals";
 import { usePostHog } from "../../dashboard/src/hooks/usePostHog";
@@ -74,9 +74,11 @@ import { mockConvexReactClient } from "../../dashboard-common/src/lib/mockConvex
 import udfs from "../../dashboard-common/src/udfs";
 import { ConvexProvider } from "convex/react";
 import { DeploymentDashboardLayout } from "../../dashboard-common/src/layouts/DeploymentDashboardLayout";
+import { CommandPalette } from "../../dashboard/src/elements/CommandPalette";
 import {
   ConnectedDeploymentContext,
   DeploymentInfoContext,
+  MaybeConnectedDeploymentContext,
 } from "../../dashboard-common/src/lib/deploymentContext";
 import { useTableShapes } from "../../dashboard-common/src/lib/deploymentApi";
 
@@ -188,6 +190,7 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
       docsPage?: {
         deploymentType?: "dev" | "prod";
         launchDarkly?: Partial<ReturnType<typeof useLaunchDarkly>>;
+        entitlements?: Partial<ReturnType<typeof useTeamEntitlements>>;
       };
     }
   )?.docsPage;
@@ -201,6 +204,7 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     customDomainsEnabled: true,
     customRolesEnabled: false,
     deploymentClassSelectionEnabled: false,
+    directorySyncEnabled: false,
     logStreamingEnabled: true,
     managementApiEnabled: true,
     maxChefTokens: 50_000_000,
@@ -265,7 +269,10 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     isLoading: false,
   });
   mocked(useProfile).mockReturnValue(mockProfile);
-  mocked(useTeamEntitlements).mockReturnValue(mockTeamEntitlements);
+  mocked(useTeamEntitlements).mockReturnValue({
+    ...mockTeamEntitlements,
+    ...docsPageParams?.entitlements,
+  });
   mocked(useProjectBySlug).mockReturnValue(
     shouldMockCurrentProject ? mockProject : undefined,
   );
@@ -274,6 +281,10 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
       ? (mockProject as ReturnType<typeof useCurrentProject>)
       : undefined,
   );
+  mocked(useCurrentProjectWithStatus).mockReturnValue({
+    project: shouldMockCurrentProject ? mockProject : undefined,
+    isLoading: false,
+  });
   mocked(useProjectById).mockImplementation(() => ({
     project: mockProject,
     isLoading: false,
@@ -353,22 +364,11 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
   mocked(useLaunchDarkly).mockReturnValue({
     ...flagDefaults,
     enableStatuspageWidget: false,
-    // The schema page has shipped in the docs, so the docs screenshots should
-    // always show the Schema tab in the deployment sidebar. Individual stories
-    // can still override this through `docsPage.launchDarkly`.
-    schemaPage: true,
     ...docsPageParams?.launchDarkly,
   });
   mocked(useCurrentDeployment).mockReturnValue(
     shouldMockCurrentDeployment ? activeDeployment : undefined,
   );
-  mocked(deploymentAuth).mockImplementation(async (deploymentName) => {
-    return {
-      ok: true,
-      deploymentUrl: `https://${deploymentName}.convex.cloud`,
-      adminKey: "STORYBOOK-FAKE-KEY",
-    };
-  });
   mocked(useDeploymentByName).mockReturnValue(undefined);
   mocked(useDeploymentRegions).mockReturnValue({
     regions: [
@@ -490,15 +490,39 @@ function DocsShell({
     setAccessToken("storybook-docs-token");
   }, [setAccessToken]);
 
+  // The command palette reads the connected deployment through
+  // useMaybeConnectedDeployment (MaybeConnectedDeploymentContext), not
+  // ConnectedDeploymentContext, so provide both from the same mock.
+  const maybeConnectedDeployment = mockConnectedDeployment && {
+    deployment: mockConnectedDeployment.deployment,
+    deploymentName: mockConnectedDeployment.deployment.deploymentName,
+    loading: false,
+    errorKind: "None" as const,
+  };
+
   const pageContents = (
     <div className="flex h-screen flex-col">
+      {/* Mirror _app.tsx: on deployment pages the palette mounts inside the
+          deployment providers so it can query the connected deployment;
+          elsewhere it mounts at the top level. */}
+      {!deployment && <CommandPalette />}
       <DashboardHeader />
       <div className="flex-1 overflow-auto">
-        {deployment && mockConnectedDeployment && mockClient ? (
+        {deployment &&
+        mockConnectedDeployment &&
+        maybeConnectedDeployment &&
+        mockClient ? (
           <ConnectedDeploymentContext.Provider value={mockConnectedDeployment}>
-            <ConvexProvider client={mockClient}>
-              <DeploymentLayoutWhenReady>{children}</DeploymentLayoutWhenReady>
-            </ConvexProvider>
+            <MaybeConnectedDeploymentContext.Provider
+              value={maybeConnectedDeployment}
+            >
+              <ConvexProvider client={mockClient}>
+                <CommandPalette />
+                <DeploymentLayoutWhenReady>
+                  {children}
+                </DeploymentLayoutWhenReady>
+              </ConvexProvider>
+            </MaybeConnectedDeploymentContext.Provider>
           </ConnectedDeploymentContext.Provider>
         ) : (
           children
@@ -533,8 +557,8 @@ function DocsShell({
 }
 
 // DeploymentInfoProvider renders children without the context on the first
-// render (before the async deploymentAuth resolves). Guard against calling
-// DeploymentDashboardLayout until the context is available.
+// render, before it has resolved the deployment's URL and admin key. Guard
+// against calling DeploymentDashboardLayout until the context is available.
 function DeploymentLayoutWhenReady({
   children,
 }: React.PropsWithChildren<object>) {

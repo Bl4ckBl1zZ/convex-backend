@@ -28,12 +28,10 @@ import {
   teamNavigation,
   teamSectionNavigation,
 } from "./navigation";
-import { ActionItem, NavigationItem } from "./items";
+import { ActionItem, NavigationItem, ProjectItem } from "./items";
 import { ComponentSwitchCommands } from "./ComponentCommands";
-import {
-  DeploymentSearchCommands,
-  SearchResultDetailItem,
-} from "./DeploymentSearchCommands";
+import { DeploymentSearchCommands } from "./DeploymentSearchCommands";
+import type { DocumentSearchResultItem } from "./DocumentSearchResult";
 import { DeploymentSearchGroup, ProjectSearchGroup } from "./searchGroups";
 import { NoResultsMessage } from "./NoResultsMessage";
 import { PalettePage } from "./pages";
@@ -54,14 +52,14 @@ export function RootCommands({
 }: {
   search: string;
   onNavigate: (to: NavigationDestination) => void;
-  onOpenDetail: (detail: SearchResultDetailItem) => void;
+  onOpenDetail: (detail: DocumentSearchResultItem) => void;
   pushPage: (page: PalettePage) => void;
   onClose: () => void;
 }) {
   const router = useRouter();
   const team = useCurrentTeam();
   const project = useCurrentProject();
-  const { usageLimits, commandPaletteDeleteProjects } = useLaunchDarkly();
+  const { commandPaletteDeleteProjects } = useLaunchDarkly();
   const [, setSupportFormOpen] = useSupportFormOpen();
   const { trackSelected } = usePaletteAnalytics();
 
@@ -76,9 +74,7 @@ export function RootCommands({
       : undefined;
   const deploymentNav =
     deploymentUriPrefix && project
-      ? deploymentNavigation(deploymentUriPrefix, {
-          usageLimitsEnabled: usageLimits,
-        })
+      ? deploymentNavigation(deploymentUriPrefix)
       : undefined;
   // Sections within pages are only surfaced while searching, to keep the
   // browsable (empty-search) list scannable.
@@ -191,7 +187,16 @@ export function RootCommands({
             drillIn
           />
           {!project && (
-            <SwitchProjectItem pushPage={pushPage} label="Go to Project…" />
+            <>
+              <SwitchProjectItem pushPage={pushPage} label="Go to Project…" />
+              <ActionItem
+                value="page:team-deployments"
+                onSelect={() => pushPage({ type: "teamDeployments" })}
+                Icon={CaretSortIcon}
+                label="Go to Deployment…"
+                drillIn
+              />
+            </>
           )}
           {[
             ...teamNav,
@@ -222,8 +227,15 @@ export function RootCommands({
         <ProjectSearchGroup
           team={team}
           search={search}
-          onNavigate={onNavigate}
-          pushPage={pushPage}
+          renderItem={(candidate) => (
+            <ProjectItem
+              key={candidate.id}
+              project={candidate}
+              teamSlug={team.slug}
+              onNavigate={onNavigate}
+              onDrill={() => pushPage({ type: "project", project: candidate })}
+            />
+          )}
         />
       )}
       {team && search.trim() && (
@@ -305,13 +317,7 @@ function SwitchProjectItem({
   );
 }
 
-export function AskAIQueryItem({
-  onClose,
-  canShowNoResults,
-}: {
-  onClose: () => void;
-  canShowNoResults: boolean;
-}) {
+export function AskAIQueryItem({ onClose }: { onClose: () => void }) {
   const search = useCommandState((state) => state.search).trim();
   const visibleCount = useCommandState((state) => state.filtered.count);
   const { trackSelected } = usePaletteAnalytics();
@@ -332,7 +338,7 @@ export function AskAIQueryItem({
         <SparklesIcon className="text-content-secondary" />
         <span className="min-w-0 truncate">Ask AI “{search}”</span>
       </Command.Item>
-      {canShowNoResults && visibleCount <= 1 && (
+      {visibleCount <= 1 && (
         <div className="flex flex-col items-center justify-center gap-1 py-6 text-sm whitespace-pre-wrap text-content-tertiary">
           <NoResultsMessage onClose={onClose} />
         </div>

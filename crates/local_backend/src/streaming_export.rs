@@ -25,6 +25,7 @@ use common::{
         extract::{
             Json,
             MtState,
+            Path,
             Query,
         },
         ExtractClientVersion,
@@ -52,6 +53,8 @@ use common::{
             ActiveDataSyncStatus,
             ActiveDataSyncUpToDate,
             DataSyncArgs,
+            DataSyncCursorFromDeltasArgs,
+            DataSyncCursorFromDeltasResponse,
             DataSyncResponse,
             DataSyncSnapshotting,
             DataSyncStale,
@@ -70,12 +73,14 @@ use common::{
             ListSnapshotValue,
             SnapshottingTag,
             StaleTag,
+            SyncId,
             UpToDateTag,
         },
         RepeatableTimestamp,
         Timestamp,
         UdfIdentifier,
     },
+    version::ClientVersion,
     virtual_system_mapping::{
         all_tables_number_to_name,
         VirtualSystemMapping,
@@ -99,7 +104,10 @@ use http::StatusCode;
 use keybroker::Identity;
 use maplit::btreemap;
 use model::{
-    data_sync_progress::types::DataSyncState,
+    data_sync_progress::types::{
+        DataSyncProgressMetadata,
+        DataSyncState,
+    },
     virtual_system_mapping,
 };
 use roles::RequireDeploymentOp;
@@ -272,7 +280,7 @@ pub async fn _document_deltas(
     post,
     path = "/data/sync",
     tag = "Data Sync",
-    tags = ["beta"],
+    tags = ["pro"],
     request_body = DataSyncArgs,
     responses((status = 200, body = DataSyncResponse)),
     security(
@@ -290,14 +298,7 @@ pub async fn data_sync(
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     Json(args): Json<DataSyncArgs>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
-    _data_sync(
-        st,
-        args,
-        identity,
-        DataSyncClient::from(client_version.client()),
-        request_metadata,
-    )
-    .await
+    _data_sync(st, args, identity, client_version, request_metadata).await
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -307,6 +308,56 @@ pub struct ListActiveSyncsArgs {
     limit: Option<usize>,
     /// Cursor from a previous response to fetch the next page.
     cursor: Option<String>,
+}
+
+/// The API representation of a sync's recorded progress.
+fn active_data_sync(progress: DataSyncProgressMetadata) -> ActiveDataSync {
+    ActiveDataSync {
+        sync_id: progress.sync_id.into(),
+        last_updated: progress.last_updated_ms as i64,
+        status: match progress.state {
+            DataSyncState::Snapshotting {
+                num_tables_synced,
+                total_tables,
+                current_component,
+                current_table,
+                num_documents_synced_in_current_table,
+                total_documents_in_current_table,
+                num_documents_synced,
+                total_documents,
+            } => ActiveDataSyncStatus::Snapshotting(ActiveDataSyncSnapshotting {
+                status_type: SnapshottingTag::Snapshotting,
+                num_tables_synced,
+                total_tables,
+                current_component: String::from(current_component),
+                current_table: current_table.to_string(),
+                num_documents_in_current_table: num_documents_synced_in_current_table,
+                total_documents_in_current_table,
+                num_documents_synced,
+                total_documents,
+            }),
+            DataSyncState::Stale {
+                total_tables,
+                num_documents_synced,
+                synced_ts,
+            } => ActiveDataSyncStatus::Stale(ActiveDataSyncStale {
+                status_type: StaleTag::Stale,
+                total_tables,
+                num_documents_synced,
+                synced_ts,
+            }),
+            DataSyncState::UpToDate {
+                total_tables,
+                num_documents_synced,
+                synced_ts,
+            } => ActiveDataSyncStatus::UpToDate(ActiveDataSyncUpToDate {
+                status_type: UpToDateTag::UpToDate,
+                total_tables,
+                num_documents_synced,
+                synced_ts,
+            }),
+        },
+    }
 }
 
 /// List active data syncs
@@ -319,7 +370,7 @@ pub struct ListActiveSyncsArgs {
     get,
     path = "/data/list_active_syncs",
     tag = "Data Sync",
-    tags = ["beta"],
+    tags = ["pro"],
     params(ListActiveSyncsArgs),
     responses((status = 200, body = ListActiveSyncsResponse)),
     security(
@@ -346,55 +397,7 @@ pub async fn list_active_syncs(
         .await?;
     let syncs = syncs
         .into_iter()
-        .map(|doc| {
-            let progress = doc.into_value();
-            ActiveDataSync {
-                sync_id: progress.sync_id,
-                last_updated: progress.last_updated_ms as i64,
-                status: match progress.state {
-                    DataSyncState::Snapshotting {
-                        num_tables_synced,
-                        total_tables,
-                        current_component,
-                        current_table,
-                        num_documents_synced_in_current_table,
-                        total_documents_in_current_table,
-                        num_documents_synced,
-                        total_documents,
-                    } => ActiveDataSyncStatus::Snapshotting(ActiveDataSyncSnapshotting {
-                        status_type: SnapshottingTag::Snapshotting,
-                        num_tables_synced,
-                        total_tables,
-                        current_component: String::from(current_component),
-                        current_table: current_table.to_string(),
-                        num_documents_in_current_table: num_documents_synced_in_current_table,
-                        total_documents_in_current_table,
-                        num_documents_synced,
-                        total_documents,
-                    }),
-                    DataSyncState::Stale {
-                        total_tables,
-                        num_documents_synced,
-                        synced_ts,
-                    } => ActiveDataSyncStatus::Stale(ActiveDataSyncStale {
-                        status_type: StaleTag::Stale,
-                        total_tables,
-                        num_documents_synced,
-                        synced_ts,
-                    }),
-                    DataSyncState::UpToDate {
-                        total_tables,
-                        num_documents_synced,
-                        synced_ts,
-                    } => ActiveDataSyncStatus::UpToDate(ActiveDataSyncUpToDate {
-                        status_type: UpToDateTag::UpToDate,
-                        total_tables,
-                        num_documents_synced,
-                        synced_ts,
-                    }),
-                },
-            }
-        })
+        .map(|doc| active_data_sync(doc.into_value()))
         .collect();
 
     Ok(Json(ListActiveSyncsResponse {
@@ -403,6 +406,106 @@ pub async fn list_active_syncs(
             has_more: next_cursor.is_some(),
             next_cursor,
         },
+    }))
+}
+
+/// Get an active data sync
+///
+/// Returns the progress of a single data sync (/v1/data/sync), identified by
+/// the `syncId` that endpoint returns. The status is the same one
+/// `/data/list_active_syncs` reports for each sync it lists.
+///
+/// A data sync is considered active for 3 days after the most recent API call
+/// from `/data/sync`. Ids of syncs that are unknown or no longer active return
+/// a 404.
+///
+/// The caller must have the `deployment:data:view` permission.
+#[utoipa::path(
+    get,
+    path = "/data/sync/{sync_id}",
+    tag = "Data Sync",
+    tags = ["pro"],
+    params(
+        ("sync_id" = SyncId, Path, description = "`syncId` of the sync, as returned by /data/sync"),
+    ),
+    responses((status = 200, body = ActiveDataSync)),
+    security(
+        ("Deploy Key" = []),
+        ("OAuth Team Token" = []),
+        ("Team Token" = []),
+        ("OAuth Project Token" = []),
+    ),
+)]
+#[fastrace::trace]
+pub async fn get_active_sync(
+    MtState(st): MtState<LocalAppState>,
+    Path(sync_id): Path<SyncId>,
+    ExtractIdentity(identity): ExtractIdentity,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    st.application
+        .ensure_streaming_export_enabled(identity.clone())
+        .await?;
+    identity.require_operation(keybroker::DeploymentOp::ViewData)?;
+
+    let progress = st
+        .application
+        .active_data_sync(identity, sync_id.as_str())
+        .await?
+        .context(ErrorMetadata::not_found(
+            "DataSyncNotFound",
+            format!(
+                "No active data sync with id {sync_id}. A data sync is active for 3 days after \
+                 its most recent page."
+            ),
+        ))?;
+
+    Ok(Json(active_data_sync(progress)))
+}
+
+/// Converts a legacy `document_deltas` cursor into a `/api/v1/data/sync`
+/// cursor, so an integration can move to the data sync API without re-reading
+/// the data it already has. Everything with a revision `<=` the given cursor is
+/// treated as already synced for the selected tables.
+///
+/// Deliberately unversioned and absent from the OpenAPI spec: this is a
+/// migration affordance for the Fivetran and Airbyte source connectors, not
+/// part of the public data sync API.
+#[fastrace::trace]
+pub async fn data_sync_cursor_from_deltas(
+    MtState(st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+    ExtractClientVersion(client_version): ExtractClientVersion,
+    Json(DataSyncCursorFromDeltasArgs { cursor, selection }): Json<DataSyncCursorFromDeltasArgs>,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    st.application
+        .ensure_streaming_export_enabled(identity.clone())
+        .await?;
+    identity.require_operation(keybroker::DeploymentOp::ViewData)?;
+
+    let cursor = Timestamp::try_from(cursor).map_err(|e| {
+        e.context(ErrorMetadata::bad_request(
+            "InvalidDataSyncCursor",
+            "The document_deltas cursor is not a valid timestamp",
+        ))
+    })?;
+    let selection = StreamingExportSelection::try_from(selection).map_err(|e| {
+        let msg = format!("Invalid selection: {e:#}");
+        e.context(ErrorMetadata::bad_request("InvalidDataSyncSelection", msg))
+    })?;
+
+    let sync_cursor = st
+        .application
+        .data_sync_cursor_from_deltas(
+            identity,
+            cursor,
+            selection,
+            DataSyncClient::from(client_version.client()),
+        )
+        .await
+        .map_err(cursor_expired_error)?;
+
+    Ok(Json(DataSyncCursorFromDeltasResponse {
+        cursor: sync_cursor.encrypt(st.application.key_broker().data_sync_encryptor())?,
     }))
 }
 
@@ -415,13 +518,30 @@ where
     utoipa_axum::router::OpenApiRouter::new()
         .routes(utoipa_axum::routes!(data_sync))
         .routes(utoipa_axum::routes!(list_active_syncs))
+        .routes(utoipa_axum::routes!(get_active_sync))
+}
+
+/// A cursor pointing at a snapshot that has aged out of the deployment's data
+/// retention window (see the endpoint docs: call at least once every 3 days)
+/// can't be resumed. Surface a 400 telling the caller to restart the sync from
+/// scratch; other errors pass through.
+fn cursor_expired_error(e: anyhow::Error) -> anyhow::Error {
+    if e.is_out_of_retention() {
+        e.context(ErrorMetadata::bad_request(
+            "DataSyncCursorExpired",
+            "The cursor is outside the deployment's data retention window and can no longer be \
+             resumed. Restart the sync from scratch by calling /data/sync without a cursor.",
+        ))
+    } else {
+        e
+    }
 }
 
 async fn _data_sync(
     st: LocalAppState,
     DataSyncArgs { cursor, selection }: DataSyncArgs,
     identity: Identity,
-    sync_client: DataSyncClient,
+    client_version: ClientVersion,
     request_metadata: RequestMetadata,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     st.application
@@ -459,24 +579,38 @@ async fn _data_sync(
         mut usage,
     } = st
         .application
-        .data_sync(identity, cursor, selection, sync_client, request_metadata)
+        .data_sync(
+            identity,
+            cursor,
+            selection,
+            DataSyncClient::from(client_version.client()),
+            request_metadata,
+        )
         .await
-        .map_err(|e| {
-            // The cursor points at a snapshot that has aged out of the
-            // deployment's data retention window (see the endpoint docs: call at
-            // least once every 3 days). It can't be resumed, so surface a 400
-            // telling the caller to restart the sync from scratch.
-            if e.is_out_of_retention() {
-                e.context(ErrorMetadata::bad_request(
-                    "DataSyncCursorExpired",
-                    "The data sync cursor is outside the deployment's data retention window and \
-                     can no longer be resumed. Restart the sync from scratch by calling this \
-                     endpoint again without a cursor.",
-                ))
-            } else {
-                e
-            }
-        })?;
+        .map_err(cursor_expired_error)?;
+
+    let (tables_synced, total_tables, docs_synced, total_docs) = match &status {
+        SyncStatus::Snapshotting { progress } => (
+            progress.num_tables_synced,
+            progress.total_tables,
+            progress.num_documents_synced,
+            progress.total_documents,
+        ),
+        SyncStatus::Stale { .. } | SyncStatus::UpToDate { .. } => (
+            new_cursor.num_synced_tables(),
+            new_cursor.num_synced_tables(),
+            new_cursor.num_docs_synced(),
+            None,
+        ),
+    };
+    let total_docs = total_docs
+        .map(|total| total.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let sync_id = new_cursor.sync_id();
+    tracing::info!(
+        "/data/sync {client_version} {sync_id} tables ({tables_synced}/{total_tables}) docs \
+         ({docs_synced}/{total_docs})"
+    );
 
     let truncates = truncates
         .into_iter()
@@ -541,7 +675,7 @@ async fn _data_sync(
     let response = DataSyncResponse {
         truncates,
         values,
-        sync_id: new_cursor.sync_id().to_string(),
+        sync_id: new_cursor.sync_id().into(),
         status,
         pagination: PaginationMetadata {
             // A data sync is a stream with no end: another page can always be
@@ -635,7 +769,12 @@ async fn _list_snapshot(
                     .map_err(anyhow::Error::new)?,
             })
         })
-        .transpose()?;
+        .transpose()
+        .context(ErrorMetadata::bad_request(
+            "InvalidListSnapshotCursor",
+            "Invalid value for the `cursor` argument of list_snapshot. Use a `cursor` returned by \
+             a previous list_snapshot call, and treat it as an opaque value.",
+        ))?;
 
     let selection = Selection::from(selection);
     let selection = StreamingExportSelection::try_from(selection)?;

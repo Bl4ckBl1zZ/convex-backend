@@ -5,7 +5,6 @@ use common::{
 };
 use futures::FutureExt;
 use sync_types::CanonicalizedUdfPath;
-use tracing::Instrument;
 use udf::{
     metrics::is_developer_ok,
     HttpActionResult,
@@ -17,8 +16,6 @@ use crate::{
         IsolateWorker,
         Request,
         RequestType,
-        SharedIsolateHeapStats,
-        PAUSE_REQUEST,
     },
     context_cache::ContextCache,
     environment::{
@@ -42,17 +39,21 @@ use crate::{
     ConcurrencyPermit,
     IsolateConfig,
 };
+
 #[derive(Clone)]
-pub(crate) struct FunctionRunnerIsolateWorker<RT: Runtime> {
+pub struct FunctionRunnerIsolateWorker<RT: Runtime> {
     rt: RT,
     isolate_config: IsolateConfig,
 }
 
 impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
-    pub(crate) fn new(rt: RT, isolate_config: IsolateConfig) -> Self {
+    pub fn new(rt: RT, isolate_config: IsolateConfig) -> Self {
         Self { rt, isolate_config }
     }
+}
 
+#[async_trait(?Send)]
+impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
     async fn handle_request_inner(
         &self,
         isolate: &mut Isolate<RT>,
@@ -63,14 +64,12 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
             parent_trace: _,
         }: Request<RT>,
         permit: ConcurrencyPermit,
-        heap_stats: SharedIsolateHeapStats,
     ) -> (String, bool) {
         // Require the layer below to opt into isolate reuse by setting `isolate_clean`.
         let mut isolate_clean = false;
         let debug_str = match inner {
             RequestType::Udf {
                 request,
-                environment_data,
                 mut response,
                 queue_timer,
                 rng_seed,
@@ -85,8 +84,6 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
                 let udf_path = request.path_and_args.path().udf_path.to_owned();
                 let (environment, args) = DatabaseUdfEnvironment::new(
                     self.rt.clone(),
-                    environment_data,
-                    heap_stats.clone(),
                     request,
                     reactor_depth,
                     client_id.clone(),
@@ -120,7 +117,6 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
             },
             RequestType::Action {
                 request,
-                environment_data,
                 mut response,
                 queue_timer,
                 action_callbacks,
@@ -141,14 +137,13 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
                     component,
                     udf_path,
                     component_path,
-                    environment_data,
+                    request.environment_data,
                     request.identity,
                     request.transaction,
                     action_callbacks,
                     fetch_client,
                     log_line_sender,
                     None,
-                    heap_stats.clone(),
                     request.context,
                 );
                 let r = environment
@@ -200,7 +195,6 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
             },
             RequestType::HttpAction {
                 request,
-                environment_data,
                 response,
                 queue_timer,
                 action_callbacks,
@@ -221,14 +215,13 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
                     http_path.component,
                     udf_path,
                     component_path,
-                    environment_data,
+                    request.environment_data,
                     request.identity,
                     request.transaction,
                     action_callbacks,
                     fetch_client,
                     log_line_sender,
                     Some(http_response_streamer),
-                    heap_stats.clone(),
                     request.context,
                 );
                 let r = environment
@@ -342,42 +335,12 @@ impl<RT: Runtime> FunctionRunnerIsolateWorker<RT> {
         }
         (debug_str, isolate_clean)
     }
-}
-
-#[async_trait(?Send)]
-impl<RT: Runtime> IsolateWorker<RT> for FunctionRunnerIsolateWorker<RT> {
-    #[fastrace::trace]
-    async fn handle_request(
-        &self,
-        isolate: &mut Isolate<RT>,
-        context_cache: &mut ContextCache,
-        request: Request<RT>,
-        permit: ConcurrencyPermit,
-        heap_stats: SharedIsolateHeapStats,
-    ) -> (String, bool) {
-        let pause_client = self.rt.pause_client();
-        pause_client.wait(PAUSE_REQUEST).await;
-        let client_id = &request.client_id;
-        // Set the scope to be tagged with the client_id just for the duration of
-        // handling the request. It would be nice to get sentry::with_scope to work, but
-        // it uses a synchronous callback and we need `report_error` in the future to
-        // have the client_id tag.
-        sentry::configure_scope(|scope| scope.set_tag("client_id", client_id));
-        // Also add the tag to tracing so it shows up in DataDog logs.
-        let span = tracing::info_span!("isolate_worker_handle_request", instance_name = client_id);
-        let result = self
-            .handle_request_inner(isolate, context_cache, request, permit, heap_stats)
-            .instrument(span)
-            .await;
-        sentry::configure_scope(|scope| scope.remove_tag("client_id"));
-        result
-    }
 
     fn config(&self) -> &IsolateConfig {
         &self.isolate_config
     }
 
-    fn rt(&self) -> RT {
-        self.rt.clone()
+    fn rt(&self) -> &RT {
+        &self.rt
     }
 }

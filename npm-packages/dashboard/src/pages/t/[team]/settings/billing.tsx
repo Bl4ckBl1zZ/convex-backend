@@ -25,10 +25,13 @@ import { Loading } from "@ui/Loading";
 import { planNameMap } from "components/billing/planCards/PlanCard";
 import { OpenInVercel } from "components/OpenInVercel";
 import startCase from "lodash/startCase";
+import { PromoCodeModalContainer } from "components/billing/PromoCodeModal";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 
 export { getServerSideProps } from "lib/ssr";
 
 function Billing({ team }: { team: TeamResponse }) {
+  const { promos } = useLaunchDarkly();
   const { subscription: orbSub, isLoading: isOrbSubLoading } =
     useTeamOrbSubscription(team.id);
 
@@ -48,10 +51,8 @@ function Billing({ team }: { team: TeamResponse }) {
   const canChangePlan = hasAdminPermissions || canChangePlanCustom === true;
   const myProfile = useProfile();
   const orbPlans = useListPlans(team.id);
-  const selectedPlan = orbPlans.plans?.find((p) =>
-    router.query.source === "chef"
-      ? p.planType === "CONVEX_STARTER_PLUS"
-      : p.id === router.query.upgradePlan,
+  const selectedPlan = orbPlans.plans?.find(
+    (p) => p.id === router.query.upgradePlan,
   );
 
   const newPlanName = selectedPlan?.planType
@@ -60,9 +61,16 @@ function Billing({ team }: { team: TeamResponse }) {
 
   const showUpgrade =
     selectedPlan && orbSub?.plan.id !== selectedPlan.id && canChangePlan;
+  const promoCode =
+    typeof router.query.promoCode === "string"
+      ? router.query.promoCode
+      : undefined;
 
   return (
     <div className="-mx-6 flex grow flex-col">
+      {promos && promoCode !== undefined && (
+        <PromoCodeModalContainer code={promoCode} initialTeam={team} />
+      )}
       <div className="sticky top-0 z-10 -mt-6 flex items-center gap-2 bg-background-primary p-6">
         {showUpgrade && (
           <Button
@@ -161,7 +169,6 @@ function Billing({ team }: { team: TeamResponse }) {
                       team={team}
                       numMembers={members?.length || 1}
                       plan={selectedPlan}
-                      isChef={router.query.source === "chef"}
                       onUpgradeComplete={() => {
                         void router.push(
                           {

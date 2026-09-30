@@ -8,12 +8,22 @@ license = "LicenseRef-FSL-1.1-Apache-2.0"
 build = "build.rs"
 include = ["data"]
 
-[package.metadata.cargo-udeps.ignore]
-normal = ["mysql"]
-development = ["mysql"]
-
 [package.metadata.cargo-machete]
-ignored = ["phf"]
+ignored = [
+    "axum",
+    "http-body-util",
+    "hyper",
+    "js_build",
+    "must-let",
+    "phf",
+    "pretty_assertions",
+    "reqwest",
+    "search",
+    "search_index_workers",
+    "sha2",
+    "shape_inference",
+    "walkdir",
+]
 
 [lib]
 doctest = false
@@ -44,18 +54,17 @@ testing = [
 tracy-tracing = ["common/tracy-tracing"]
 
 [dependencies]
+ai_gateway_jwt = { workspace = true }
 anyhow = { workspace = true }
 async-broadcast = { workspace = true }
 async-recursion = { workspace = true }
 async-trait = { workspace = true }
 async_lru = { workspace = true }
-aws-lc-rs = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 cmd_util = { workspace = true }
 common = { workspace = true }
-const-oid = { workspace = true }
 convex_macro = { workspace = true }
 database = { workspace = true }
 deno_core = { workspace = true }
@@ -78,11 +87,10 @@ mime = { workspace = true }
 model = { workspace = true }
 multer = { workspace = true }
 must-let = { workspace = true, optional = true }
-openssl = { workspace = true }
 parking_lot = { workspace = true }
+paste = { workspace = true }
 pb = { workspace = true }
 phf = { workspace = true }
-pkcs8 = { workspace = true }
 prometheus = { workspace = true }
 proptest = { workspace = true, optional = true }
 rand = { workspace = true }
@@ -101,7 +109,6 @@ serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 slab = { workspace = true }
 sourcemap = { workspace = true }
-spki = { workspace = true }
 storage = { workspace = true }
 strum = { workspace = true }
 sync_types = { workspace = true }
@@ -115,12 +122,14 @@ usage_tracking = { workspace = true }
 uuid = { workspace = true }
 value = { workspace = true }
 vector = { workspace = true }
+webcrypto = { workspace = true }
 
 [target."cfg(not(windows))".dependencies]
 libc = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
+js_build = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

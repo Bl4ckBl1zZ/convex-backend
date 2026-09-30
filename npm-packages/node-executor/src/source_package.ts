@@ -79,92 +79,139 @@ function parseMetadataFile(contents: string): MetadataJson {
   };
 }
 
+// In-flight `removeDir` promises
+const pendingRemovals = new Map<string, Promise<void>>();
+
+// Removes `dir`, serialized against any other removal of the same directory.
+function removeDir(dir: string): Promise<void> {
+  const removal = (pendingRemovals.get(dir) ?? Promise.resolve())
+    .then(() => fs.promises.rm(dir, { recursive: true, force: true }))
+    .catch((e) => {
+      // Removals are best effort, just log failures
+      logDebug(`Failed to remove ${dir}: ${e}`);
+    })
+    .finally(() => {
+      if (pendingRemovals.get(dir) === removal) {
+        pendingRemovals.delete(dir);
+      }
+    });
+  pendingRemovals.set(dir, removal);
+  return removal;
+}
+
+/**
+ * Returns the cache entry for `key`, starting the download if it isn't cached
+ * yet. Concurrent requests for the same key share a single download.
+ *
+ * This runs to completion synchronously so that callers can register their
+ * interest in a package (via the refcount) before yielding to other requests.
+ */
+function getOrStartDownload<T>(
+  context: PackageRefcounts,
+  cache: Map<string, PackageCacheEntry<T>>,
+  key: string,
+  dir: string,
+  startDownload: (dir: string) => Promise<T>,
+): PackageCacheEntry<T> {
+  const cached = cache.get(key);
+  if (cached !== undefined) {
+    return context.adopt(cached);
+  }
+  const entry: PackageCacheEntry<T> = {
+    dir,
+    refcount: 0,
+    settled: false,
+    ready: (pendingRemovals.get(dir) ?? Promise.resolve())
+      // N.B.: .then() ensures `startDownload` runs after `adopt`, which bumps our own refcount
+      .then(() => startDownload(dir))
+      .catch(async (e) => {
+        // Don't cache failures, so that the next request retries the download.
+        if (cache.get(key) === entry) {
+          cache.delete(key);
+        }
+        // No cleanup pass can reach the partial download once it's uncached.
+        await removeDir(dir);
+        throw e;
+      })
+      .finally(() => {
+        entry.settled = true;
+      }),
+  };
+  cache.set(key, entry);
+  context.adopt(entry);
+  return entry;
+}
+
 /// Downloads source package and external deps package, if necessary,
 /// populating cache with result. Links external deps package into
 /// local source package directory.
 export async function maybeDownloadAndLinkPackages(
+  context: PackageRefcounts,
   sourcePackage: SourcePackage,
 ): Promise<LocalSourcePackage> {
-  // If we've previously downloaded and cached this source package, we've already linked the necessary
-  // external modules and so there is no more work left to do, so return.
-  const local = availableSourcePackages.get(sourcePackage.key);
-  if (local !== undefined) {
-    return local;
-  }
+  const externalDeps = sourcePackage.external_deps ?? null;
+  const external = externalDeps
+    ? getOrStartDownload(
+        context,
+        availableExternalPackages,
+        externalDeps.key,
+        path.join(os.tmpdir(), `external_deps/${externalDeps.key}`),
+        (dir) => downloadExternalPackage(dir, externalDeps),
+      )
+    : null;
+  const source = getOrStartDownload(
+    context,
+    availableSourcePackages,
+    sourcePackage.key,
+    path.join(os.tmpdir(), `source/${sourcePackage.key}`),
+    (dir) =>
+      downloadAndLinkSourcePackage(dir, sourcePackage.bundled_source, external),
+  );
 
-  // Multiple actions can reach a cold executor at the same time. Deduplicate
-  // package setup so they do not concurrently remove, recreate, and populate
-  // the same source directory.
-  let packagePromise = pendingSourcePackages.get(sourcePackage.key);
-  if (packagePromise === undefined) {
-    packagePromise = downloadAndLinkPackages(sourcePackage);
-    pendingSourcePackages.set(sourcePackage.key, packagePromise);
-  }
-  try {
-    return await packagePromise;
-  } finally {
-    if (pendingSourcePackages.get(sourcePackage.key) === packagePromise) {
-      pendingSourcePackages.delete(sourcePackage.key);
-    }
-  }
+  const [modules] = await Promise.all([source.ready, external?.ready]);
+  return { dir: source.dir, modules };
 }
 
-async function downloadAndLinkPackages(
-  sourcePackage: SourcePackage,
-): Promise<LocalSourcePackage> {
-  const sourcePackagePromise = downloadSourcePackage(
-    sourcePackage.bundled_source,
-  );
-  const externalPackagePromise = sourcePackage.external_deps
-    ? maybeDownloadExternalPackage(sourcePackage.external_deps)
-    : null;
-  const [localPackage, externalPackage] = await Promise.all([
-    sourcePackagePromise,
-    externalPackagePromise,
-  ]);
+async function downloadAndLinkSourcePackage(
+  dir: string,
+  bundledSource: Package,
+  externalPackage: PackageCacheEntry<void> | null,
+): Promise<Set<CanonicalizedModulePath>> {
+  const modules = await downloadSourcePackage(dir, bundledSource);
 
   // Do symlinking of external package into local source package node_modules folder.
   //
-  // This symlink is necessary only if there does not already exist a node_modules folder
-  // in the source (localPackage) directory. Why? If a package already exists in the localPackage.dir
-  // directory, we can be sure it is up-to-date since a given source package can only ever map to
-  // one set of external deps. If external deps change, a new source package is created.
-  //
-  // If we reach this point and a valid externalPackage exists for this source, we can unconditionally
-  // symlink since we can be sure that the local package was not previously downloaded and cached, otherwise
-  // this function would have returned earlier. Thus, the local package directory has been freshly downloaded
-  // and so no node_modules folder can exist already.
+  // This symlink is necessary only after the initial download, as a given
+  // source package can only ever map to one set of external deps.
+  // If external deps change, a new source package is created.
   if (externalPackage) {
     logDebug(
-      `Attempting symlink from ${externalPackage.dir}/node_modules to ${localPackage.dir}/node_modules`,
+      `Attempting symlink from ${externalPackage.dir}/node_modules to ${dir}/node_modules`,
     );
     await fs.promises.symlink(
       `${externalPackage.dir}/node_modules`,
-      `${localPackage.dir}/node_modules`,
+      `${dir}/node_modules`,
       "dir",
     );
   }
 
-  // Save result for next time
-  availableSourcePackages.set(sourcePackage.key, localPackage);
-
-  return localPackage;
+  return modules;
 }
 
 // Downloads sourcePackage and unzips it into `source/${sourcePackage.key}/modules`
 async function downloadSourcePackage(
+  dir: string,
   sourcePackage: Package,
-): Promise<LocalSourcePackage> {
+): Promise<Set<CanonicalizedModulePath>> {
   const start = performance.now();
   logDebug("Downloading source package...");
 
-  // First cleanup any previously downloaded packages in order to not run
-  // out of space.
+  // First cleanup any previously downloaded packages (that are not still being used)
+  // in order to not run out of space.
   await cleanupSourcePackages();
   logDurationMs("cleanupTime", start);
 
   // Create directory and do download in parallel
-  const dir = path.join(os.tmpdir(), `source/${sourcePackage.key}`);
   const dirPromise = createFreshDir(dir);
   const downloadPackagePromise = download(sourcePackage.uri);
   const [sourcePackageStream, ..._] = await Promise.all([
@@ -184,32 +231,10 @@ async function downloadSourcePackage(
 }
 
 // Downloads externalPackage and unzips it into `externals/${externalPackage.key}/node_modules`.
-async function maybeDownloadExternalPackage(
-  externalPackage: Package,
-): Promise<ExternalDepsPackage> {
-  const externalDeps = availableExternalPackages.get(externalPackage.key);
-  if (externalDeps !== undefined) {
-    logDebug("External Package available locally");
-    return externalDeps;
-  }
-
-  let packagePromise = pendingExternalPackages.get(externalPackage.key);
-  if (packagePromise === undefined) {
-    packagePromise = downloadExternalPackage(externalPackage);
-    pendingExternalPackages.set(externalPackage.key, packagePromise);
-  }
-  try {
-    return await packagePromise;
-  } finally {
-    if (pendingExternalPackages.get(externalPackage.key) === packagePromise) {
-      pendingExternalPackages.delete(externalPackage.key);
-    }
-  }
-}
-
 async function downloadExternalPackage(
+  dir: string,
   externalPackage: Package,
-): Promise<ExternalDepsPackage> {
+): Promise<void> {
   const start = performance.now();
   logDebug("External Package not available locally");
 
@@ -219,7 +244,6 @@ async function downloadExternalPackage(
 
   // Create directory and do download in parallel
   const downloadStart = performance.now();
-  const dir = path.join(os.tmpdir(), `external_deps/${externalPackage.key}`);
   const dirPromise = createFreshDir(dir);
   const downloadPackagePromise = download(externalPackage.uri);
   const [externalPackageStream, ..._] = await Promise.all([
@@ -234,13 +258,8 @@ async function downloadExternalPackage(
     externalPackage,
     externalPackageStream,
   );
-  const result: ExternalDepsPackage = { dir, dynamicallyDownloaded: true };
-
-  // Save result for next time
-  availableExternalPackages.set(externalPackage.key, result);
 
   logDurationMs("externalDepsProcessingTime", start);
-  return result;
 }
 
 async function createFreshDir(dir: string) {
@@ -342,19 +361,26 @@ type LocalSourcePackage = {
    * This doesn’t include bundler chunks (files in /_deps/).
    */
   modules: Set<CanonicalizedModulePath>;
-  dynamicallyDownloaded: boolean;
 };
 
-type ExternalDepsPackage = {
+/**
+ * A package directory that is being, or has been, downloaded. The entry is
+ * cached from the moment the download starts, so that concurrent requests for
+ * the same package share one download.
+ */
+type PackageCacheEntry<T> = {
   dir: string;
-  dynamicallyDownloaded: boolean;
+  refcount: number;
+  // true if `ready` has settled
+  settled: boolean;
+  ready: Promise<T>;
 };
 
 async function processSourcePackageStream(
   dir: string,
   sourcePackage: Package,
   sourceStream: stream.Readable,
-): Promise<LocalSourcePackage> {
+): Promise<Set<CanonicalizedModulePath>> {
   const startUnzip = performance.now();
   const zipBuffer = await processPackageStream(
     sourcePackage.sha256,
@@ -399,18 +425,17 @@ async function processSourcePackageStream(
     );
   }
 
-  const modules = modulesFromMetadataJson(metadataJson);
-  return {
-    dir,
-    modules,
-    dynamicallyDownloaded: true,
-  };
+  return modulesFromMetadataJson(metadataJson);
 }
 
-export const availableSourcePackages = new Map<string, LocalSourcePackage>();
-const pendingSourcePackages = new Map<string, Promise<LocalSourcePackage>>();
-export const availableExternalPackages = new Map<string, ExternalDepsPackage>();
-const pendingExternalPackages = new Map<string, Promise<ExternalDepsPackage>>();
+export const availableSourcePackages = new Map<
+  string,
+  PackageCacheEntry<Set<CanonicalizedModulePath>>
+>();
+export const availableExternalPackages = new Map<
+  string,
+  PackageCacheEntry<void>
+>();
 
 /**
  * Prepopulates source and external deps caches if this Lambda was pushed with source and, optionally,
@@ -445,8 +470,10 @@ export async function populatePrebuildPackages() {
     }
     availableSourcePackages.set(pkg, {
       dir: pkgDir,
-      modules,
-      dynamicallyDownloaded: false,
+      // Give this an infinite refcount so that it is never cleaned up
+      refcount: Infinity,
+      settled: true,
+      ready: Promise.resolve(modules),
     });
 
     if (
@@ -458,7 +485,9 @@ export async function populatePrebuildPackages() {
       );
       availableExternalPackages.set(metadata.externalDepsStorageKey, {
         dir: pkgDir,
-        dynamicallyDownloaded: false,
+        refcount: Infinity,
+        settled: true,
+        ready: Promise.resolve(),
       });
     }
   }
@@ -501,24 +530,40 @@ function modulesFromMetadataJson(
   return modules;
 }
 
-// Delete all dynamically downloaded source packages.
+// Delete all unreferenced source packages.
 export async function cleanupSourcePackages() {
   for (const [key, local] of availableSourcePackages) {
-    if (local.dynamicallyDownloaded) {
+    if (local.settled && local.refcount === 0) {
       availableSourcePackages.delete(key);
-      await fs.promises.rm(local.dir, { recursive: true, force: true });
+      await removeDir(local.dir);
     }
   }
 }
 
-// Delete all external dependency packages. This doesn't distinguish between
-// prebuilt and non-prebuilt packages, like cleanupSourcePackages, since there
-// is no prebuild of external packages yet.
+// Delete all unreferenced external dependency packages.
 export async function cleanupExternalPackages() {
   for (const [key, pkg] of availableExternalPackages) {
-    if (pkg.dynamicallyDownloaded) {
+    if (pkg.settled && pkg.refcount === 0) {
       availableExternalPackages.delete(key);
-      await fs.promises.rm(pkg.dir, { recursive: true, force: true });
+      await removeDir(pkg.dir);
+    }
+  }
+}
+
+export class PackageRefcounts {
+  packages: { refcount: number }[];
+  constructor() {
+    this.packages = [];
+  }
+  adopt<T extends { refcount: number }>(pkg: T): T {
+    pkg.refcount += 1;
+    this.packages.push(pkg);
+    return pkg;
+  }
+  // TODO: use Symbol.dispose when on Node 24+
+  dispose() {
+    for (const pkg of this.packages) {
+      pkg.refcount -= 1;
     }
   }
 }

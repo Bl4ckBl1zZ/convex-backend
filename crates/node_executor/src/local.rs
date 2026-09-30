@@ -53,6 +53,7 @@ use crate::{
         EXECUTE_TIMEOUT_RESPONSE_JSON,
     },
     handle_node_executor_stream,
+    InvokeCompletion,
     NodeExecutorStreamPart,
 };
 
@@ -174,15 +175,14 @@ impl InnerLocalNodeExecutor {
             .await?;
         let version = String::from_utf8_lossy(&cmd.stdout);
 
-        if !version.starts_with("v18.")
-            && !version.starts_with("v20.")
+        if !version.starts_with("v20.")
             && !version.starts_with("v22.")
             && !version.starts_with("v24.")
         {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "DeploymentNotConfiguredForNodeActions",
                 "Deployment is not configured to deploy \"use node\" actions. \
-                 Node.js v18, 20, 22, or 24 is not installed. \
+                 Node.js v20, 22, or 24 is not installed. \
                  Install a supported Node.js version with nvm (https://github.com/nvm-sh/nvm) \
                  to deploy Node.js actions."
             ))
@@ -314,15 +314,19 @@ pub(crate) async fn node_executor_response_stream(
                             anyhow::Ok(NodeExecutorStreamPart::Chunk(chunk))
                         }
                         None => {
-                            anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Ok(())))
+                            anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(
+                                InvokeCompletion::Success,
+                            ))
                         }
                     }
                 },
                 _ = timeout_future.fuse() => {
-                    anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(Err(InvokeResponse {
-                        response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
-                        aws_request_id: None,
-                    })))
+                    anyhow::Ok(NodeExecutorStreamPart::InvokeComplete(
+                        InvokeCompletion::ExplicitError(InvokeResponse {
+                            response: EXECUTE_TIMEOUT_RESPONSE_JSON.clone(),
+                            aws_request_id: None,
+                        }),
+                    ))
                 },
             }
         };

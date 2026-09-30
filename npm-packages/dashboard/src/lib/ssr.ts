@@ -6,7 +6,7 @@ import {
 } from "server/workos";
 import groupBy from "lodash/groupBy";
 import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
-import { TeamResponse, ProjectDetails } from "generatedApi";
+import { TeamResponse, ProjectDetails, MemberPreferences } from "generatedApi";
 import fetchRetryFactory from "fetch-retry";
 import { getGoogleAnalyticsClientId } from "hooks/fetching";
 
@@ -75,15 +75,6 @@ const getProps: GetServerSideProps<{
       "Google-Analytics-Client-Id": googleAnalyticsId,
     };
 
-    // Big Brain includes this metadata in account_created for ad-platform
-    // matching. Forward the browser values instead of the dashboard server's.
-    if (req.headers["x-forwarded-for"]) {
-      headers["x-forwarded-for"] = req.headers["x-forwarded-for"].toString();
-    }
-    if (req.headers["user-agent"]) {
-      headers["user-agent"] = req.headers["user-agent"];
-    }
-
     const resp = await retryingFetch(
       `${process.env.NEXT_PUBLIC_BIG_BRAIN_URL}/api/dashboard/member_data`,
       {
@@ -140,6 +131,7 @@ const getProps: GetServerSideProps<{
       projects,
       deployments,
       optInsToAccept,
+      preferences,
     }: {
       teams: TeamResponse[];
       projects: ProjectDetails[];
@@ -148,6 +140,7 @@ const getProps: GetServerSideProps<{
         optIn: string;
         message: string;
       }[];
+      preferences?: MemberPreferences;
     } = await resp.json();
     const { team, project, deploymentName } = query;
     if (team && !teams.find((t: TeamResponse) => t.slug === team.toString())) {
@@ -220,6 +213,7 @@ const getProps: GetServerSideProps<{
       ...initialProjectsByTeam,
       ...initialIndividualProjects,
       ...initialDeployments,
+      "/preferences": { preferences: preferences ?? {} },
     };
 
     if (optInsToAccept !== undefined) {

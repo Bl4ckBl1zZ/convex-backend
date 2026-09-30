@@ -1,12 +1,12 @@
 import { Meta, StoryObj } from "@storybook/nextjs";
-import { mocked } from "storybook/test";
-import { useEffect } from "react";
+import { mocked, screen, userEvent } from "storybook/test";
+import { useEffect, type ContextType } from "react";
 import type { FunctionReturnType } from "convex/server";
 import type { Value } from "convex/values";
 import udfs from "@common/udfs";
 import {
   DeploymentInfoContext,
-  useMaybeConnectedDeployment,
+  MaybeConnectedDeploymentContext,
 } from "@common/lib/deploymentContext";
 import { mockDeploymentInfo } from "@common/lib/mockDeploymentInfo";
 import { mockConvexReactClient } from "@common/lib/mockConvexReactClient";
@@ -26,11 +26,24 @@ import {
 import {
   useCurrentDeployment,
   useDeployments,
-  usePaginatedDeployments,
+  useInfiniteDeployments,
 } from "api/deployments";
 import { useProfile } from "api/profile";
-import type { PlatformDeploymentResponse } from "generatedApi";
-import { CommandPalette, useCommandPaletteOpen } from "./CommandPalette";
+import { ignoredDirectorySyncTeamsKey } from "hooks/useIgnoredDirectorySyncTeams";
+import {
+  useDirectorySyncOffers,
+  useJoinDirectorySyncedTeam,
+} from "api/directorySync";
+import type {
+  DirectorySyncOffer,
+  PlatformDeploymentResponse,
+} from "generatedApi";
+import {
+  CommandPalette,
+  useCommandPaletteAnchor,
+  useCommandPaletteInitialPages,
+  useCommandPaletteOpen,
+} from "./CommandPalette";
 
 const mockTeam = {
   id: 2,
@@ -93,6 +106,14 @@ const mockProfile = {
   email: "nicolas@acme.dev",
 };
 
+// A team the member isn't in, offered because its directory lists one of their
+// verified emails.
+const directorySyncOffer: DirectorySyncOffer = {
+  teamId: 14,
+  teamName: "Example Org",
+  email: "nicolas@example.org",
+};
+
 // The palette's open state lives in a global (so the header trigger can open
 // it from anywhere); flip it on when the story mounts so the dialog renders.
 function OpenCommandPalette() {
@@ -114,17 +135,23 @@ const meta = {
   },
   render: () => <OpenCommandPalette />,
   beforeEach: () => {
-    mocked(useLaunchDarkly).mockReturnValue({
-      ...flagDefaults,
-      commandPalette: true,
-      usageLimits: true,
-    });
+    mocked(useLaunchDarkly).mockReturnValue(flagDefaults);
     mocked(useTeams).mockReturnValue({
       selectedTeamSlug: mockTeam.slug,
       teams: [mockTeam],
     });
     mocked(useCurrentTeam).mockReturnValue(mockTeam);
     mocked(useProfile).mockReturnValue(mockProfile);
+    mocked(useDirectorySyncOffers).mockReturnValue([]);
+    // The ProjectSelector stories persist ignored offers to localStorage, which
+    // the test runner shares across stories; reset it so the offer still shows.
+    window.localStorage.removeItem(
+      ignoredDirectorySyncTeamsKey(mockProfile.id),
+    );
+    mocked(useJoinDirectorySyncedTeam).mockReturnValue(async () => ({
+      teamId: directorySyncOffer.teamId,
+      teamSlug: "example-org",
+    }));
     // These hooks are server-backed: their remote rows bypass the palette's
     // client-side filter, so the results must already reflect the query.
     // Filter the mock data by the search argument to match that behavior —
@@ -138,6 +165,7 @@ const meta = {
         return {
           projects,
           isLoading: false,
+          isLoadingMore: false,
           hasMore: false,
           loadMore: () => {},
           debouncedQuery: searchQuery,
@@ -145,19 +173,27 @@ const meta = {
         };
       },
     );
-    mocked(usePaginatedDeployments).mockImplementation((_teamId, options) => {
-      const q = (options?.q ?? "").trim().toLowerCase();
-      const items = [devDeployment].filter(
-        (d) =>
-          !q ||
-          `${"reference" in d ? d.reference : ""} ${d.name}`
-            .toLowerCase()
-            .includes(q),
-      );
-      return { items, isLoading: false } as ReturnType<
-        typeof usePaginatedDeployments
-      >;
-    });
+    mocked(useInfiniteDeployments).mockImplementation(
+      (_teamId, searchQuery = "") => {
+        const q = searchQuery.trim().toLowerCase();
+        const deployments = [devDeployment].filter(
+          (d) =>
+            !q ||
+            `${"reference" in d ? d.reference : ""} ${d.name}`
+              .toLowerCase()
+              .includes(q),
+        );
+        return {
+          deployments,
+          isLoading: false,
+          isLoadingMore: false,
+          hasMore: false,
+          loadMore: () => {},
+          debouncedQuery: searchQuery,
+          pageSize: 25,
+        };
+      },
+    );
     mocked(useDeployments).mockReturnValue({
       deployments: [devDeployment],
       isLoading: false,
@@ -212,6 +248,131 @@ export const TeamLevel: Story = {
   beforeEach: () => {
     mocked(useCurrentProject).mockReturnValue(undefined);
     mocked(useCurrentDeployment).mockReturnValue(undefined);
+  },
+};
+
+export const SearchLoading: Story = {
+  parameters: InsideDeployment.parameters,
+  beforeEach: () => {
+    mocked(useCurrentProject).mockReturnValue(mockProject);
+    mocked(useCurrentDeployment).mockReturnValue(devDeployment);
+    const pending = {
+      isLoading: true,
+      isLoadingMore: false,
+      hasMore: false,
+      loadMore: () => {},
+      debouncedQuery: "",
+    };
+    mocked(useInfiniteProjects).mockReturnValue({
+      ...pending,
+      projects: [],
+      pageSize: 20,
+    });
+    mocked(useInfiniteDeployments).mockReturnValue({
+      ...pending,
+      deployments: [],
+      pageSize: 25,
+    });
+  },
+  play: async () => {
+    await userEvent.type(await screen.findByRole("combobox"), "checkout");
+  },
+};
+
+// --- Switch Team page --------------------------------------------------------
+
+// The palette drilled onto its "Switch Team" page.
+function SwitchTeamPalette() {
+  const [, setOpen] = useCommandPaletteOpen();
+  const [, setInitialPages] = useCommandPaletteInitialPages();
+  useEffect(() => {
+    setInitialPages([{ type: "teams" }]);
+    setOpen(true);
+    return () => setOpen(false);
+  }, [setOpen, setInitialPages]);
+  return <CommandPalette />;
+}
+
+// Teams the member can join without an invitation get their own "Available
+// Teams" section above the ones they belong to, as dashed "Join <team>"
+// entries. Selecting one opens the join prompt (see the ProjectSelector
+// stories, which mount that modal the way `_app` does).
+export const SwitchTeamWithJoinOffer: Story = {
+  parameters: TeamLevel.parameters,
+  render: () => <SwitchTeamPalette />,
+  beforeEach: () => {
+    mocked(useCurrentProject).mockReturnValue(undefined);
+    mocked(useCurrentDeployment).mockReturnValue(undefined);
+    mocked(useDirectorySyncOffers).mockReturnValue([directorySyncOffer]);
+  },
+};
+
+// --- Deployment menu (the header's deployment switcher) ----------------------
+
+// The deployment switcher in the header opens the palette anchored beneath its
+// trigger, drilled straight onto the project's "Switch Deployment" page. This
+// renders that anchored menu the way it appears in the app: a compact popover
+// attached under a stand-in trigger, showing the Project Settings shortcut
+// (contextual), the create-deployment actions, and the project's deployments.
+function DeploymentSwitcherMenu() {
+  const [, setOpen] = useCommandPaletteOpen();
+  const [, setAnchor] = useCommandPaletteAnchor();
+  const [, setInitialPages] = useCommandPaletteInitialPages();
+  useEffect(() => {
+    setInitialPages([{ type: "deployments", project: mockProject }]);
+    setAnchor({ left: 16, top: 56, source: "deployment-switcher" });
+    setOpen(true);
+    return () => {
+      setOpen(false);
+      setAnchor(null);
+    };
+  }, [setOpen, setAnchor, setInitialPages]);
+  return (
+    <div className="h-screen bg-background-primary">
+      <div className="flex h-14 items-center border-b bg-background-secondary px-4">
+        <div className="flex h-9 items-center gap-2 rounded-full border bg-background-primary px-4 text-sm font-medium text-content-primary">
+          <span className="font-mono font-normal">dev/nicolas</span>
+        </div>
+      </div>
+      <CommandPalette />
+    </div>
+  );
+}
+
+// The Switch Deployment menu anchored under the header's deployment switcher.
+export const DeploymentMenu: Story = {
+  parameters: {
+    nextjs: {
+      router: {
+        pathname: "/t/[team]/[project]/[deploymentName]/data",
+        route: "/t/[team]/[project]/[deploymentName]/data",
+        asPath: "/t/acme/my-amazing-app/happy-capybara-123/data",
+        query: {
+          team: "acme",
+          project: "my-amazing-app",
+          deploymentName: "happy-capybara-123",
+        },
+      },
+    },
+  },
+  render: () => <DeploymentSwitcherMenu />,
+  beforeEach: () => {
+    mocked(useCurrentProject).mockReturnValue(mockProject);
+    mocked(useCurrentDeployment).mockReturnValue(devDeployment);
+  },
+};
+
+// A project with nothing provisioned yet: the menu is just the two dashed
+// create-deployment placeholders.
+export const DeploymentMenuNothingProvisioned: Story = {
+  ...DeploymentMenu,
+  beforeEach: () => {
+    mocked(useCurrentProject).mockReturnValue(mockProject);
+    mocked(useCurrentDeployment).mockReturnValue(undefined);
+    mocked(useDeployments).mockReturnValue({
+      deployments: [],
+      isLoading: false,
+    });
   },
 };
 
@@ -289,6 +450,16 @@ const modules: [string, Module][] = [
       sourcePackageId: "storybook",
     },
   ],
+  [
+    "http",
+    {
+      functions: [
+        makeAnalyzedFunction("GET /messages", "HttpAction"),
+        makeAnalyzedFunction("POST /webhooks/stripe", "HttpAction"),
+      ],
+      sourcePackageId: "storybook",
+    },
+  ],
 ];
 
 const components = [
@@ -306,6 +477,10 @@ const dataPlaneClient = mockConvexReactClient()
   .registerQueryFake(udfs.getTableMapping.default, () => TABLE_MAPPING)
   .registerQueryFake(udfs.modules.list, () => modules)
   .registerQueryFake(udfs.components.list, () => components)
+  .registerQueryFake(
+    udfs.convexSiteUrl.default,
+    () => "https://happy-capybara-123.convex.site",
+  )
   .registerQueryFake(udfs.fileStorageV2.getFile, ({ storageId }) =>
     storageId === STORAGE_ID ? storageFile : null,
   )
@@ -327,7 +502,7 @@ const connectedDeployment = {
   deploymentName: devDeployment.name,
   loading: false,
   errorKind: "None",
-} as ReturnType<typeof useMaybeConnectedDeployment>;
+} as ContextType<typeof MaybeConnectedDeploymentContext>;
 
 // A backdrop listing example IDs to copy into the palette, since the palette
 // looks documents up by their (unguessable) ID.
@@ -365,8 +540,10 @@ function ExampleIdsBackdrop() {
 function DataDeploymentPalette() {
   return (
     <DeploymentInfoContext.Provider value={deploymentInfo}>
-      <ExampleIdsBackdrop />
-      <OpenCommandPalette />
+      <MaybeConnectedDeploymentContext.Provider value={connectedDeployment}>
+        <ExampleIdsBackdrop />
+        <OpenCommandPalette />
+      </MaybeConnectedDeploymentContext.Provider>
     </DeploymentInfoContext.Provider>
   );
 }
@@ -389,7 +566,6 @@ const dataDeploymentRouter = {
 function setupDataDeployment() {
   mocked(useCurrentProject).mockReturnValue(mockProject);
   mocked(useCurrentDeployment).mockReturnValue(devDeployment);
-  mocked(useMaybeConnectedDeployment).mockReturnValue(connectedDeployment);
 }
 
 // Interactive: the palette wired to a mock deployment. Search a table or

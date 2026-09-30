@@ -21,6 +21,7 @@ use application::{
     log_visibility::RedactLogsToClient,
     Application,
     QueryCache,
+    SourceMapCache,
 };
 use common::{
     self,
@@ -113,8 +114,10 @@ use search::{
     SegmentTermMetadataFetcher,
 };
 use serde::Serialize;
+pub use sync::subscription_reconnect::SubscriptionReconnectRateLimiter;
 
 pub mod admin;
+mod ai_gateway;
 mod app_metrics;
 mod args_structs;
 pub mod authentication;
@@ -174,6 +177,7 @@ impl LocalAppState {
 pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
+    pub subscription_reconnect_rate_limiter: Option<Arc<SubscriptionReconnectRateLimiter>>,
 }
 
 #[derive(Serialize)]
@@ -236,6 +240,7 @@ pub async fn make_app(
             Quota::per_second(*DOCUMENT_RETENTION_RATE_LIMIT),
         )),
         deleted_tablet_sender,
+        config.name(),
     )
     .await?;
     initialize_application_system_tables(&database).await?;
@@ -339,6 +344,11 @@ pub async fn make_app(
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,
         oidc_http_client,
+        Some(Arc::new(ai_gateway::LocalAiGatewayTokenMinter::new(
+            config.control_plane_url.clone(),
+            config.control_plane_access_token.clone(),
+        ))),
+        SourceMapCache::new(runtime.clone()),
     )
     .await?;
 
