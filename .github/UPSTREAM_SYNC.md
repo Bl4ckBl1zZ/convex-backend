@@ -4,8 +4,8 @@
 [`get-convex/convex-backend`](https://github.com/get-convex/convex-backend). The
 fork carries self-hosting, scaling, and benchmarking work that upstream does not
 have, and upstream ships ~10 commits a day.
-`.github/workflows/upstream-sync.yml` merges upstream into this fork every day
-and opens a pull request.
+`.github/workflows/upstream-sync.yml` merges upstream into this fork every other
+day and opens a pull request.
 
 This document is the specification that merge follows. It is read by humans and
 by the automated conflict resolver, so keep it accurate: if you add a change to
