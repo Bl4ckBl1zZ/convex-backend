@@ -61,7 +61,8 @@ pub use database_index_workers::{
     IndexWorker,
 };
 pub use execution_size::{
-    FileStorageSize,
+    FileStorageReadSize,
+    FileStorageWriteSize,
     FunctionExecutionSize,
     TransactionLimits,
 };
@@ -89,6 +90,7 @@ pub use table_iteration::{
         DataSyncIterator,
         DataSyncStatus,
     },
+    LatestTableIterator,
     MultiTableIterator,
     TableIterator,
     TableScanCursor,
@@ -169,7 +171,6 @@ pub use self::{
             SCHEMA_STATE_FIELD,
         },
         schema_validation_progress::{
-            legacy::LegacySchemaValidationProgressMetadata,
             types::SchemaValidationProgress,
             SchemaValidationProgressModel,
             SchemaValidationProgressTable,
