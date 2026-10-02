@@ -83,6 +83,13 @@ services:
       # Without headroom, isolates restart after most requests
       # (TooMuchMemoryCarryOver).
       ISOLATE_MAX_HEAP_EXTRA_SIZE: ${ISOLATE_MAX_HEAP_EXTRA_SIZE:-134217728}
+      # Each isolate worker keeps its own V8 heap (roughly 50-70 MB at 5,000 bots)
+      # and the defaults allow 300, 120 of them for queries and mutations.
+      # Peak memory grew with the pools: 72 + 64 workers (64 V8 action slots)
+      # hit the 12g limit, 40 + 40 (32 slots) peaked at 7.8 GB. Requests
+      # beyond the pool wait in the isolate queue.
+      MAX_TRANSACTION_ISOLATE_WORKERS: ${MAX_TRANSACTION_ISOLATE_WORKERS:-48}
+      MAX_ACTION_ISOLATE_WORKERS: ${MAX_ACTION_ISOLATE_WORKERS:-40}
       LOCAL_NODE_EXECUTOR_POOL_SIZE: ${LOCAL_NODE_EXECUTOR_POOL_SIZE:-4}
       MAX_BYTES_WRITTEN_PER_SECOND: ${MAX_BYTES_WRITTEN_PER_SECOND:-16777216}
       IN_PROCESS_SEARCH_CACHE_PATH: /convex/data/search-cache
