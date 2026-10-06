@@ -150,6 +150,7 @@ use serde::{
     Serialize,
 };
 use sync_types::{
+    module_path::InvalidModulePathError,
     CanonicalizedModulePath,
     ModulePath,
 };
@@ -786,6 +787,13 @@ impl<RT: Runtime> Application<RT> {
                 let internal_id = match (existing, allocated) {
                     (None, Some(id)) => *id,
                     (Some(doc), None) => doc.id().into(),
+                    (Some(doc), Some(id)) if doc.developer_id() == *id => *id,
+                    // A concurrent push created this component with a different namespace.
+                    // The CLI retries the push on a 409.
+                    (Some(_), Some(_)) => anyhow::bail!(ErrorMetadata::conflict(
+                        "RaceDetected",
+                        format!("Component {component_path} was created by a concurrent push"),
+                    )),
                     r => anyhow::bail!("Invalid existing component state: {r:?}"),
                 };
                 ComponentId::Child(internal_id)
@@ -1248,7 +1256,7 @@ impl StartPushRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StartPushResponse {
     // We read the current environment variables when evaluating the definitions, so we need to
     // cancel the push if they change before the commit point.
@@ -1645,9 +1653,8 @@ pub fn parse_module_environment(
 }
 
 pub fn parse_module_path(path: &str) -> anyhow::Result<ModulePath> {
-    path.parse().map_err(|e: anyhow::Error| {
-        let msg = format!("{path} is not a valid path to a Convex module. {e}");
-        e.context(ErrorMetadata::bad_request("BadConvexModuleIdentifier", msg))
+    path.parse().map_err(|e: InvalidModulePathError| {
+        ErrorMetadata::bad_request("BadConvexModuleIdentifier", e.to_string()).into()
     })
 }
 
