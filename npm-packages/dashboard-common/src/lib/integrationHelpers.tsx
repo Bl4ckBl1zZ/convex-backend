@@ -292,13 +292,9 @@ export const STREAMING_EXPORT_DESCRIPTION = (
 export const ANALYTICS_EXPORT_DESCRIPTION = (
   <div>
     <p>
-      Keep a mirror of this deployment's data in object storage, in Apache
-      Iceberg format, so it can be queried by analytics engines like DuckDB,
-      ClickHouse, Databricks, and Snowflake.
-    </p>
-    <p>
-      The mirror is refreshed on the schedule you pick and lags the deployment
-      by up to that interval.
+      Export this deployment's change log to an S3 bucket you own as Apache
+      Iceberg tables, queryable from Athena, Snowflake, Databricks, and other
+      engines through AWS Glue.
     </p>
   </div>
 );
@@ -405,7 +401,7 @@ export const integrationName = (kind: IntegrationType) => {
     case "postHogErrorTracking":
       return "PostHog Error Tracking";
     case "s3Export":
-      return "Streaming Export to AWS S3";
+      return "AWS S3";
     default:
       return kind.charAt(0).toUpperCase() + kind.slice(1);
   }
