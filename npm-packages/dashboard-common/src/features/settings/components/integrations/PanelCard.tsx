@@ -34,6 +34,7 @@ import { FivetranSyncStatus } from "./FivetranSyncProgress";
 import { IntegrationTitle } from "./IntegrationTitle";
 import { IntegrationOverflowMenu } from "./IntegrationOverflowMenu";
 import { IntegrationStatus } from "./IntegrationStatus";
+import { S3ExportStatus } from "./S3ExportStatus";
 import { AxiomConfigurationForm } from "./AxiomConfigurationForm";
 import { DatadogConfigurationForm } from "./DatadogConfigurationForm";
 import { SentryConfigurationForm } from "./SentryConfigurationForm";
@@ -62,6 +63,8 @@ export type PanelCardProps = {
    *  members without write access can see what's available. */
   writeDisabled?: boolean;
   writeDisabledTip?: React.ReactNode;
+  configureDisabled?: boolean;
+  configureDisabledTip?: React.ReactNode;
 };
 
 function ProBadge({ teamSlug }: { teamSlug?: string }) {
@@ -90,6 +93,8 @@ export function PanelCard({
   onAddedIntegration,
   writeDisabled = false,
   writeDisabledTip,
+  configureDisabled,
+  configureDisabledTip,
 }: PanelCardProps) {
   const classes = classNames(
     "py-3 px-4",
@@ -187,7 +192,11 @@ export function PanelCard({
             }
           />
           <div className="flex items-center gap-4">
-            <IntegrationStatus integration={integration} />
+            {integration.kind === "s3Export" && integration.existing ? (
+              <S3ExportStatus existing={integration.existing} />
+            ) : (
+              <IntegrationStatus integration={integration} />
+            )}
             {unavailableReason === "MissingEntitlement" ? (
               <ProBadge teamSlug={teamSlug} />
             ) : (
@@ -196,6 +205,8 @@ export function PanelCard({
                 onConfigure={() => setIsModalOpen(true)}
                 disabled={writeDisabled}
                 disabledTip={writeDisabledTip}
+                configureDisabled={configureDisabled}
+                configureDisabledTip={configureDisabledTip}
               />
             )}
           </div>
@@ -345,8 +356,8 @@ function renderForm(
       return (
         <LogIntegrationSidePanel
           closeModal={closeModal}
-          title="Configure Streaming Export to AWS S3"
-          description="Mirror this deployment's data into an S3 bucket you own, in Apache Iceberg format, so it can be queried by your analytics engine."
+          title="Configure AWS S3"
+          description="Export this deployment's change log to an S3 bucket you own."
         >
           {(closePanel) => (
             <S3ExportConfigurationForm

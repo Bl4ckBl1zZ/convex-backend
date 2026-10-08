@@ -76,6 +76,10 @@ use model::{
         ModuleSource,
         SourceMap,
     },
+    source_packages::{
+        types::SourcePackage,
+        upload_download::download_package,
+    },
     udf_config::types::UdfConfig,
 };
 use rand::Rng;
@@ -163,6 +167,15 @@ pub trait StorageForDeployment<RT: Runtime>: Debug + Clone + Send + Sync + 'stat
         transaction: &mut Transaction<RT>,
         use_case: StorageUseCase,
     ) -> anyhow::Result<Arc<dyn Storage>>;
+
+    /// Reads a source package's modules out of `modules_storage`.
+    async fn download_package(
+        &self,
+        modules_storage: Arc<dyn Storage>,
+        source_package: &SourcePackage,
+    ) -> anyhow::Result<BTreeMap<CanonicalizedModulePath, ModuleConfig>> {
+        download_package(modules_storage, source_package).await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -368,6 +381,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 cache: self.module_cache.clone(),
                 code_cache: self.code_cache.clone(),
                 modules_storage,
+                storage: self.storage.clone(),
             }),
             deployment,
         };
