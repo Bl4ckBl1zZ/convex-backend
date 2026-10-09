@@ -1,43 +1,7 @@
 services:
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    init: true
-    shm_size: 1gb
-    mem_limit: 6g
-    command:
-      - postgres
-      - -c
-      - config_file=/etc/postgresql/postgresql.dokploy.conf
-    environment:
-      POSTGRES_DB: convex_self_hosted
-      POSTGRES_USER: convex
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-      POSTGRES_INITDB_ARGS: --data-checksums --locale=C --encoding=UTF8
-    volumes:
-      - postgres17_data:/var/lib/postgresql/data
-      - ./postgresql.dokploy.conf:/etc/postgresql/postgresql.dokploy.conf:ro
-      - ./postgres-autovacuum.sql:/opt/convex/postgres-autovacuum.sql:ro
-      - ./postgres-autovacuum-health.sql:/opt/convex/postgres-autovacuum-health.sql:ro
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U convex -d convex_self_hosted && psql -U convex -d
-          convex_self_hosted -Atqc 'SELECT 1' >/dev/null",
-        ]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 15s
-    logging:
-      options:
-        max-size: 100m
-        max-file: "5"
-
-  # PostgreSQL 18 (Debian/glibc image). Holds the live database; `postgres`
-  # above is the PostgreSQL 17 copy it was migrated from, kept read-only for
-  # rollback until it is removed.
+  # PostgreSQL 18 (Debian/glibc image). The service keeps the name it had
+  # during the migration from PostgreSQL 17: renaming it would recreate the
+  # container on the same volume.
   postgres18:
     image: postgres:18.6-trixie
     restart: unless-stopped
@@ -74,28 +38,6 @@ services:
       options:
         max-size: 100m
         max-file: "5"
-
-  # Copies convex_self_hosted from `postgres` (17) to `postgres18` once; a
-  # no-op on later deploys. See pg18-migrate.sh.
-  pg18-migrate:
-    image: postgres:18.6-trixie
-    restart: "no"
-    init: true
-    depends_on:
-      postgres:
-        condition: service_healthy
-      postgres18:
-        condition: service_healthy
-    environment:
-      PGUSER: convex
-      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-    volumes:
-      - ./pg18-migrate.sh:/opt/convex/pg18-migrate.sh:ro
-    command: ["/bin/sh", "/opt/convex/pg18-migrate.sh"]
-    logging:
-      options:
-        max-size: 50m
-        max-file: "3"
 
   backend:
     image: ${CONVEX_BACKEND_IMAGE:-ghcr.io/bl4ckbl1zz/convex-backend:latest}
@@ -143,8 +85,6 @@ services:
     depends_on:
       postgres18:
         condition: service_healthy
-      pg18-migrate:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:3210/version >/dev/null"]
       interval: 10s
@@ -208,6 +148,5 @@ services:
         max-file: "3"
 
 volumes:
-  postgres17_data:
   postgres18_data:
   convex_data:
