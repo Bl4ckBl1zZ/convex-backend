@@ -9,7 +9,6 @@
 
 use std::{
     num::NonZeroU64,
-    path::PathBuf,
     sync::LazyLock,
 };
 
@@ -59,23 +58,6 @@ fn calculate_vertical_search_default(
     // established compatibility default on a medium-sized host.
     cpu_derived.max(compatibility_default.min(maximum))
 }
-
-/// Directory used by the in-process searcher's on-disk segment cache. An empty
-/// value keeps the existing temporary-directory behavior.
-pub static IN_PROCESS_SEARCH_CACHE_PATH: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
-    let path = env_config("IN_PROCESS_SEARCH_CACHE_PATH", String::new());
-    (!path.is_empty()).then(|| PathBuf::from(path))
-});
-
-/// Maximum size of the in-process searcher's on-disk segment cache. Defaults to
-/// upstream's `MAX_ARCHIVE_CACHE_SIZE_BYTES`.
-pub static IN_PROCESS_SEARCH_CACHE_SIZE_BYTES: LazyLock<u64> = LazyLock::new(|| {
-    env_config(
-        "IN_PROCESS_SEARCH_CACHE_SIZE_BYTES",
-        MAX_ARCHIVE_CACHE_SIZE_BYTES.get(),
-    )
-    .max(1)
-});
 
 /// Maximum number of general-purpose blocking search tasks running at once.
 pub static SEARCH_GENERAL_POOL_MAX_CONCURRENCY: LazyLock<usize> = LazyLock::new(|| {
