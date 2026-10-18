@@ -4,74 +4,126 @@
 -- bound as the tables scale. Non-zero thresholds avoid constant maintenance on
 -- tiny development databases. TOAST is tuned separately because Convex document
 -- payloads can be much larger than their heap tuples.
+--
+-- The maintenance sidecar runs this file repeatedly. `ALTER TABLE ... SET` and
+-- `ANALYZE` both take a lock that cancels a running autovacuum on the table, so
+-- options are only written when they differ from what is already set, a table
+-- is only analyzed explicitly if it has never been analyzed, and a table that
+-- is being vacuumed right now is left for the next run.
 
-DO $tuning$
+CREATE FUNCTION pg_temp.apply_autovacuum_profile(
+  rel text,
+  heap_options text[],
+  toast_options text[] DEFAULT '{}'
+) RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+  heap_current text[];
+  toast_current text[];
+  assignments text;
 BEGIN
-  IF to_regclass('public.documents') IS NOT NULL THEN
-    ALTER TABLE public.documents SET (
-      autovacuum_vacuum_threshold = 1000,
-      autovacuum_vacuum_scale_factor = 0.001,
-      autovacuum_vacuum_insert_threshold = 1000,
-      autovacuum_vacuum_insert_scale_factor = 0.001,
-      autovacuum_analyze_threshold = 500,
-      autovacuum_analyze_scale_factor = 0.0005,
-      autovacuum_vacuum_cost_limit = 3000,
-      autovacuum_vacuum_cost_delay = 1,
-      toast.autovacuum_vacuum_threshold = 1000,
-      toast.autovacuum_vacuum_scale_factor = 0.001,
-      toast.autovacuum_vacuum_cost_limit = 3000,
-      toast.autovacuum_vacuum_cost_delay = 1
-    );
+  IF to_regclass(rel) IS NULL THEN
+    RETURN;
   END IF;
 
-  IF to_regclass('public.indexes') IS NOT NULL THEN
-    ALTER TABLE public.indexes SET (
-      autovacuum_vacuum_threshold = 1000,
-      autovacuum_vacuum_scale_factor = 0.001,
-      autovacuum_vacuum_insert_threshold = 1000,
-      autovacuum_vacuum_insert_scale_factor = 0.001,
-      autovacuum_analyze_threshold = 500,
-      autovacuum_analyze_scale_factor = 0.0005,
-      autovacuum_vacuum_cost_limit = 3000,
-      autovacuum_vacuum_cost_delay = 1,
-      toast.autovacuum_vacuum_threshold = 1000,
-      toast.autovacuum_vacuum_scale_factor = 0.001,
-      toast.autovacuum_vacuum_cost_limit = 3000,
-      toast.autovacuum_vacuum_cost_delay = 1
-    );
+  SELECT coalesce(c.reloptions, '{}'), coalesce(t.reloptions, '{}')
+  INTO heap_current, toast_current
+  FROM pg_class c
+  LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+  WHERE c.oid = rel::regclass;
+
+  IF heap_current @> heap_options AND toast_current @> toast_options THEN
+    RETURN;
   END IF;
 
-  IF to_regclass('public.persistence_globals') IS NOT NULL THEN
-    ALTER TABLE public.persistence_globals SET (
-      autovacuum_vacuum_threshold = 10,
-      autovacuum_vacuum_scale_factor = 0,
-      autovacuum_analyze_threshold = 10,
-      autovacuum_analyze_scale_factor = 0
-    );
+  IF EXISTS (SELECT 1 FROM pg_stat_progress_vacuum WHERE relid = rel::regclass) THEN
+    RAISE NOTICE '% is being vacuumed; autovacuum options will be applied on the next run', rel;
+    RETURN;
   END IF;
 
-  IF to_regclass('public.leases') IS NOT NULL THEN
-    ALTER TABLE public.leases SET (
-      autovacuum_vacuum_threshold = 10,
-      autovacuum_vacuum_scale_factor = 0,
-      autovacuum_analyze_threshold = 10,
-      autovacuum_analyze_scale_factor = 0
-    );
-  END IF;
+  SELECT string_agg(o, ', ')
+  INTO assignments
+  FROM (
+    SELECT unnest(heap_options) AS o
+    UNION ALL
+    SELECT 'toast.' || unnest(toast_options)
+  ) options;
 
-  IF to_regclass('public.read_only') IS NOT NULL THEN
-    ALTER TABLE public.read_only SET (
-      autovacuum_vacuum_threshold = 10,
-      autovacuum_vacuum_scale_factor = 0,
-      autovacuum_analyze_threshold = 10,
-      autovacuum_analyze_scale_factor = 0
-    );
-  END IF;
+  EXECUTE format('ALTER TABLE %s SET (%s)', rel, assignments);
 END
-$tuning$;
+$fn$;
 
-ANALYZE public.documents;
-ANALYZE public.indexes;
-ANALYZE public.persistence_globals;
-ANALYZE public.leases;
-ANALYZE public.read_only;
+SELECT pg_temp.apply_autovacuum_profile(
+  'public.documents',
+  ARRAY[
+    'autovacuum_vacuum_threshold=1000',
+    'autovacuum_vacuum_scale_factor=0.001',
+    'autovacuum_vacuum_insert_threshold=1000',
+    'autovacuum_vacuum_insert_scale_factor=0.001',
+    'autovacuum_analyze_threshold=500',
+    'autovacuum_analyze_scale_factor=0.0005',
+    'autovacuum_vacuum_cost_limit=3000',
+    'autovacuum_vacuum_cost_delay=1'
+  ],
+  ARRAY[
+    'autovacuum_vacuum_threshold=1000',
+    'autovacuum_vacuum_scale_factor=0.001',
+    'autovacuum_vacuum_cost_limit=3000',
+    'autovacuum_vacuum_cost_delay=1'
+  ]
+);
+
+SELECT pg_temp.apply_autovacuum_profile(
+  'public.indexes',
+  ARRAY[
+    'autovacuum_vacuum_threshold=1000',
+    'autovacuum_vacuum_scale_factor=0.001',
+    'autovacuum_vacuum_insert_threshold=1000',
+    'autovacuum_vacuum_insert_scale_factor=0.001',
+    'autovacuum_analyze_threshold=500',
+    'autovacuum_analyze_scale_factor=0.0005',
+    'autovacuum_vacuum_cost_limit=3000',
+    'autovacuum_vacuum_cost_delay=1'
+  ],
+  ARRAY[
+    'autovacuum_vacuum_threshold=1000',
+    'autovacuum_vacuum_scale_factor=0.001',
+    'autovacuum_vacuum_cost_limit=3000',
+    'autovacuum_vacuum_cost_delay=1'
+  ]
+);
+
+SELECT pg_temp.apply_autovacuum_profile(
+  rel,
+  ARRAY[
+    'autovacuum_vacuum_threshold=10',
+    'autovacuum_vacuum_scale_factor=0',
+    'autovacuum_analyze_threshold=10',
+    'autovacuum_analyze_scale_factor=0'
+  ]
+)
+FROM unnest(ARRAY[
+  'public.persistence_globals',
+  'public.leases',
+  'public.read_only'
+]) AS rel;
+
+DO $analyze$
+DECLARE
+  rel text;
+BEGIN
+  FOR rel IN
+    SELECT format('%I.%I', schemaname, relname)
+    FROM pg_stat_user_tables
+    WHERE schemaname = 'public'
+      AND relname IN ('documents', 'indexes', 'persistence_globals', 'leases', 'read_only')
+      AND last_analyze IS NULL
+      AND last_autoanalyze IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_stat_progress_vacuum p WHERE p.relid = pg_stat_user_tables.relid
+      )
+  LOOP
+    EXECUTE 'ANALYZE ' || rel;
+  END LOOP;
+END
+$analyze$;

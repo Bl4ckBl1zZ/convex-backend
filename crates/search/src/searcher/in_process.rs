@@ -1,11 +1,8 @@
+use std::collections::BTreeMap;
 /// Searcher trait and implementations
 /// - Stub implementation
 /// - InProcessSearcher implementation
-use std::{
-    collections::BTreeMap,
-    fs,
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::{
@@ -42,15 +39,12 @@ use super::{
         TokenMatch,
         TokenQuery,
     },
+    searchlight_knobs::MAX_ARCHIVE_CACHE_SIZE_BYTES,
     FragmentedTextStorageKeys,
     SearcherImpl,
     TermValue,
 };
 use crate::{
-    searcher::searchlight_knobs::{
-        IN_PROCESS_SEARCH_CACHE_PATH,
-        IN_PROCESS_SEARCH_CACHE_SIZE_BYTES,
-    },
     Searcher,
     SegmentTermMetadataFetcher,
 };
@@ -142,30 +136,21 @@ impl SegmentTermMetadataFetcher for SearcherStub {
 #[derive(Clone)]
 pub struct InProcessSearcher<RT: Runtime> {
     searcher: Arc<SearcherImpl<RT>>,
-    _tmpdir: Option<Arc<TempDir>>,
+    _tmpdir: Arc<TempDir>,
 }
 
 impl<RT: Runtime> InProcessSearcher<RT> {
     pub fn new(runtime: RT) -> anyhow::Result<Self> {
-        let (cache_path, tmpdir) = match &*IN_PROCESS_SEARCH_CACHE_PATH {
-            Some(path) => {
-                fs::create_dir_all(path)?;
-                (path.clone(), None)
-            },
-            None => {
-                let tmpdir = Arc::new(TempDir::new()?);
-                (tmpdir.path().to_owned(), Some(tmpdir))
-            },
-        };
+        let tmpdir = TempDir::new()?;
         Ok(Self {
             searcher: Arc::new(SearcherImpl::new(
-                cache_path,
-                *IN_PROCESS_SEARCH_CACHE_SIZE_BYTES,
+                tmpdir.path(),
+                MAX_ARCHIVE_CACHE_SIZE_BYTES.get(),
                 100,
                 false,
                 runtime,
             )?),
-            _tmpdir: tmpdir,
+            _tmpdir: Arc::new(tmpdir),
         })
     }
 }

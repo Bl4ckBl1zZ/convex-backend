@@ -40,7 +40,6 @@ use common::{
         IndexKeyBytes,
     },
     interval::Interval,
-    knobs::IN_MEMORY_INDEX_LOAD_CONCURRENCY,
     persistence::PersistenceSnapshot,
     query::Order,
     static_span,
@@ -55,11 +54,7 @@ use common::{
     },
     value::Size,
 };
-use futures::{
-    stream,
-    StreamExt,
-    TryStreamExt,
-};
+use futures::TryStreamExt;
 use imbl::{
     OrdMap,
     OrdSet,
@@ -145,44 +140,10 @@ impl BackendInMemoryIndexes {
         snapshot: &PersistenceSnapshot,
         tables: &BTreeSet<TableName>,
     ) -> anyhow::Result<()> {
-        let (indexes_by_table, indexes_to_load) =
-            self.group_indexes_to_load(index_registry, table_mapping, tables)?;
-        tracing::info!(
-            "Loading {} tables with {} indexes...",
-            indexes_by_table.len(),
-            indexes_to_load
-        );
-
-        let loaded_tables =
-            Self::load_index_maps_for_tables(indexes_by_table, snapshot.clone()).await?;
-        for (num_keys, total_bytes, index_maps) in loaded_tables {
-            for (index_id, index_map) in index_maps {
-                self.in_memory_indexes.insert(index_id, index_map);
-            }
-            tracing::debug!("Loaded {num_keys} keys, {total_bytes} bytes.");
-        }
-        Ok(())
-    }
-
-    fn group_indexes_to_load(
-        &self,
-        index_registry: &IndexRegistry,
-        table_mapping: &TableMapping,
-        tables: &BTreeSet<TableName>,
-    ) -> anyhow::Result<(
-        BTreeMap<TabletId, Vec<ParsedDocument<TabletIndexMetadata>>>,
-        usize,
-    )> {
         let enabled_indexes = index_registry.all_enabled_indexes();
         let mut indexes_by_table: BTreeMap<TabletId, Vec<_>> = BTreeMap::new();
         let mut indexes_to_load = 0;
         for index_metadata in enabled_indexes {
-            if self
-                .in_memory_indexes
-                .contains_key(&index_metadata.id().internal_id().into())
-            {
-                continue;
-            }
             let table_name = table_mapping.tablet_name(*index_metadata.name.table())?;
             if tables.contains(&table_name) {
                 match &index_metadata.config {
@@ -209,24 +170,18 @@ impl BackendInMemoryIndexes {
                 indexes_to_load += 1;
             }
         }
-        Ok((indexes_by_table, indexes_to_load))
-    }
-
-    async fn load_index_maps_for_tables(
-        indexes_by_table: BTreeMap<TabletId, Vec<ParsedDocument<TabletIndexMetadata>>>,
-        snapshot: PersistenceSnapshot,
-    ) -> anyhow::Result<Vec<(usize, usize, Vec<(IndexId, DatabaseIndexMap)>)>> {
-        let loaded_tables: Vec<_> = stream::iter(indexes_by_table)
-            .map(|(tablet_id, index_metadatas)| {
-                let snapshot = snapshot.clone();
-                async move {
-                    Self::build_enabled_index_maps(tablet_id, index_metadatas, &snapshot).await
-                }
-            })
-            .buffer_unordered(*IN_MEMORY_INDEX_LOAD_CONCURRENCY)
-            .try_collect()
-            .await?;
-        Ok(loaded_tables)
+        tracing::info!(
+            "Loading {} tables with {} indexes...",
+            indexes_by_table.len(),
+            indexes_to_load
+        );
+        for (tablet_id, index_metadatas) in indexes_by_table {
+            let (num_keys, total_bytes) = self
+                .load_enabled(tablet_id, index_metadatas, snapshot)
+                .await?;
+            tracing::debug!("Loaded {num_keys} keys, {total_bytes} bytes.");
+        }
+        Ok(())
     }
 
     #[fastrace::trace]
@@ -245,19 +200,6 @@ impl BackendInMemoryIndexes {
             // Already loaded in memory.
             return Ok((0, 0));
         }
-        let (num_keys, total_size, index_maps) =
-            Self::build_enabled_index_maps(tablet_id, indexes, snapshot).await?;
-        for (index_id, index_map) in index_maps {
-            self.in_memory_indexes.insert(index_id, index_map);
-        }
-        Ok((num_keys, total_size))
-    }
-
-    async fn build_enabled_index_maps(
-        tablet_id: TabletId,
-        indexes: Vec<ParsedDocument<TabletIndexMetadata>>,
-        snapshot: &PersistenceSnapshot,
-    ) -> anyhow::Result<(usize, usize, Vec<(IndexId, DatabaseIndexMap)>)> {
         for index in &indexes {
             anyhow::ensure!(
                 *index.name.table() == tablet_id,
@@ -313,12 +255,11 @@ impl BackendInMemoryIndexes {
             }
         }
 
-        let index_maps = indexes
-            .iter()
-            .zip(index_maps)
-            .map(|(index, index_map)| (index.id().internal_id().into(), index_map))
-            .collect();
-        Ok((num_keys, total_size, index_maps))
+        for (index, index_map) in indexes.iter().zip(index_maps) {
+            self.in_memory_indexes
+                .insert(index.id().internal_id().into(), index_map);
+        }
+        Ok((num_keys, total_size))
     }
 
     /// Insert enabled indexes for the given `tablet_id` with the provided,
@@ -431,6 +372,7 @@ impl BackendInMemoryIndexes {
             .get(&index_id)
             .map(|index_map| order.apply(index_map.range(interval)).collect()))
     }
+
 }
 
 /// Implementor of `InMemoryIndexes` if no indexes are available in-memory.

@@ -33,10 +33,7 @@ use common::{
     },
     errors::JsError,
     execution_context::RequestMetadata,
-    knobs::{
-        ASYNC_JOIN_CONCURRENCY,
-        FINISH_PUSH_MAX_OCC_FAILURES,
-    },
+    knobs::FINISH_PUSH_MAX_OCC_FAILURES,
     runtime::{
         try_join,
         Runtime,
@@ -78,12 +75,7 @@ use fastrace::{
     future::FutureExt as _,
     Span,
 };
-use futures::{
-    stream,
-    FutureExt,
-    StreamExt,
-    TryStreamExt,
-};
+use futures::FutureExt;
 use keybroker::Identity;
 use maplit::btreeset;
 use model::{
@@ -844,25 +836,11 @@ impl<RT: Runtime> Application<RT> {
     ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
         // Download all source packages. We can remove this once we don't store source
         // in the database.
-        let source_package_jobs = start_push
-            .component_definition_packages
-            .iter()
-            .map(|(definition_path, source_package)| {
-                (definition_path.clone(), source_package.clone())
-            })
-            .collect::<Vec<_>>();
-        let modules_storage = self.modules_storage().clone();
-        let downloaded_source_packages = stream::iter(source_package_jobs)
-            .map(move |(definition_path, source_package)| {
-                let storage = modules_storage.clone();
-                async move {
-                    let package = download_package(storage, &source_package).await?;
-                    anyhow::Ok((definition_path, package))
-                }
-            })
-            .buffer_unordered(*ASYNC_JOIN_CONCURRENCY)
-            .try_collect::<BTreeMap<_, _>>()
-            .await?;
+        let mut downloaded_source_packages = BTreeMap::new();
+        for (definition_path, source_package) in &start_push.component_definition_packages {
+            let package = download_package(self.modules_storage().clone(), source_package).await?;
+            downloaded_source_packages.insert(definition_path.clone(), package);
+        }
 
         // TODO(ENG-7533): Strip out exports from the `StartPushResponse` since we don't
         // want to actually store it in the database. Remove this path once

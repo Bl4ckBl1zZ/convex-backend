@@ -31,7 +31,6 @@ use common::{
     },
     knobs::{
         INDEX_CACHE_VERIFY_PERCENT,
-        INDEX_RANGE_BATCH_CONCURRENCY,
         MAX_TRANSACTION_CACHE_SIZE_BYTES,
     },
     query::{
@@ -446,7 +445,7 @@ impl DatabaseIndexSnapshot {
                 };
                 stream::iter(populate_cache)
             })
-            .buffer_unordered(*INDEX_RANGE_BATCH_CONCURRENCY)
+            .buffer_unordered(20)
             .flatten()
             .collect();
         let populate_cache_results: Vec<(IndexId, Vec<(Timestamp, PackedDocument)>, Interval)> =

@@ -9,7 +9,6 @@
   },
   "bin": "dist/scenario-runner.mjs",
   "dependencies": {
-    "@convex-dev/workflow": "^0.3.3",
     "@sentry/node": "^7.23.0",
     "convex": "workspace:*",
     "@sentry/tracing": "^7.23.0",

@@ -151,24 +151,9 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
             "concurrency_logger",
             concurrency_limiter.go_log(rt.clone(), ACTIVE_CONCURRENCY_PERMITS_LOG_FREQUENCY),
         );
-        // Transactions and actions run in separate worker pools so long-lived
-        // actions can't occupy the workers transactional functions need. Both
-        // pools share one CPU limiter.
-        let transaction_isolate_worker = FunctionRunnerIsolateWorker::new(
-            rt.clone(),
-            IsolateConfig::new("transaction_funrun", concurrency_limiter.clone()),
-        );
-        let action_isolate_worker = FunctionRunnerIsolateWorker::new(
-            rt.clone(),
-            IsolateConfig::new("action_funrun", concurrency_limiter),
-        );
-        let server = FunctionRunnerCore::new(
-            rt,
-            storage,
-            max_percent_per_client,
-            transaction_isolate_worker,
-            action_isolate_worker,
-        )?;
+        let isolate_config = IsolateConfig::new("funrun", concurrency_limiter);
+        let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
+        let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
         Ok(Self {
             server,
             persistence_reader,
