@@ -7,8 +7,9 @@
 --
 -- The maintenance sidecar runs this file repeatedly. `ALTER TABLE ... SET` and
 -- `ANALYZE` both take a lock that cancels a running autovacuum on the table, so
--- options are only written when they differ from what is already set, and a
--- table is only analyzed explicitly if it has never been analyzed.
+-- options are only written when they differ from what is already set, a table
+-- is only analyzed explicitly if it has never been analyzed, and a table that
+-- is being vacuumed right now is left for the next run.
 
 CREATE FUNCTION pg_temp.apply_autovacuum_profile(
   rel text,
@@ -32,6 +33,11 @@ BEGIN
   WHERE c.oid = rel::regclass;
 
   IF heap_current @> heap_options AND toast_current @> toast_options THEN
+    RETURN;
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM pg_stat_progress_vacuum WHERE relid = rel::regclass) THEN
+    RAISE NOTICE '% is being vacuumed; autovacuum options will be applied on the next run', rel;
     RETURN;
   END IF;
 
@@ -113,6 +119,9 @@ BEGIN
       AND relname IN ('documents', 'indexes', 'persistence_globals', 'leases', 'read_only')
       AND last_analyze IS NULL
       AND last_autoanalyze IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_stat_progress_vacuum p WHERE p.relid = pg_stat_user_tables.relid
+      )
   LOOP
     EXECUTE 'ANALYZE ' || rel;
   END LOOP;
