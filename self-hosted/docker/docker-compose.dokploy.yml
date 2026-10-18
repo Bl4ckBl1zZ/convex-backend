@@ -132,7 +132,7 @@ services:
         max-file: "3"
 
   dashboard:
-    image: ghcr.io/get-convex/convex-dashboard@sha256:f3a8ccb90a07c9cb580974c0e4a03f38137b5b53dd4c70cd5b242d5d7ae2260b
+    image: ghcr.io/convex/convex-dashboard@sha256:f3a8ccb90a07c9cb580974c0e4a03f38137b5b53dd4c70cd5b242d5d7ae2260b
     restart: unless-stopped
     init: true
     expose:
