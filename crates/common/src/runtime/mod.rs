@@ -72,7 +72,6 @@ pub use self::{
 use crate::{
     errors::recapture_stacktrace,
     is_canceled::IsCanceled,
-    knobs::ASYNC_JOIN_CONCURRENCY,
     pause::PauseClient,
     types::Timestamp,
 };
@@ -210,6 +209,10 @@ pub async fn shutdown_and_join(mut handle: Box<dyn SpawnHandle>) -> anyhow::Resu
     Ok(())
 }
 
+// Why 20? ¯\_(ツ)_/¯. We use this value a lot elsewhere and it doesn't seem
+// unreasonable as a starting point for lightweight things.
+const JOIN_BUFFER_SIZE: usize = 20;
+
 pub async fn try_join_buffered<
     RT: Runtime,
     T: Send + 'static,
@@ -222,7 +225,7 @@ pub async fn try_join_buffered<
 ) -> anyhow::Result<C> {
     assert_send(
         stream::iter(tasks.map(|task| assert_send(try_join(name, assert_send(task)))))
-            .buffered(*ASYNC_JOIN_CONCURRENCY)
+            .buffered(JOIN_BUFFER_SIZE)
             .try_collect(),
     )
     .await
@@ -246,7 +249,7 @@ pub async fn try_join_buffer_unordered<
 ) -> anyhow::Result<C> {
     assert_send(
         stream::iter(tasks.map(|task| try_join(name, task)))
-            .buffer_unordered(*ASYNC_JOIN_CONCURRENCY)
+            .buffer_unordered(JOIN_BUFFER_SIZE)
             .try_collect(),
     )
     .await

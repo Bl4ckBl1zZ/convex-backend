@@ -21,7 +21,6 @@ use common::{
     index::IndexKeyBytes,
     interval::Interval,
     knobs::{
-        ASYNC_JOIN_CONCURRENCY,
         FUNRUN_INDEX_CACHE_CONCURRENCY,
         FUNRUN_INDEX_CACHE_QUEUE_SIZE,
         FUNRUN_INDEX_CACHE_SIZE,
@@ -50,11 +49,7 @@ use database::{
     COMPONENTS_TABLE,
     SCHEMAS_TABLE,
 };
-use futures::{
-    stream,
-    StreamExt,
-    TryStreamExt,
-};
+use futures::TryStreamExt;
 use indexing::{
     database_index_snapshot::DatabaseIndexSnapshot,
     in_memory_indexes::{
@@ -476,25 +471,16 @@ impl<RT: Runtime> FunctionRunnerInMemoryIndexes<RT> {
                 || async move {
                     let mut size = 0;
                     let mut schema_docs = BTreeMap::new();
-                    let loaded_components = stream::iter(schema_tables)
-                        .map(|(namespace, schema_tablet, index)| {
-                            let index_reader = index_reader.clone();
-                            async move {
-                                let (component_documents, component_size) =
-                                    load_unpacked_index(index, &index_reader, schema_tablet, NAME)
-                                        .await?;
-                                let documents = component_documents
-                                    .into_iter()
-                                    .map(|d| d.parse())
-                                    .try_collect()?;
-                                anyhow::Ok((namespace, documents, component_size))
-                            }
-                        })
-                        .buffer_unordered(*ASYNC_JOIN_CONCURRENCY)
-                        .try_collect::<Vec<_>>()
-                        .await?;
-                    for (namespace, documents, component_size) in loaded_components {
-                        schema_docs.insert(namespace, documents);
+                    for (namespace, schema_tablet, index) in schema_tables {
+                        let (component_documents, component_size) =
+                            load_unpacked_index(index, &index_reader, schema_tablet, NAME).await?;
+                        schema_docs.insert(
+                            namespace,
+                            component_documents
+                                .into_iter()
+                                .map(|d| d.parse())
+                                .try_collect()?,
+                        );
                         size += component_size;
                     }
                     let schema_registry = SchemaRegistry::bootstrap(schema_docs);

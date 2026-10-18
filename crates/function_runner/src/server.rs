@@ -24,10 +24,7 @@ use common::{
         fetch::FetchClient,
         RoutedHttpPath,
     },
-    knobs::{
-        MAX_ACTION_ISOLATE_WORKERS,
-        MAX_TRANSACTION_ISOLATE_WORKERS,
-    },
+    knobs::MAX_ISOLATE_WORKERS,
     log_lines::LogLine,
     persistence::RetentionValidator,
     query_journal::QueryJournal,
@@ -205,8 +202,7 @@ pub struct FunctionRunnerCore<RT: Runtime, S: StorageForDeployment<RT>> {
     index_cache: InMemoryIndexCache<RT>,
     module_cache: ModuleCache<RT>,
     code_cache: CodeCache,
-    transaction_isolate_client: IsolateClient<RT>,
-    action_isolate_client: IsolateClient<RT>,
+    isolate_client: IsolateClient<RT>,
 }
 
 impl<RT: Runtime, S: StorageForDeployment<RT>> Clone for FunctionRunnerCore<RT, S> {
@@ -217,8 +213,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> Clone for FunctionRunnerCore<RT, 
             index_cache: self.index_cache.clone(),
             module_cache: self.module_cache.clone(),
             code_cache: self.code_cache.clone(),
-            transaction_isolate_client: self.transaction_isolate_client.clone(),
-            action_isolate_client: self.action_isolate_client.clone(),
+            isolate_client: self.isolate_client.clone(),
         }
     }
 }
@@ -248,20 +243,14 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         rt: RT,
         storage: S,
         max_percent_per_client: usize,
-        transaction_isolate_worker: W,
-        action_isolate_worker: W,
+        isolate_worker: W,
     ) -> anyhow::Result<Self> {
-        let transaction_isolate_client = IsolateClient::new(
+        let max_isolate_workers = *MAX_ISOLATE_WORKERS;
+        let isolate_client = IsolateClient::new(
             rt.clone(),
             max_percent_per_client,
-            *MAX_TRANSACTION_ISOLATE_WORKERS,
-            transaction_isolate_worker,
-        )?;
-        let action_isolate_client = IsolateClient::new(
-            rt.clone(),
-            max_percent_per_client,
-            *MAX_ACTION_ISOLATE_WORKERS,
-            action_isolate_worker,
+            max_isolate_workers,
+            isolate_worker,
         )?;
         let index_cache = InMemoryIndexCache::new(rt.clone());
         let module_cache = ModuleCache::new(rt.clone());
@@ -273,23 +262,20 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             index_cache,
             module_cache,
             code_cache,
-            transaction_isolate_client,
-            action_isolate_client,
+            isolate_client,
         })
     }
 
     pub fn active_isolate_workers(&self) -> usize {
-        self.transaction_isolate_client.active_workers()
-            + self.action_isolate_client.active_workers()
+        self.isolate_client.active_workers()
     }
 
     pub fn max_isolate_workers(&self) -> usize {
-        self.transaction_isolate_client.max_workers() + self.action_isolate_client.max_workers()
+        self.isolate_client.max_workers()
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.transaction_isolate_client.shutdown().await?;
-        self.action_isolate_client.shutdown().await
+        self.isolate_client.shutdown().await
     }
 
     // Runs a function given the information for the backend as well as arguments
@@ -398,7 +384,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 let rng_seed = self.rt.rng().random();
                 let unix_timestamp = udf_unix_timestamp(transaction.next_creation_time());
                 let (tx, outcome) = self
-                    .transaction_isolate_client
+                    .isolate_client
                     .execute_udf(
                         udf_type,
                         path_and_args,
@@ -426,7 +412,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 let log_line_sender =
                     log_line_sender.context("Missing log line sender for action")?;
                 let outcome = self
-                    .action_isolate_client
+                    .isolate_client
                     .execute_action(
                         path_and_args,
                         transaction,
@@ -460,7 +446,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 let identity =
                     propagate_component_auth(&identity, component_id, component_id.is_root());
                 let outcome = self
-                    .action_isolate_client
+                    .isolate_client
                     .execute_http_action(
                         http_module_path,
                         routed_path,
@@ -500,7 +486,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             "Can only analyze Isolate modules"
         );
 
-        self.transaction_isolate_client
+        self.isolate_client
             .analyze(udf_config, modules, environment_variables, deployment_name)
             .await
     }
@@ -526,7 +512,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             "Can only evaluate Isolate modules"
         );
 
-        self.transaction_isolate_client
+        self.isolate_client
             .evaluate_app_definitions(
                 app_definition,
                 component_definitions,
@@ -548,7 +534,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         name: ComponentName,
         deployment_name: String,
     ) -> anyhow::Result<BTreeMap<Identifier, Resource>> {
-        self.transaction_isolate_client
+        self.isolate_client
             .evaluate_component_initializer(
                 evaluated_definitions,
                 path,
@@ -569,7 +555,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         unix_timestamp: UnixTimestamp,
         deployment_name: String,
     ) -> anyhow::Result<DatabaseSchema> {
-        self.transaction_isolate_client
+        self.isolate_client
             .evaluate_schema(
                 schema_bundle,
                 source_map,
@@ -589,7 +575,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         explanation: &str,
         deployment_name: String,
     ) -> anyhow::Result<AuthConfig> {
-        self.transaction_isolate_client
+        self.isolate_client
             .evaluate_auth_config(
                 auth_config_bundle,
                 source_map,
