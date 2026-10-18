@@ -1,6 +1,7 @@
--- Run with:
--- docker compose -f docker-compose.yml -f docker-compose.postgres.yml \
---   exec postgres psql -U convex -d convex_self_hosted \
+-- The maintenance sidecar in docker-compose.dokploy.yml runs this every six
+-- hours. To run it by hand:
+-- docker compose -f docker-compose.dokploy.yml exec postgres18 \
+--   psql -U convex -d convex_self_hosted \
 --   -f /opt/convex/postgres-autovacuum-health.sql
 
 SELECT
