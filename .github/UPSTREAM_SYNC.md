@@ -34,10 +34,10 @@ git merge upstream/main
 ## Conflict resolution principle
 
 Upstream owns how the engine works. The fork owns how it is deployed. Take
-upstream's side of every conflict except where it would drop an invariant
-below; then re-apply the invariant through upstream's new API. Never revert an
-upstream bug fix. Upstream API changes can break fork code in files that git
-merged cleanly, so always compile after resolving.
+upstream's side of every conflict except where it would drop an invariant below;
+then re-apply the invariant through upstream's new API. Never revert an upstream
+bug fix. Upstream API changes can break fork code in files that git merged
+cleanly, so always compile after resolving.
 
 ## Invariants
 
@@ -49,11 +49,11 @@ merged cleanly, so always compile after resolving.
 `self-hosted/docker/postgres-autovacuum-health.sql`
 
 Fork-only files: PostgreSQL 18.6 (Debian image), the backend from GHCR, the
-dashboard, and an autovacuum maintenance sidecar. They never conflict, but
-check upstream's release notes for renamed or removed environment variables
-the profile sets. Convex must receive a PostgreSQL **cluster** URL (no database
-name in the path). `docker-compose.restorecord.dokploy.yml` is a second,
-separately owned profile; do not change it during a sync.
+dashboard, and an autovacuum maintenance sidecar. They never conflict, but check
+upstream's release notes for renamed or removed environment variables the
+profile sets. Convex must receive a PostgreSQL **cluster** URL (no database name
+in the path). `docker-compose.restorecord.dokploy.yml` is a second, separately
+owned profile; do not change it during a sync.
 
 The maintenance SQL runs every six hours and must stay idempotent: it may only
 `ALTER` a table when its options differ, and must skip tables that are being
@@ -64,11 +64,11 @@ autovacuum.
 
 `crates/node_executor/src/local.rs`
 
-`LocalNodeExecutor` runs `LOCAL_NODE_EXECUTOR_POOL_SIZE` Node processes
-(default 1, production 4) and sends each request to the least-loaded one.
-Upstream changes to the executor (spawn arguments, environment, callback
-timing, health checks, timeouts) must apply to every process in the pool, not
-only to one. Guarded by `cargo test -p node_executor --lib`.
+`LocalNodeExecutor` runs `LOCAL_NODE_EXECUTOR_POOL_SIZE` Node processes (default
+1, production 4) and sends each request to the least-loaded one. Upstream
+changes to the executor (spawn arguments, environment, callback timing, health
+checks, timeouts) must apply to every process in the pool, not only to one.
+Guarded by `cargo test -p node_executor --lib`.
 
 `crates/local_backend/src/main.rs` also passes upstream's
 `HTTP_SERVER_MAX_CONCURRENT_REQUESTS` knob to the HTTP server instead of the
@@ -88,8 +88,8 @@ not exist here: a job with those labels queues forever.
 - `setup-rust` falls back to local-disk sccache when Convex's R2 credentials are
   absent. Keep that fallback.
 - `publish_fork_backend.yml` is fork-only (multi-arch GHCR publishing).
-- The Dockerfile caps `CARGO_BUILD_JOBS` at 4 so release builds fit the
-  runners' memory.
+- The Dockerfile caps `CARGO_BUILD_JOBS` at 4 so release builds fit the runners'
+  memory.
 - Other upstream workflows (release, precompile, CLA, metrics) are disabled in
   the repository settings. Take upstream's version of them wholesale.
 
