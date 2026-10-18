@@ -56,7 +56,7 @@ jobs:
       - name: Lint fork-modified crates
         run: >-
           cargo clippy --locked -p local_backend -p node_executor --all-targets
-          -- -D warnings
+          --no-deps -- -D warnings
 
       - name: Test the local Node executor pool
         run: cargo test --locked -p node_executor --lib

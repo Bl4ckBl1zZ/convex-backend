@@ -110,7 +110,7 @@ just turbo run build --filter=component-tests... --filter=convex... \
   --filter=system-udfs... --filter=udf-runtime... --filter=udf-tests...
 
 cargo check --locked -p local_backend -p node_executor
-cargo clippy --locked -p local_backend -p node_executor --all-targets -- -D warnings
+cargo clippy --locked -p local_backend -p node_executor --all-targets --no-deps -- -D warnings
 cargo test --locked -p node_executor --lib
 ```
 
