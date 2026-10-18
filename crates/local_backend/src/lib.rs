@@ -94,9 +94,7 @@ use node_executor::{
         LocalNodeExecutor,
         LOCAL_NODE_EXECUTOR_POOL_SIZE,
     },
-    remote::RemoteNodeExecutor,
     NodeActions,
-    NodeExecutor,
 };
 use runtime::prod::ProdRuntime;
 use search::{
@@ -267,11 +265,7 @@ pub async fn make_app(
         class: DeploymentClass::S16,
     };
     let node_process_timeout = *NODE_ACTION_USER_TIMEOUT + Duration::from_secs(5);
-    let node_executor: Arc<dyn NodeExecutor> =
-        match RemoteNodeExecutor::from_env(node_process_timeout)? {
-            Some(remote_executor) => Arc::new(remote_executor),
-            None => Arc::new(LocalNodeExecutor::new(node_process_timeout).await?),
-        };
+    let node_executor = Arc::new(LocalNodeExecutor::new(node_process_timeout).await?);
     let node_actions = NodeActions::new(
         node_executor,
         config.convex_origin_url()?,
