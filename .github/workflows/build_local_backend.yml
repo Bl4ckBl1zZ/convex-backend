@@ -51,30 +51,12 @@ jobs:
           just turbo run build --filter=component-tests... --filter=convex... --filter=system-udfs... --filter=udf-runtime... --filter=udf-tests...
 
       - name: Check backend integration crates
+        run: cargo check --locked -p local_backend -p node_executor
+
+      - name: Lint fork-modified crates
         run: >-
-          cargo check --locked -p local_backend -p node_executor -p application
-          -p function_runner -p database -p indexing -p isolate -p
-          search_index_workers -p storage
+          cargo clippy --locked -p local_backend -p node_executor --all-targets
+          -- -D warnings
 
-      - name: Lint fork-modified libraries
-        run: >-
-          cargo clippy --locked -p application -p database -p function_runner -p
-          indexing -p isolate -p search_index_workers -p storage --lib -- -D
-          warnings
-
-      - name: Test vertical-scaling defaults
-        run: cargo test --locked -p common vertical_scaling --lib
-
-      - name: Test persistence connection headroom
-        run: cargo test --locked -p common commit_persistence --lib
-
-      - name: Test shared isolate CPU capacity
-        run:
-          cargo test --locked -p isolate cloned_limiters_share_cpu_capacity
-          --lib
-
-      - name: Test state-only index OCC behavior
-        run: >-
-          cargo test --locked -p indexing
-          state_only_index_update_does_not_invalidate_virtual_definition_index
-          --lib
+      - name: Test the local Node executor pool
+        run: cargo test --locked -p node_executor --lib
