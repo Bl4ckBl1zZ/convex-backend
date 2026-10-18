@@ -153,8 +153,6 @@ packages:
   - "wasm-runtime-bundler"
 
 autoInstallPeers: true
-onlyBuiltDependencies:
-  - "root@https://codeload.github.com/nipunn1313/docusaurus-openapi-docs/tar.gz/33ca8ab0ecbe76adc157c6c7ade3e53e5c990428"
 publishBranch: release
 minimumReleaseAge: 10080
 

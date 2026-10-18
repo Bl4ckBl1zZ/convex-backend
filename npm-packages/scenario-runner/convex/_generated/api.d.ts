@@ -9,7 +9,6 @@
  */
 
 import type * as actions_componentsNode from "../actions/componentsNode.js";
-import type * as actions_cpu from "../actions/cpu.js";
 import type * as actions_externalNodeDeps from "../actions/externalNodeDeps.js";
 import type * as actions_insert from "../actions/insert.js";
 import type * as common from "../common.js";
@@ -25,9 +24,6 @@ import type * as search from "../search.js";
 import type * as setup from "../setup.js";
 import type * as update from "../update.js";
 import type * as vectorSearch from "../vectorSearch.js";
-import type * as workflow_benchmark from "../workflow_benchmark.js";
-import type * as workflow_benchmark_node from "../workflow_benchmark_node.js";
-import type * as workflow_benchmark_shared from "../workflow_benchmark_shared.js";
 
 import type {
   ApiFromModules,
@@ -37,7 +33,6 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   "actions/componentsNode": typeof actions_componentsNode;
-  "actions/cpu": typeof actions_cpu;
   "actions/externalNodeDeps": typeof actions_externalNodeDeps;
   "actions/insert": typeof actions_insert;
   common: typeof common;
@@ -53,9 +48,6 @@ declare const fullApi: ApiFromModules<{
   setup: typeof setup;
   update: typeof update;
   vectorSearch: typeof vectorSearch;
-  workflow_benchmark: typeof workflow_benchmark;
-  workflow_benchmark_node: typeof workflow_benchmark_node;
-  workflow_benchmark_shared: typeof workflow_benchmark_shared;
 }>;
 
 /**
@@ -86,5 +78,4 @@ export declare const internal: FilterApi<
 
 export declare const components: {
   counterComponent: import("../../counterComponent/_generated/component.js").ComponentApi<"counterComponent">;
-  workflow: import("@convex-dev/workflow/_generated/component.js").ComponentApi<"workflow">;
 };
