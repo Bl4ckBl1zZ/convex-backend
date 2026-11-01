@@ -166,11 +166,12 @@ impl InnerLocalNodeExecutor {
         if !version.starts_with("v20.")
             && !version.starts_with("v22.")
             && !version.starts_with("v24.")
+            && !version.starts_with("v26.")
         {
             anyhow::bail!(ErrorMetadata::bad_request(
                 "DeploymentNotConfiguredForNodeActions",
                 "Deployment is not configured to deploy \"use node\" actions. \
-                 Node.js v20, 22, or 24 is not installed. \
+                 Node.js v20, 22, 24, or 26 is not installed. \
                  Install a supported Node.js version with nvm (https://github.com/nvm-sh/nvm) \
                  to deploy Node.js actions."
             ))

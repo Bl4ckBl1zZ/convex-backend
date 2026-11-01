@@ -108,10 +108,14 @@ jobs:
         id: manifest
         shell: bash
         run: |
+          # Dokploy pulls latest, so only main may move the shared tags.
+          tags=(--tag "${IMAGE_NAME}:sha-${GITHUB_SHA}")
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            tags+=(--tag "${IMAGE_NAME}:latest" --tag "${IMAGE_NAME}:main")
+          fi
+
           docker buildx imagetools create \
-            --tag "${IMAGE_NAME}:latest" \
-            --tag "${IMAGE_NAME}:main" \
-            --tag "${IMAGE_NAME}:sha-${GITHUB_SHA}" \
+            "${tags[@]}" \
             "${IMAGE_NAME}:sha-${GITHUB_SHA}-amd64" \
             "${IMAGE_NAME}:sha-${GITHUB_SHA}-arm64"
 
@@ -128,8 +132,6 @@ jobs:
         run: |
           {
             echo "### Published backend image"
-            echo
-            echo "\`${IMAGE_NAME}:latest\`"
             echo
             echo "\`${IMAGE_NAME}:sha-${GITHUB_SHA}\`"
             echo
