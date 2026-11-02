@@ -119,11 +119,13 @@ the end, against 172 MiB for upstream's one.
 
 ### What production needs to know
 
-- Merging to `main` deploys: Dokploy pulls `latest` with `pull_policy: always`.
+- Merging to `main` redeploys the profile, but the backend image is pinned by
+  `CONVEX_BACKEND_IMAGE` in the Dokploy environment; see "Merge strategy" in
+  `.github/UPSTREAM_SYNC.md` for rolling out a new backend. Production has run
+  `sha-3860098a0` since 2026-10-19.
 - The new image uses less memory than the one production ran, but the 4-process
   Node pool still adds roughly 0.5-0.75 GiB over upstream. Check the backend's
   steady-state usage with `docker stats` against its 12 GiB limit before raising
   `LOCAL_NODE_EXECUTOR_POOL_SIZE`.
-- After deploying, `/convex/data/search-cache` on the `convex_data` volume is no
-  longer used and can be deleted. Its files are read-only, so run `chmod -R u+w`
-  on it first.
+- The old `/convex/data/search-cache` directory was deleted from production's
+  `convex_data` volume on 2026-10-19.
