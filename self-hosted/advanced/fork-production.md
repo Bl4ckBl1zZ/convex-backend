@@ -129,3 +129,10 @@ the end, against 172 MiB for upstream's one.
   `LOCAL_NODE_EXECUTOR_POOL_SIZE`.
 - The old `/convex/data/search-cache` directory was deleted from production's
   `convex_data` volume on 2026-10-19.
+- The profile sets `ISOLATE_MAX_HEAP_EXTRA_SIZE=134217728` (upstream 32 MiB) and
+  `SCHEDULED_JOB_EXECUTION_PARALLELISM=32` (upstream 8). With 32 MiB an isolate
+  whose heap no longer has 64 MiB free is torn down after the request
+  (`TooMuchMemoryCarryOver`), which with ModularBots' function bundles happened
+  after almost every request; 8 parallel scheduled jobs queued replies for 30 s
+  while action slots sat idle. On 2026-11-02 the backend ran at about 2 GiB
+  (half of it the four Node processes) against its 12 GiB limit.
