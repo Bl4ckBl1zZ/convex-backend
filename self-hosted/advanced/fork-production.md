@@ -127,9 +127,9 @@ the end, against 172 MiB for upstream's one.
 - After deploying, `/convex/data/search-cache` on the `convex_data` volume is no
   longer used and can be deleted. Its files are read-only, so run `chmod -R u+w`
   on it first.
-- The profile sets `ISOLATE_MAX_HEAP_EXTRA_SIZE=134217728` (upstream 32 MiB)
-  and `SCHEDULED_JOB_EXECUTION_PARALLELISM=32` (upstream 8). With 32 MiB an
-  isolate whose heap no longer has 64 MiB free is torn down after the request
+- The profile sets `ISOLATE_MAX_HEAP_EXTRA_SIZE=134217728` (upstream 32 MiB) and
+  `SCHEDULED_JOB_EXECUTION_PARALLELISM=32` (upstream 8). With 32 MiB an isolate
+  whose heap no longer has 64 MiB free is torn down after the request
   (`TooMuchMemoryCarryOver`), which with ModularBots' function bundles happened
   after almost every request; 8 parallel scheduled jobs queued replies for 30 s
   while action slots sat idle. On 2026-11-02 the backend ran at about 2 GiB
