@@ -27,9 +27,21 @@ git switch -c upstream-sync/$(date +%F) origin/main
 git merge upstream/main
 ```
 
-**Merging to `main` deploys.** Every push to `main` publishes
-`ghcr.io/bl4ckbl1zz/convex-backend:latest`, and the Dokploy profile pulls
-`latest` with `pull_policy: always`, so the next redeploy runs it.
+**Merging to `main` redeploys production, but not its backend.** Dokploy
+auto-deploys the profile on every push to `main`, so compose, SQL and dashboard
+changes go live on merge. The backend image is pinned by `CONVEX_BACKEND_IMAGE`
+in the Dokploy environment, so a merge alone keeps the old backend. To roll out
+a new backend:
+
+1. Wait for "Publish Fork Backend Image" to finish for the merge commit.
+2. Resolve its digest:
+   `docker buildx imagetools inspect ghcr.io/bl4ckbl1zz/convex-backend:sha-<merge-sha>`.
+3. Deploy it to ModularBots Dev first (its raw compose pins the image), then set
+   `CONVEX_BACKEND_IMAGE=ghcr.io/bl4ckbl1zz/convex-backend:sha-<merge-sha>@sha256:<digest>`
+   on production and redeploy.
+4. A new backend runs its database migrations in the background after startup.
+   Errors such as `missing field` can appear until the logs show
+   `Migration complete`; wait for that before deciding to roll back.
 
 ## Conflict resolution principle
 
