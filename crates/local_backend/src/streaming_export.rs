@@ -270,6 +270,11 @@ pub async fn _document_deltas(
 /// from each response back in the next request as `cursor`. Omit `cursor` on
 /// the first call.
 ///
+/// Apply each page's `truncates` before its `values`, and persist these changes
+/// atomically with `pagination.nextCursor`. Retrying the same input cursor may
+/// return a different page, so non-atomic updates can lead to data
+/// inconsistency.
+///
 /// To do a one time data sync, keep fetching pages until reaching an `upToDate`
 /// page. For a continuous streaming export, continue fetching pages
 /// periodically. It's recommended to sleep between `upToDate` pages to reduce
@@ -522,9 +527,9 @@ where
 }
 
 /// A cursor pointing at a snapshot that has aged out of the deployment's data
-/// retention window (see the endpoint docs: call at least once every 3 days)
-/// can't be resumed. Surface a 400 telling the caller to restart the sync from
-/// scratch; other errors pass through.
+/// retention window (`DOCUMENT_RETENTION_DELAY`) can't be resumed. Surface a
+/// 400 telling the caller to restart the sync from scratch; other errors pass
+/// through.
 fn cursor_expired_error(e: anyhow::Error) -> anyhow::Error {
     if e.is_out_of_retention() {
         e.context(ErrorMetadata::bad_request(

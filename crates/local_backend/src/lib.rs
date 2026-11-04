@@ -40,6 +40,7 @@ use common::{
         new_rate_limiter,
         Runtime,
     },
+    sentry::proxied_sentry_transport_factory,
     shutdown::ShutdownSignal,
     types::{
         ConvexOrigin,
@@ -96,10 +97,11 @@ pub mod deploy_config;
 pub mod deploy_config2;
 pub mod deployment_audit_log;
 pub mod deployment_info;
+pub mod deployment_jwks;
 pub mod deployment_state;
 pub mod environment_variables;
 pub mod http_actions;
-pub mod log_sinks;
+pub mod integrations;
 pub mod logs;
 pub mod node_action_callbacks;
 pub mod parse;
@@ -272,7 +274,7 @@ pub async fn make_app(
         )),
         QueryCache::new(*UDF_CACHE_MAX_SIZE),
         fetch_client,
-        config.local_log_sink.clone(),
+        proxied_sentry_transport_factory(config.convex_http_proxy.clone(), config.name()),
         preempt_tx.clone(),
         Arc::new(InProcessExportProvider),
         deleted_tablet_receiver,

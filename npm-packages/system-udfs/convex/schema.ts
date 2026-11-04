@@ -1,3 +1,5 @@
+import { syncSelection } from "./tableDefs/streamingExport";
+export { syncSelection } from "./tableDefs/streamingExport";
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import deploymentAuditLogTable, {
@@ -169,8 +171,7 @@ const cronJobStatus = v.union(
   }),
 );
 
-// Log sinks
-export const sinkState = v.union(
+export const integrationState = v.union(
   v.object({
     type: v.literal("pending"),
   }),
@@ -266,27 +267,20 @@ export const postHogErrorTrackingConfig = v.object({
   host: v.optional(v.string()),
 });
 
-const inclusionDefault = v.union(v.literal("included"), v.literal("excluded"));
-
-// The components, tables, and columns mirrored by an Analytics export, in the
-// streaming export `Selection` wire format: nested maps keyed by component,
-// then table, then column, where `_other` gives the default for entries that
-// aren't listed.
-export const syncSelection = v.record(
-  v.string(),
-  v.union(
-    inclusionDefault,
-    v.record(
-      v.string(),
-      v.union(inclusionDefault, v.record(v.string(), inclusionDefault)),
-    ),
-  ),
-);
-
-const syncPeriod = v.union(
-  v.literal("continuous"),
-  v.literal("hourly"),
-  v.literal("daily"),
+const s3ExportProgress = v.union(
+  v.object({
+    type: v.literal("snapshotting"),
+    numTablesSynced: v.int64(),
+    totalTables: v.int64(),
+    currentComponent: v.string(),
+    currentTable: v.string(),
+    numDocumentsInCurrentTable: v.int64(),
+    totalDocumentsInCurrentTable: v.union(v.int64(), v.null()),
+    numDocumentsSynced: v.int64(),
+    totalDocuments: v.union(v.int64(), v.null()),
+  }),
+  v.object({ type: v.literal("stale"), ts: v.int64() }),
+  v.object({ type: v.literal("upToDate"), ts: v.int64() }),
 );
 
 export const s3ExportConfig = v.object({
@@ -294,31 +288,15 @@ export const s3ExportConfig = v.object({
   bucket: v.string(),
   region: v.string(),
   prefix: v.optional(v.string()),
-  accessKeyId: v.string(),
-  secretAccessKey: v.string(),
+  accessKeyId: v.optional(v.string()),
+  secretAccessKey: v.optional(v.string()),
+  // Empty until the admin pastes the ARN from their CloudFormation stack.
+  roleArn: v.optional(v.string()),
+  roleExternalId: v.optional(v.string()),
   selection: syncSelection,
-  period: syncPeriod,
-  cursor: v.optional(v.string()),
-  progress: v.optional(
-    v.union(
-      v.object({
-        type: v.literal("snapshotting"),
-        numTablesSynced: v.int64(),
-        totalTables: v.int64(),
-        currentComponent: v.string(),
-        currentTable: v.string(),
-        numDocumentsInCurrentTable: v.int64(),
-        totalDocumentsInCurrentTable: v.union(v.int64(), v.null()),
-        numDocumentsSynced: v.int64(),
-        totalDocuments: v.union(v.int64(), v.null()),
-      }),
-      v.object({ type: v.literal("stale"), ts: v.int64() }),
-      v.object({ type: v.literal("upToDate"), ts: v.int64() }),
-    ),
-  ),
 });
 
-export const sinkConfig = v.union(
+export const integrationConfig = v.union(
   datadogConfig,
   webhookConfig,
   axiomConfig,
@@ -328,9 +306,9 @@ export const sinkConfig = v.union(
   s3ExportConfig,
 );
 
-const logSinksTable = defineTable({
-  status: sinkState,
-  config: sinkConfig,
+const integrationsTable = defineTable({
+  status: integrationState,
+  config: integrationConfig,
 });
 
 const userStopState = v.union(v.literal("none"), v.literal("paused"));
@@ -564,7 +542,13 @@ export default defineSchema({
     numDocsValidated: v.int64(),
     totalDocs: v.union(v.int64(), v.null()),
   }).index("by_validation_id", ["validationId"]),
-  _log_sinks: logSinksTable,
+  _log_sinks: integrationsTable,
+  _s3_export_state: defineTable({
+    configId: v.id("_log_sinks"),
+    checkpoint: v.object({
+      progress: s3ExportProgress,
+    }),
+  }).index("by_config_id", ["configId"]),
   _backend_state: backendStateTable,
   _snapshot_imports: snapshotImportsTable,
   _aws_lambda_versions: awsLambdaVersionsTable,

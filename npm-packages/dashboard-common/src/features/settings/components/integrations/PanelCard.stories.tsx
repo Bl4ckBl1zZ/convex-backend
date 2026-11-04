@@ -1,3 +1,4 @@
+import { SWRConfig, unstable_serialize } from "swr";
 import { Meta, StoryObj } from "@storybook/nextjs";
 import { type ContextType } from "react";
 import type {
@@ -340,7 +341,7 @@ export const FivetranSyncProgressFlagOff: Story = {
 
 type S3Integration = Extract<AnalyticsIntegration, { kind: "s3Export" }>;
 type S3Progress = NonNullable<
-  NonNullable<S3Integration["existing"]>["config"]["progress"]
+  NonNullable<S3Integration["existing"]>["exportProgress"]
 >;
 
 const connectedDeployment = {
@@ -359,6 +360,7 @@ function s3Export(progress: S3Progress | undefined): S3Integration {
       _id: "s3export" as never,
       _creationTime: minutesAgo(60 * 24),
       status: { type: "active" },
+      exportProgress: progress,
       config: {
         type: "s3Export",
         bucket: "acme-analytics",
@@ -366,8 +368,6 @@ function s3Export(progress: S3Progress | undefined): S3Integration {
         prefix: "convex",
         accessKeyId: "AKIAIOSFODNN7EXAMPLE",
         selection: {},
-        period: "daily",
-        progress,
       },
     },
   };
@@ -380,7 +380,26 @@ function S3Providers({ children }: { children: React.ReactNode }) {
       value={mockDeploymentInfo as ContextType<typeof DeploymentInfoContext>}
     >
       <ConnectedDeploymentContext.Provider value={connectedDeployment}>
-        {children}
+        <SWRConfig
+          value={{
+            provider: () => new Map(),
+            revalidateOnMount: false,
+            isPaused: () => true,
+            fallback: {
+              [unstable_serialize([
+                connectedDeployment.deployment.deploymentUrl,
+                "/api/json_schemas?byComponent=true",
+                "Convex ",
+              ])]: {
+                "": ["customers", "invoices", "orders", "products"],
+                aggregate: ["items", "namespaces"],
+                workpool: ["config", "pendingWork", "work", "workers"],
+              },
+            },
+          }}
+        >
+          {children}
+        </SWRConfig>
       </ConnectedDeploymentContext.Provider>
     </DeploymentInfoContext.Provider>
   );
@@ -441,7 +460,7 @@ export const S3ExportDetailModal: Story = {
     );
     const dialog = within(await screen.findByTestId("modal"));
     await dialog.findByText(
-      "s3://acme-analytics/convex/wandering-fish-513/tables/",
+      "s3://acme-analytics/convex/wandering-fish-513/data-lake/",
     );
     await dialog.findByText("wandering_fish_513");
   },
@@ -488,4 +507,51 @@ export const S3ExportSetupForm: Story = {
       </div>
     </S3Providers>
   ),
+};
+
+// A role export created without its ARN yet: the form opens on Connect AWS.
+export const S3ExportFinishAwsSetup: Story = {
+  name: "S3 Export Finish AWS Setup",
+  render: () => {
+    const pending = s3Export(undefined);
+    pending.existing!.status = { type: "pending" };
+    pending.existing!.config = {
+      ...pending.existing!.config,
+      accessKeyId: "",
+      roleArn: "",
+      roleExternalId: "Qk9xT3mZa8vLw2Hc5RfG1uYpN7dB4eJs",
+    };
+    return (
+      <S3Providers>
+        <div className="flex h-192 w-2xl flex-col">
+          <S3ExportConfigurationForm integration={pending} onClose={() => {}} />
+        </div>
+      </S3Providers>
+    );
+  },
+};
+
+export const S3ExportComponentSelection: Story = {
+  name: "S3 Export Component Selection",
+  render: () => (
+    <S3Providers>
+      <div className="flex h-192 w-full max-w-2xl flex-col">
+        <S3ExportConfigurationForm
+          integration={s3Export(undefined)}
+          onClose={() => {}}
+        />
+      </div>
+    </S3Providers>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(
+      canvas.getByRole("checkbox", { name: "Include component tables" }),
+    );
+    await canvas.findByText(/keeps the progress of tables you already export/);
+    await userEvent.click(
+      canvas.getByRole("button", { name: "Choose specific tables Advanced" }),
+    );
+    await canvas.findByText("Exporting 4 of 10 tables");
+  },
 };

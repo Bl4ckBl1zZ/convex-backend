@@ -22,7 +22,7 @@ use std::{
 };
 
 use ::exports::interface::ExportProvider;
-use ::log_streaming::{
+use ::integrations::{
     LogManager,
     LogManagerClient,
 };
@@ -191,13 +191,6 @@ use file_storage::{
     FileStorage,
     FileStream,
 };
-use fivetran_destination::{
-    api_types::{
-        BatchWriteRow,
-        DeleteType,
-    },
-    constants::FIVETRAN_PRIMARY_KEY_INDEX_DESCRIPTOR,
-};
 use function_runner::FunctionRunner;
 use futures::stream::BoxStream;
 use headers::{
@@ -209,11 +202,13 @@ use http_client::{
     ClientPurpose,
 };
 use keybroker::{
+    AdminIdentity,
+    AdminIdentityPrincipal,
     DeploymentOp,
+    ExportDownloadActor,
     Identity,
     KeyBroker,
 };
-use log_streaming::add_local_log_sink_on_startup;
 use maplit::{
     btreemap,
     btreeset,
@@ -285,7 +280,12 @@ use model::{
         FileStorageId,
         FileStorageModel,
     },
-    fivetran_import::FivetranImportModel,
+    fivetran_import::{
+        constants::FIVETRAN_PRIMARY_KEY_INDEX_DESCRIPTOR,
+        BatchWriteRow,
+        DeleteType,
+        FivetranImportModel,
+    },
     migrations::MigrationWorker,
     modules::{
         module_versions::{
@@ -325,7 +325,10 @@ use model::{
     usage_limits::UsageLimitsModel,
 };
 use node_executor::NodeActions;
-use parking_lot::Mutex;
+use parking_lot::{
+    Mutex,
+    RwLock,
+};
 use rand::Rng;
 use roles::RequireDeploymentOp;
 use scheduled_jobs::ScheduledJobRunner;
@@ -431,7 +434,9 @@ pub mod airbyte_import;
 pub mod api;
 pub mod app_metric_seed;
 pub mod application_function_runner;
+mod audit_log_config;
 pub mod audit_logging;
+mod backend_info;
 mod cache;
 pub mod cron_jobs;
 pub mod deploy_config;
@@ -439,7 +444,7 @@ pub mod deployment_state;
 mod execute_query_timestamp;
 mod exports;
 pub mod function_log;
-pub mod log_streaming;
+pub mod integrations;
 pub mod log_visibility;
 mod metrics;
 pub mod redaction;
@@ -625,6 +630,10 @@ pub struct Application<RT: Runtime> {
     app_auth: Arc<ApplicationAuth<RT>>,
     log_manager_client: LogManagerClient,
     audit_log_client: AuditLogClient,
+    sentry_tags: Arc<RwLock<Vec<(&'static str, String)>>>,
+    // Serializes `_backend_info` writes together with the log-streaming permission
+    // and Sentry tag updates that follow them.
+    backend_info_write_lock: Arc<tokio::sync::Mutex<()>>,
     oidc_http_client: CachedHttpClient,
 }
 
@@ -736,7 +745,7 @@ impl<RT: Runtime> Application<RT> {
         app_auth: Arc<ApplicationAuth<RT>>,
         cache: QueryCache,
         fetch_client: Arc<dyn FetchClient>,
-        local_log_sink: Option<String>,
+        sentry_transport: Arc<dyn sentry::TransportFactory>,
         lease_lost_shutdown: ShutdownSignal,
         export_provider: Arc<dyn ExportProvider<RT>>,
         deleted_tablet_receiver: tokio::sync::mpsc::Receiver<TabletId>,
@@ -808,24 +817,16 @@ impl<RT: Runtime> Application<RT> {
             runtime.spawn("system_table_cleanup_worker", system_table_cleanup_worker),
         ));
 
-        // If local_log_sink is passed in, this is a local instance, so we enable log
-        // streaming by default. Otherwise, it's hard to grant the
-        // entitlement in testing and in load generator. If not local, we
-        // read the entitlement from the database.
         let mut tx = database.begin(Identity::system()).await?;
         let mut bi = BackendInfoModel::new(&mut tx);
-        let log_streaming_allowed = if let Some(path) = local_log_sink {
-            add_local_log_sink_on_startup(database.clone(), path).await?;
-            true
-        } else {
-            bi.is_log_streaming_allowed().await?
-        };
+        let log_streaming_allowed = bi.is_log_streaming_allowed().await?;
 
         let usage_counter = UsageCounter::new(usage_event_logger.clone());
         let log_manager_client = LogManager::start(
             runtime.clone(),
             database.clone(),
             fetch_client.clone(),
+            sentry_transport,
             deployment_name.clone(),
             deployment_region.as_ref().map(|r| r.to_string()),
             log_streaming_allowed,
@@ -917,6 +918,7 @@ impl<RT: Runtime> Application<RT> {
             database.clone(),
             deployment_name.clone(),
             export_provider.clone(),
+            usage_counter.clone(),
         );
         let s3_export_worker = Arc::new(Mutex::new(Some(
             runtime.spawn("s3_export_worker", s3_export_worker.run()),
@@ -1001,6 +1003,8 @@ impl<RT: Runtime> Application<RT> {
             app_auth,
             log_manager_client,
             audit_log_client,
+            sentry_tags: Default::default(),
+            backend_info_write_lock: Default::default(),
             oidc_http_client,
         })
     }
@@ -1034,6 +1038,13 @@ impl<RT: Runtime> Application<RT> {
         self.runner
             .mint_ai_gateway_jwt(identity, claims, request_id)
             .await
+    }
+
+    /// Served at `/.well-known/jwks.json`.
+    pub async fn deployment_jwks(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            self.key_broker.deployment_jwt_keys().jwks()?,
+        )?)
     }
 
     pub fn metrics_log(&self, identity: &Identity) -> anyhow::Result<FunctionMetricsLog<'_, RT>> {
@@ -1717,19 +1728,13 @@ impl<RT: Runtime> Application<RT> {
         }?;
         let component_id = component.serialize_to_string();
         let component_path = tx.must_component_path(component)?;
-        let format_str = match &format {
-            ExportFormat::Zip { include_storage } if *include_storage => {
-                "zip_with_storage".to_string()
-            },
-            ExportFormat::Zip { .. } => "zip".to_string(),
-        };
         self.commit_with_audit_log_events(
             tx,
             vec![DeploymentAuditLogEvent::RequestExport {
                 id: DeveloperDocumentId::from(snapshot_id).encode(),
                 component_id,
                 component: component_path,
-                format: format_str,
+                format: format.audit_log_format().to_string(),
                 requestor: requestor.usage_tag().to_string(),
             }],
             request_metadata,
@@ -1739,41 +1744,77 @@ impl<RT: Runtime> Application<RT> {
         Ok(snapshot_id.into())
     }
 
+    pub async fn export_download_identity(
+        &self,
+        actor: ExportDownloadActor,
+        download_token: String,
+    ) -> anyhow::Result<Identity> {
+        let principal = match (actor.member_id, actor.token_id) {
+            (Some(member_id), _) => AdminIdentityPrincipal::Member(member_id),
+            (None, None) => return Ok(Identity::system()),
+            (None, Some(_)) => {
+                let mut tx = self.begin(Identity::system()).await?;
+                let backend_info = BackendInfoModel::new(&mut tx).get().await?.context(
+                    ErrorMetadata::forbidden(
+                        "InvalidExportDownloadToken",
+                        "Invalid export download token",
+                    ),
+                )?;
+                AdminIdentityPrincipal::Team(backend_info.team)
+            },
+        };
+        Ok(Identity::DeploymentAdmin(
+            AdminIdentity::new_for_access_token(
+                self.deployment_name(),
+                principal,
+                download_token,
+                true,
+                vec![DeploymentOp::DownloadBackups],
+                self.runtime.system_time(),
+                actor.token_id,
+                None,
+            ),
+        ))
+    }
+
     pub async fn get_zip_export(
         &self,
         identity: Identity,
+        request_metadata: RequestMetadata,
         id: Either<DeveloperDocumentId, Timestamp>,
     ) -> anyhow::Result<(StorageGetStream, String)> {
-        let (object_key, snapshot_ts) = {
-            let mut tx = self.begin(identity).await?;
-            let export = match id {
-                Either::Left(id) => ExportsModel::new(&mut tx).get(id).await?,
-                Either::Right(ts) => {
-                    ExportsModel::new(&mut tx)
-                        .completed_export_at_ts(ts)
-                        .await?
-                },
-            }
-            .context(ErrorMetadata::not_found(
-                "ExportNotFound",
-                format!("The requested export {id} was not found"),
-            ))?;
-            match export.into_value() {
-                Export::Completed {
-                    zip_object_key,
-                    start_ts,
-                    ..
-                } => (zip_object_key, start_ts),
-                Export::Failed { .. }
-                | Export::Canceled { .. }
-                | Export::InProgress { .. }
-                | Export::Requested { .. } => {
-                    anyhow::bail!(ErrorMetadata::bad_request(
-                        "ExportNotComplete",
-                        format!("The requested export {id} has not completed"),
-                    ))
-                },
-            }
+        let mut tx = self.begin(identity).await?;
+        let export = match id {
+            Either::Left(id) => ExportsModel::new(&mut tx).get(id).await?,
+            Either::Right(ts) => {
+                ExportsModel::new(&mut tx)
+                    .completed_export_at_ts(ts)
+                    .await?
+            },
+        }
+        .context(ErrorMetadata::not_found(
+            "ExportNotFound",
+            format!("The requested export {id} was not found"),
+        ))?;
+        let snapshot_id = DeveloperDocumentId::from(export.id()).encode();
+        let component = export.component();
+        let format = export.format();
+        let requestor = export.requestor();
+        let (object_key, snapshot_ts) = match export.into_value() {
+            Export::Completed {
+                zip_object_key,
+                start_ts,
+                ..
+            } => (zip_object_key, start_ts),
+            Export::Failed { .. }
+            | Export::Canceled { .. }
+            | Export::InProgress { .. }
+            | Export::Requested { .. } => {
+                anyhow::bail!(ErrorMetadata::bad_request(
+                    "ExportNotComplete",
+                    format!("The requested export {id} has not completed"),
+                ))
+            },
         };
         let storage_get_stream = self
             .application_storage
@@ -1784,6 +1825,22 @@ impl<RT: Runtime> Application<RT> {
                 "ExportNotFound",
                 format!("The requested export {snapshot_ts}/{object_key:?} was not found"),
             ))?;
+
+        let component_id = component.serialize_to_string();
+        let component_path = tx.must_component_path(component)?;
+        self.commit_with_audit_log_events(
+            tx,
+            vec![DeploymentAuditLogEvent::DownloadExport {
+                id: snapshot_id,
+                component_id,
+                component: component_path,
+                format: format.audit_log_format().to_string(),
+                requestor: requestor.usage_tag().to_string(),
+            }],
+            request_metadata,
+            "download_export",
+        )
+        .await?;
 
         let filename = format!(
             // This should match the format in SnapshotExport.tsx.

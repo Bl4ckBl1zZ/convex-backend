@@ -8,6 +8,7 @@ import { Button } from "@ui/Button";
 import { TextInput } from "@ui/TextInput";
 import { useGlobalLocalStorage } from "@common/lib/useGlobalLocalStorage";
 import { ProjectCard } from "components/projects/ProjectCard";
+import { ProjectTagFilter } from "components/projects/ProjectTagFilter";
 import {
   DeploymentList,
   DeploymentToolbar,
@@ -24,12 +25,16 @@ import { useReferralState } from "api/referrals";
 import { ProjectDetails, TeamResponse } from "generatedApi";
 import { ReferralsBanner } from "components/referral/ReferralsBanner";
 import { useCreateProjectModalRequest } from "hooks/useCreateProjectModal";
+import { useProjectTagFilter } from "hooks/useProjectTagFilter";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import {
   useCursorPagination,
   useSnapBackOnEmptyPage,
 } from "hooks/useCursorPagination";
 import { useHasCustomRolePermission } from "api/roles";
+import { PROPOSED_PROJECT_RESOURCE } from "lib/permissions";
 import { permissionDeniedTip } from "elements/permissionDeniedTip";
+import { TEAM_RESOURCE } from "lib/permissions";
 import { withAuthenticatedPage } from "lib/withAuthenticatedPage";
 import Head from "next/head";
 import { useState, useEffect } from "react";
@@ -144,6 +149,25 @@ function TeamContent({
     [projectQuery],
   );
 
+  const { tagEditUi } = useLaunchDarkly();
+  const canListTags = useHasCustomRolePermission(
+    team.id,
+    "team:projectTags:view",
+    TEAM_RESOURCE,
+    true,
+  );
+  const [tagsFromUrl, setSelectedTags] = useProjectTagFilter();
+  // A `?tag=` in the URL filters the list only once the filter is shown and
+  // the member is known to be allowed to list tags, so neither a hidden
+  // filter nor a still-loading permission check applies one.
+  const selectedTags = tagEditUi && canListTags === true ? tagsFromUrl : [];
+
+  const clearFilters = () => {
+    setProjectQuery("");
+    setDebouncedProjectQuery("");
+    setSelectedTags([]);
+  };
+
   return (
     <>
       {!prefersReferralsBannerHidden && isFreePlan && referralState && (
@@ -176,6 +200,14 @@ function TeamContent({
                 isSearchLoading={debouncedProjectQuery !== projectQuery}
               />
             </div>
+            {tagEditUi && (
+              <ProjectTagFilter
+                teamId={team.id}
+                canListTags={canListTags}
+                selectedTag={selectedTags[0]}
+                onChangeTag={(tag) => setSelectedTags(tag ? [tag] : [])}
+              />
+            )}
             <div className="hidden gap-1 rounded-md border bg-background-secondary p-1 lg:flex">
               <Button
                 icon={<GridIcon />}
@@ -203,6 +235,8 @@ function TeamContent({
         <ProjectGrid
           team={team}
           debouncedProjectQuery={debouncedProjectQuery}
+          selectedTags={selectedTags}
+          onClearFilters={clearFilters}
           showAsList={showAsList}
         />
       )}
@@ -233,7 +267,7 @@ function ProjectActions({ team }: { team: TeamResponse }) {
   const canCreateCustom = useHasCustomRolePermission(
     team.id,
     "project:create",
-    { segments: [{ kind: "project", id: 0, slug: "" }] },
+    PROPOSED_PROJECT_RESOURCE,
     true,
   );
   const canCreate = canCreateCustom !== false;
@@ -274,10 +308,14 @@ function ProjectActions({ team }: { team: TeamResponse }) {
 function ProjectGrid({
   team,
   debouncedProjectQuery,
+  selectedTags,
+  onClearFilters,
   showAsList,
 }: {
   team: TeamResponse;
   debouncedProjectQuery: string;
+  selectedTags: string[];
+  onClearFilters: () => void;
   showAsList: boolean;
 }) {
   const { pageSize, setPageSize } = useProjectsPageSize();
@@ -298,9 +336,11 @@ function ProjectGrid({
     {
       cursor: currentCursor,
       q: debouncedQuery.trim() || undefined,
+      tags: selectedTags,
     },
     30000,
   );
+  const hasFilters = !!debouncedQuery.trim() || selectedTags.length > 0;
 
   const projects = paginatedData?.items ?? [];
   const hasMore = paginatedData?.pagination.hasMore ?? false;
@@ -321,10 +361,11 @@ function ProjectGrid({
     resetPagination();
   };
 
-  // Reset cursor when debounced search query changes
+  // A cursor only means something under the filters that produced it.
+  const tagsKey = selectedTags.join(",");
   useEffect(() => {
     resetPagination();
-  }, [debouncedQuery, resetPagination]);
+  }, [debouncedQuery, tagsKey, resetPagination]);
 
   return (
     <div className="flex flex-col items-center">
@@ -333,12 +374,15 @@ function ProjectGrid({
           <LoadingLogo />
         </div>
       )}
-      {projects.length === 0 && !isLoading && debouncedQuery.trim() && (
+      {projects.length === 0 && !isLoading && hasFilters && (
         <div className="my-24 flex animate-fadeInFromLoading flex-col items-center gap-2 text-content-secondary">
-          There are no projects matching your search.
+          There are no projects matching your filters.
+          <Button variant="neutral" size="sm" onClick={onClearFilters}>
+            Clear filters
+          </Button>
         </div>
       )}
-      {projects.length === 0 && !isLoading && !debouncedQuery.trim() && (
+      {projects.length === 0 && !isLoading && !hasFilters && (
         <EmptySection
           header="Welcome to Convex!"
           sheet={false}

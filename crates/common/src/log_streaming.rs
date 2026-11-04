@@ -393,7 +393,7 @@ pub enum StructuredLogEvent {
         outcome: AiGatewayOutcome,
         environment: AiGatewayEnvironment,
     },
-    /// Topic for log stream egress. Emitted when a log sink sends a batch
+    /// Topic for log stream egress. Emitted when a integration sends a batch
     /// of events to an external service, reporting the egress bytes used.
     LogStreamEgress {
         egress_bytes: u64,
@@ -1051,9 +1051,15 @@ impl FunctionEventSource {
             UdfType::Action => "action",
             UdfType::HttpAction => "http_action",
         };
+        let runtime = match self.module_environment {
+            ModuleEnvironment::Isolate => Some("convex"),
+            ModuleEnvironment::Node => Some("node"),
+            ModuleEnvironment::Invalid => None,
+        };
         let JsonValue::Object(mut fields) = json!({
             "path": self.udf_path,
             "type": udf_type,
+            "runtime": runtime,
             "cached": self.cached,
             "request_id": self.context.request_id.to_string(),
             "mutation_queue_length": self.mutation_queue_length,

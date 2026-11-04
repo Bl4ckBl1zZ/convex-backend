@@ -966,6 +966,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/teams/{team_id}/get_prices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_prices"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/teams/{team_id}/list_active_plans": {
         parameters: {
             query?: never;
@@ -1189,22 +1205,6 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_team_current_billing_period"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/teams/{team_slug}/usage/get_token_info": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_token_info"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2108,6 +2108,9 @@ export interface components {
              */
             expiryDate?: number | null;
         };
+        CurrentPlanPriceResponse: components["schemas"]["MetricPriceRate"] & {
+            includedUnits: string;
+        };
         /** Format: int64 */
         CustomRoleId: number;
         CustomRoleResponse: {
@@ -2269,6 +2272,23 @@ export interface components {
             environmentName?: string | null;
             isProduction?: boolean | null;
         };
+        GetPricesPeriodResponse: {
+            /** Format: int64 */
+            start: number;
+            /** Format: int64 */
+            end: number | null;
+            plan: components["schemas"]["GetPricesPlanResponse"];
+            metrics: {
+                [key: string]: components["schemas"]["CurrentPlanPriceResponse"];
+            };
+        };
+        GetPricesPlanResponse: {
+            planType: string;
+        };
+        GetPricesResponse: {
+            currency: string;
+            periods: components["schemas"]["GetPricesPeriodResponse"][];
+        };
         /** @description Response for getting a project WorkOS environment with credentials - matches
          *     ProvisionProjectEnvironmentResponse pattern with workos_ prefix */
         GetProjectEnvironmentResponse: {
@@ -2289,19 +2309,6 @@ export interface components {
             /** Format: int64 */
             warningThresholdCents?: number | null;
             state?: null | components["schemas"]["SpendingLimitsState"];
-        };
-        GetTokenInfoResponse: {
-            /** Format: int64 */
-            tokensUsed: number;
-            /** Format: int64 */
-            tokensQuota: number;
-            /** Format: int64 */
-            centitokensUsed: number;
-            /** Format: int64 */
-            centitokensQuota: number;
-            isTeamDisabled: boolean;
-            isPaidPlan: boolean;
-            planType: string;
         };
         GroupRoleMappingResponse: {
             role: components["schemas"]["Role"];
@@ -2420,6 +2427,30 @@ export interface components {
             id: components["schemas"]["MemberId"];
             email: string;
             name?: string | null;
+        };
+        MetricPriceAmount: {
+            amount: string;
+            /** Format: double */
+            percentageDiscount?: number | null;
+            /** Format: double */
+            consumedUnits?: number | null;
+        };
+        MetricPriceRate: {
+            rate: components["schemas"]["MetricPriceAmount"];
+        } | components["schemas"]["RegionalRates"] | {
+            deploymentClassRate: {
+                [key: string]: {
+                    regionRate: {
+                        [key: string]: {
+                            amount: string;
+                            /** Format: double */
+                            percentageDiscount?: number | null;
+                            /** Format: double */
+                            consumedUnits?: number | null;
+                        };
+                    };
+                };
+            };
         };
         MfaStatusResponse: {
             enabled: boolean;
@@ -2628,6 +2659,9 @@ export interface components {
             createTime: number;
             prodDeploymentName?: string | null;
             devDeploymentName?: string | null;
+            prodDeploymentReference?: string | null;
+            devDeploymentReference?: string | null;
+            tags?: string[] | null;
         };
         /** @description Summary of a project WorkOS environment for list responses - slimmer than
          *     full environment details, uses workos_ prefix for consistency with
@@ -2702,6 +2736,17 @@ export interface components {
         };
         /** @enum {string} */
         RegionName: "aws-us-east-1" | "aws-eu-west-1" | "aws-ca-central-1" | "aws-ap-southeast-2";
+        RegionalRates: {
+            regionRate: {
+                [key: string]: {
+                    amount: string;
+                    /** Format: double */
+                    percentageDiscount?: number | null;
+                    /** Format: double */
+                    consumedUnits?: number | null;
+                };
+            };
+        };
         RegisterOauthAppArgs: {
             appName: components["schemas"]["AppName"];
             redirectUris: string[];
@@ -2722,8 +2767,8 @@ export interface components {
             effect: components["schemas"]["RoleStatementEffect"];
             actions: components["schemas"]["RoleStatementActions"];
             /**
-             * @description Resource path like `project:*`, `project:slug=my-app`, or
-             *     `project:*:deployment:type=prod`.
+             * @description Resource path like `project:*`, `project:slug=my-app`,
+             *     `project:tag=prod`, or `project:*:deployment:type=prod`.
              * @example project:*
              */
             resource: string;
@@ -2732,7 +2777,7 @@ export interface components {
          * @description An action that can be allowed or denied by a custom role statement.
          * @enum {string}
          */
-        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
+        RoleStatementAction: "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:view" | "project:updateMemberRole" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "defaultEnvironmentVariable:view" | "deployment:create" | "deployment:transfer" | "deployment:receive" | "deployment:updateReference" | "deployment:updateDashboardEditConfirmation" | "deployment:updateExpiresAt" | "deployment:updateSendLogsToClient" | "deployment:updateClass" | "deployment:updateIsDefault" | "deployment:updateType" | "deployment:delete" | "deployment:view" | "deployment:integrations:view" | "deployment:integrations:write" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:customDomain:view" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "member:view" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:changePlan" | "billing:spendingLimit:update" | "billing:view" | "billing:invoices:view" | "team:auditLog:view" | "team:domain:create" | "team:domain:delete" | "team:domain:view" | "team:projectTags:view" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:view" | "oauthApplication:generateClientSecret" | "team:usage:view" | "deployment:insights:view" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "deployment:backups:view" | "sso:enable" | "sso:disable" | "sso:update" | "sso:view" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "directorySync:view" | "customRole:view" | "integration:view" | "integration:create" | "integration:update" | "integration:delete" | "deployment:deploy" | "deployment:env:view" | "deployment:env:write" | "deployment:pause" | "deployment:unpause" | "deployment:logs:view" | "deployment:metrics:view" | "deployment:data:view" | "deployment:data:write" | "deployment:backups:download" | "deployment:functions:actAsUser" | "deployment:functions:runInternalQueries" | "deployment:functions:runInternalMutations" | "deployment:functions:runInternalActions" | "deployment:functions:runTestQuery" | "deployment:auditLog:view" | "deployment:usageLimits:view" | "deployment:usageLimits:write" | "deployment:usage:view" | "deployment:aiGateway:use";
         RoleStatementActions: components["schemas"]["RoleStatementWildcardAction"] | components["schemas"]["RoleStatementAction"][];
         /**
          * @description Whether a rule grants or revokes access.
@@ -3036,6 +3081,7 @@ export type CreateProjectResponse = components['schemas']['CreateProjectResponse
 export type CreateSubscriptionArgs = components['schemas']['CreateSubscriptionArgs'];
 export type CreateTeamArgs = components['schemas']['CreateTeamArgs'];
 export type CreditResponse = components['schemas']['CreditResponse'];
+export type CurrentPlanPriceResponse = components['schemas']['CurrentPlanPriceResponse'];
 export type CustomRoleId = components['schemas']['CustomRoleId'];
 export type CustomRoleResponse = components['schemas']['CustomRoleResponse'];
 export type DeleteAccessTokenArgs = components['schemas']['DeleteAccessTokenArgs'];
@@ -3072,10 +3118,12 @@ export type GenerateSsoConfigurationLinkResponse = components['schemas']['Genera
 export type GetCurrentSpendResponse = components['schemas']['GetCurrentSpendResponse'];
 export type GetOptInsResponse = components['schemas']['GetOptInsResponse'];
 export type GetOrProvisionEnvironmentRequest = components['schemas']['GetOrProvisionEnvironmentRequest'];
+export type GetPricesPeriodResponse = components['schemas']['GetPricesPeriodResponse'];
+export type GetPricesPlanResponse = components['schemas']['GetPricesPlanResponse'];
+export type GetPricesResponse = components['schemas']['GetPricesResponse'];
 export type GetProjectEnvironmentResponse = components['schemas']['GetProjectEnvironmentResponse'];
 export type GetProjectEnvironmentsResponse = components['schemas']['GetProjectEnvironmentsResponse'];
 export type GetSpendingLimitsResponse = components['schemas']['GetSpendingLimitsResponse'];
-export type GetTokenInfoResponse = components['schemas']['GetTokenInfoResponse'];
 export type GroupRoleMappingResponse = components['schemas']['GroupRoleMappingResponse'];
 export type HasAssociatedWorkOsTeamResponse = components['schemas']['HasAssociatedWorkOSTeamResponse'];
 export type HasFailedPaymentResponse = components['schemas']['HasFailedPaymentResponse'];
@@ -3099,6 +3147,8 @@ export type MemberEmailResponse = components['schemas']['MemberEmailResponse'];
 export type MemberId = components['schemas']['MemberId'];
 export type MemberPreferences = components['schemas']['MemberPreferences'];
 export type MemberResponse = components['schemas']['MemberResponse'];
+export type MetricPriceAmount = components['schemas']['MetricPriceAmount'];
+export type MetricPriceRate = components['schemas']['MetricPriceRate'];
 export type MfaStatusResponse = components['schemas']['MfaStatusResponse'];
 export type OauthAppResponse = components['schemas']['OauthAppResponse'];
 export type OptIn = components['schemas']['OptIn'];
@@ -3136,6 +3186,7 @@ export type ProvisionWorkOsTeamResponse = components['schemas']['ProvisionWorkOS
 export type ReferralCode = components['schemas']['ReferralCode'];
 export type ReferralState = components['schemas']['ReferralState'];
 export type RegionName = components['schemas']['RegionName'];
+export type RegionalRates = components['schemas']['RegionalRates'];
 export type RegisterOauthAppArgs = components['schemas']['RegisterOauthAppArgs'];
 export type RemoveMemberArgs = components['schemas']['RemoveMemberArgs'];
 export type RequestCloudBackupArgs = components['schemas']['RequestCloudBackupArgs'];
@@ -3692,6 +3743,8 @@ export interface operations {
                 limit?: number;
                 /** @description Search query to filter projects by name or slug (case-insensitive) */
                 q?: string;
+                /** @description Only return projects with this tag. This parameter can be provided more than once to match projects with any of several tags */
+                tag?: string[];
             };
             header?: never;
             path: {
@@ -4534,6 +4587,33 @@ export interface operations {
             };
         };
     };
+    get_prices: {
+        parameters: {
+            query?: {
+                /** @description Inclusive lower bound in YYYY-MM-DD format, using UTC. */
+                from?: string | null;
+                /** @description Inclusive upper bound in YYYY-MM-DD format, using UTC. */
+                to?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GetPricesResponse"];
+                };
+            };
+        };
+    };
     list_active_plans: {
         parameters: {
             query?: never;
@@ -4843,30 +4923,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TeamCurrentBillingPeriodResponse"];
-                };
-            };
-        };
-    };
-    get_token_info: {
-        parameters: {
-            query?: {
-                from?: string;
-                to?: string;
-            };
-            header?: never;
-            path: {
-                team_slug: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GetTokenInfoResponse"];
                 };
             };
         };

@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
+use bytes::Bytes;
 use common::{
     audit_log_lines::AuditLogLine,
     bootstrap_model::components::handles::FunctionHandle,
@@ -84,6 +85,7 @@ use model::{
         types::FileStorageEntry,
         BatchKey,
         FileStorageId,
+        FileStorageModel,
     },
     scheduled_jobs::{
         VirtualSchedulerModel,
@@ -240,6 +242,7 @@ pub fn system_table_guard(name: &TableName, expect_system_table: bool) -> anyhow
 pub enum AsyncSyscallBatch {
     Reads(Vec<AsyncRead>),
     StorageGetUrls(Vec<JsonValue>),
+    StorageGets(Vec<JsonValue>),
     Unbatched { name: String, args: JsonValue },
 }
 
@@ -249,12 +252,33 @@ pub enum AsyncRead {
     QueryStreamNext(JsonValue),
 }
 
+impl HeapSize for AsyncSyscallBatch {
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Reads(reads) => reads.iter().map(HeapSize::heap_size).sum(),
+            Self::StorageGetUrls(args) | Self::StorageGets(args) => {
+                args.iter().map(HeapSize::heap_size).sum()
+            },
+            Self::Unbatched { name, args } => name.heap_size() + args.heap_size(),
+        }
+    }
+}
+
+impl HeapSize for AsyncRead {
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Get(args) | Self::QueryStreamNext(args) => args.heap_size(),
+        }
+    }
+}
+
 impl AsyncSyscallBatch {
     pub fn new(name: String, args: JsonValue) -> Self {
         match &*name {
             "1.0/get" => Self::Reads(vec![AsyncRead::Get(args)]),
             "1.0/queryStreamNext" => Self::Reads(vec![AsyncRead::QueryStreamNext(args)]),
             "1.0/storageGetUrl" => Self::StorageGetUrls(vec![args]),
+            "1.0/storageGet" => Self::StorageGets(vec![args]),
             _ => Self::Unbatched { name, args },
         }
     }
@@ -269,6 +293,8 @@ impl AsyncSyscallBatch {
             (Self::Reads(_), _) => false,
             (Self::StorageGetUrls(_), "1.0/storageGetUrl") => true,
             (Self::StorageGetUrls(_), _) => false,
+            (Self::StorageGets(_), "1.0/storageGet") => true,
+            (Self::StorageGets(_), _) => false,
             (Self::Unbatched { .. }, _) => false,
         }
     }
@@ -282,6 +308,9 @@ impl AsyncSyscallBatch {
             (Self::StorageGetUrls(batch_args), "1.0/storageGetUrl") => {
                 batch_args.push(args);
             },
+            (Self::StorageGets(batch_args), "1.0/storageGet") => {
+                batch_args.push(args);
+            },
             _ => anyhow::bail!("cannot push {name} onto {self:?}"),
         }
         Ok(())
@@ -292,6 +321,7 @@ impl AsyncSyscallBatch {
             // 1.0/get is grouped in with 1.0/queryStreamNext.
             Self::Reads(_) => "1.0/queryStreamNext",
             Self::StorageGetUrls(_) => "1.0/storageGetUrl",
+            Self::StorageGets(_) => "1.0/storageGet",
             Self::Unbatched { name, .. } => name,
         }
     }
@@ -300,6 +330,7 @@ impl AsyncSyscallBatch {
         match self {
             Self::Reads(args) => args.len(),
             Self::StorageGetUrls(args) => args.len(),
+            Self::StorageGets(args) => args.len(),
             Self::Unbatched { .. } => 1,
         }
     }
@@ -442,7 +473,8 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         let storage_key: ObjectKey = self.rt.new_uuid_v4().to_string().try_into()?;
         let storage_id = StorageUuid::from(self.rt.new_uuid_v4());
 
-        let namespace: TableNamespace = self.phase.component()?.into();
+        let component = self.phase.component()?;
+        let namespace: TableNamespace = component.into();
         let tx = self.phase.tx()?;
         let max_files = tx.transaction_limits().files_written;
         let max_bytes = tx.transaction_limits().file_write_bytes;
@@ -471,11 +503,18 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
             size: blob.len().try_into()?,
             content_type: content_type.map(|ct| ct.to_string()),
         };
+        let component_path = tx.must_component_path(component)?;
         let (id, virtual_id) = self
             .file_storage
             .store_file_entry(tx, namespace, entry)
             .await?;
-        tx.add_pending_file_upload(id, PendingFileUpload { bytes: blob.into() })?;
+        tx.add_pending_file_upload(
+            id,
+            PendingFileUpload {
+                component_path,
+                bytes: blob.into(),
+            },
+        )?;
         Ok(virtual_id)
     }
 
@@ -498,6 +537,92 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         self.file_storage
             .get_file_entry(self.phase.tx()?, component.into(), storage_id)
             .await
+    }
+
+    async fn file_storage_get_batch(
+        &mut self,
+        storage_ids: BTreeMap<BatchKey, FileStorageId>,
+    ) -> BTreeMap<BatchKey, anyhow::Result<Option<(Bytes, Option<String>)>>> {
+        match self.try_file_storage_get_batch(&storage_ids).await {
+            Ok(results) => results,
+            Err(e) => storage_ids
+                .into_keys()
+                .map(|batch_key| (batch_key, Err(e.clone_error())))
+                .collect(),
+        }
+    }
+
+    async fn try_file_storage_get_batch(
+        &mut self,
+        storage_ids: &BTreeMap<BatchKey, FileStorageId>,
+    ) -> anyhow::Result<BTreeMap<BatchKey, anyhow::Result<Option<(Bytes, Option<String>)>>>> {
+        if self.udf_type != UdfType::Mutation {
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "StorageGetNotSupported",
+                "Getting files from storage is only supported in mutations and actions",
+            ));
+        }
+        let component = self.phase.component()?;
+        let tx = self.phase.tx()?;
+        let component_path = tx.must_component_path(component)?;
+        let entries = FileStorageModel::new(tx, component.into())
+            .get_file_batch(storage_ids.clone())
+            .await;
+
+        let mut results = BTreeMap::new();
+        let mut from_downloads = BTreeMap::new();
+        let mut to_download = BTreeMap::new();
+        for (batch_key, entry) in entries {
+            let entry = match entry {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    results.insert(batch_key, Ok(None));
+                    continue;
+                },
+                Err(e) => {
+                    results.insert(batch_key, Err(e));
+                    continue;
+                },
+            };
+            let content_type = entry.content_type.clone();
+            if let Some(upload) = tx.get_pending_file_upload(&entry.id())? {
+                results.insert(batch_key, Ok(Some((upload.bytes, content_type))));
+                continue;
+            }
+            let storage_key = entry.storage_key.clone();
+            if self.file_downloads.get(&storage_key).is_none()
+                && !to_download.contains_key(&storage_key)
+            {
+                if let Err(e) = check_file_read_limits(tx, entry.size.try_into()?) {
+                    results.insert(batch_key, Err(e));
+                    continue;
+                }
+                tx.add_file_storage_read(entry.size.try_into()?);
+                to_download.insert(
+                    storage_key.clone(),
+                    (component_path.clone(), entry.into_value()),
+                );
+            }
+            from_downloads.insert(batch_key, (storage_key, content_type));
+        }
+        if !to_download.is_empty() {
+            let usage_tracker = tx.usage_tracker.clone();
+            self.file_storage
+                .download_files(
+                    &self.file_downloads,
+                    to_download.into_values().collect(),
+                    usage_tracker,
+                )
+                .await?;
+        }
+        for (batch_key, (storage_key, content_type)) in from_downloads {
+            let bytes = self
+                .file_downloads
+                .get(&storage_key)
+                .context("Downloaded file missing from file_downloads")?;
+            results.insert(batch_key, Ok(Some((bytes, content_type))));
+        }
+        Ok(results)
     }
 
     #[fastrace::trace]
@@ -580,7 +705,9 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
             nested_tx.set_transaction_limits(limits);
         }
 
-        let query_journal = if self.is_system() && nested_udf_type == NestedUdfType::Query {
+        let share_query_journal =
+            self.udf_type == UdfType::Query && nested_udf_type == NestedUdfType::Query;
+        let query_journal = if share_query_journal {
             self.prev_journal.clone()
         } else {
             QueryJournal::new()
@@ -602,6 +729,7 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
                         module_loader: self.phase.module_loader().clone(),
                         deployment: self.deployment.clone(),
                     },
+                    file_downloads: self.file_downloads.clone(),
                 },
                 rng_seed,
                 new_reactor_depth,
@@ -670,7 +798,15 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
 
         self.syscall_trace.merge(&syscall_trace);
 
-        if self.is_system() && nested_udf_type == NestedUdfType::Query && result.is_ok() {
+        if share_query_journal && result.is_ok() && journal.end_cursor.is_some() {
+            anyhow::ensure!(
+                self.next_journal.end_cursor.is_none(),
+                ErrorMetadata::bad_request(
+                    "MultiplePaginatedDatabaseQueries",
+                    "This query function ran multiple paginated queries. Convex only supports a \
+                     single paginated query in each query function.",
+                )
+            );
             self.next_journal = journal;
         }
 
@@ -744,6 +880,7 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
         AsyncSyscallBatch::StorageGetUrls(batch_args) => {
             storage_get_url_batch(provider, batch_args).await
         },
+        AsyncSyscallBatch::StorageGets(batch_args) => storage_get_batch(provider, batch_args).await,
         AsyncSyscallBatch::Unbatched { name, args } => {
             let result = match &name[..] {
                 // Database
@@ -759,6 +896,8 @@ pub(super) async fn run_async_syscall_batch<RT: Runtime>(
                 "1.0/getRequestMetadata" => request_metadata(provider),
                 // Auth
                 "1.0/getUserIdentity" => Box::pin(get_user_identity(provider, args)).await,
+                "1.0/signJwt" => Box::pin(sign_deployment_jwt(provider, args)).await,
+                "1.0/getDeploymentJwks" => deployment_jwks(provider),
                 // Storage
                 "1.0/storageDelete" => Box::pin(storage_delete(provider, args)).await,
                 "1.0/storageGetMetadata" => Box::pin(storage_get_metadata(provider, args)).await,
@@ -1003,6 +1142,50 @@ async fn get_user_identity<RT: Runtime>(
     Ok(RawValue::NULL.to_owned())
 }
 
+/// Syscall for JWT signing in mutations.
+///
+/// Not supported in queries (JWT creation involves the current time and query
+/// caching makes it too likely that an incorrect value would later be served).
+#[convex_macro::instrument_future]
+async fn sign_deployment_jwt<RT: Runtime>(
+    provider: &mut DatabaseUdfSyscallProvider<RT>,
+    args: JsonValue,
+) -> anyhow::Result<Box<RawValue>> {
+    if provider.udf_type != UdfType::Mutation {
+        anyhow::bail!(ErrorMetadata::bad_request(
+            "JwtSignInQuery",
+            "ctx.auth.signJwt() can't be called from a query. Call it from a mutation.",
+        ));
+    }
+    let default_system_env_vars = provider.phase.default_system_env_vars().clone();
+    let component = provider.phase.component()?;
+    let tx = provider.phase.tx()?;
+    let origin = udf::deployment_jwt::deployment_origin(tx, &default_system_env_vars).await?;
+    let signer = tx
+        .get_component_path(component)
+        .context("Calling component not found")?;
+    let keys = provider.key_broker.deployment_jwt_keys()?;
+    let token = udf::deployment_jwt::mint(
+        keys,
+        &origin,
+        signer,
+        args,
+        provider.phase.unix_timestamp()?.as_system_time(),
+    )?;
+    Ok(serde_json::value::to_raw_value(&token)?)
+}
+
+/// The public keys that verify `ctx.auth.signJwt` tokens, the same JWKS that
+/// `/.well-known/jwks.json` serves. Unlike signing, this is allowed in
+/// queries: the keys are deployment state shared by every caller, not a fresh
+/// value like a token's `iat` and `exp`.
+fn deployment_jwks<RT: Runtime>(
+    provider: &mut DatabaseUdfSyscallProvider<RT>,
+) -> anyhow::Result<Box<RawValue>> {
+    let jwks = provider.key_broker.deployment_jwt_keys()?.jwks()?;
+    Ok(serde_json::value::to_raw_value(&jwks)?)
+}
+
 #[convex_macro::instrument_future]
 async fn storage_generate_upload_url<RT: Runtime>(
     provider: &mut DatabaseUdfSyscallProvider<RT>,
@@ -1111,6 +1294,79 @@ async fn storage_store<RT: Runtime>(
         .file_storage_store(blob, content_type, expected_sha256)
         .await?;
     Ok(serde_json::value::to_raw_value(&storage_id.encode())?)
+}
+
+fn check_file_read_limits<RT: Runtime>(tx: &Transaction<RT>, size: usize) -> anyhow::Result<()> {
+    let max_files = tx.transaction_limits().files_read;
+    let max_bytes = tx.transaction_limits().file_read_bytes;
+    let read = &tx.file_storage_read_size;
+    anyhow::ensure!(
+        read.num_reads < max_files,
+        ErrorMetadata::bad_request(
+            "TooManyFilesRead",
+            format!("Too many files read by this mutation (limit: {max_files})")
+        )
+    );
+    anyhow::ensure!(
+        read.size + size <= max_bytes,
+        ErrorMetadata::bad_request(
+            "FilesReadTooLarge",
+            format!(
+                "Too large total size of the files read by this mutation (limit: {max_bytes} \
+                 bytes)"
+            )
+        )
+    );
+    Ok(())
+}
+
+#[convex_macro::instrument_future]
+async fn storage_get_batch<RT: Runtime>(
+    provider: &mut DatabaseUdfSyscallProvider<RT>,
+    batch_args: Vec<JsonValue>,
+) -> Vec<anyhow::Result<Box<RawValue>>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GetArgs {
+        storage_id: String,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GetResult {
+        /// Base64-encoded file contents.
+        blob: String,
+        content_type: Option<String>,
+    }
+    let batch_size = batch_args.len();
+    let mut results = BTreeMap::new();
+    let mut storage_ids = BTreeMap::new();
+    for (idx, args) in batch_args.into_iter().enumerate() {
+        let storage_id_result = with_argument_error("storage.get", || {
+            let GetArgs { storage_id } = serde_json::from_value(args)?;
+            storage_id.parse().context(ArgName("storageId"))
+        });
+        match storage_id_result {
+            Ok(storage_id) => {
+                storage_ids.insert(idx, storage_id);
+            },
+            Err(e) => {
+                assert!(results.insert(idx, Err(e)).is_none());
+            },
+        }
+    }
+    let files = provider.file_storage_get_batch(storage_ids).await;
+    for (batch_key, file) in files {
+        let result = file.and_then(|file| {
+            let result = file.map(|(contents, content_type)| GetResult {
+                blob: base64::encode(&contents),
+                content_type,
+            });
+            Ok(serde_json::value::to_raw_value(&result)?)
+        });
+        assert!(results.insert(batch_key, result).is_none());
+    }
+    assert_eq!(results.len(), batch_size);
+    results.into_values().collect()
 }
 
 #[convex_macro::instrument_future]
@@ -1996,13 +2252,6 @@ async fn query_page<RT: Runtime>(
     };
 
     let component = provider.phase.component()?;
-    if !component.is_root() && !provider.is_system() {
-        anyhow::bail!(ErrorMetadata::bad_request(
-                "PaginationUnsupportedInComponents",
-                "paginate() is only supported in the app. Learn more at https://docs.convex.dev/components/authoring#pagination",
-            ));
-    }
-
     let tx = provider.phase.tx()?;
 
     let (
@@ -2049,15 +2298,17 @@ async fn query_page<RT: Runtime>(
         }
     );
 
-    anyhow::ensure!(
-        provider.next_journal.end_cursor.is_none(),
-        ErrorMetadata::bad_request(
-            "MultiplePaginatedDatabaseQueries",
-            "This query or mutation function ran multiple paginated queries. Convex only supports \
-             a single paginated query in each function.",
-        )
-    );
-    provider.next_journal.end_cursor = Some(cursor);
+    if provider.udf_type == UdfType::Query {
+        anyhow::ensure!(
+            provider.next_journal.end_cursor.is_none(),
+            ErrorMetadata::bad_request(
+                "MultiplePaginatedDatabaseQueries",
+                "This query function ran multiple paginated queries. Convex only supports a \
+                 single paginated query in each query function.",
+            )
+        );
+        provider.next_journal.end_cursor = Some(cursor);
+    }
 
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]

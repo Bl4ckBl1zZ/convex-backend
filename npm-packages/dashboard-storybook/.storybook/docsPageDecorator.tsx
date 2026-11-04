@@ -18,6 +18,7 @@ import {
   useCurrentProjectWithStatus,
   usePaginatedProjects,
   useProjectById,
+  useTeamProjectTags,
 } from "../../dashboard/src/api/projects";
 import {
   useIsCurrentMemberTeamAdmin,
@@ -180,6 +181,9 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
     createTime: Date.now(),
     prodDeploymentName: "musical-otter-456",
     devDeploymentName: "happy-capybara-123",
+    prodDeploymentReference: "production",
+    devDeploymentReference: "dev/nicolas",
+    tags: ["frontend", "billing"],
   } as NonNullable<ReturnType<typeof useProjectBySlug>>;
   const shouldMockCurrentProject = title.startsWith("docs/pages/project/");
   const shouldMockCurrentDeployment = title.startsWith(
@@ -261,6 +265,7 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
   mocked(useTeamMembers).mockReturnValue(mockTeamMembers);
   mocked(useCurrentTeam).mockReturnValue(mockTeam);
   mocked(useIsCurrentMemberTeamAdmin).mockReturnValue(true);
+  mocked(useTeamProjectTags).mockReturnValue(["billing", "frontend"]);
   mocked(usePaginatedProjects).mockReturnValue({
     items: [mockProject],
     pagination: {
@@ -364,12 +369,16 @@ export const docsPageDecorator: DecoratorFunction<ReactRenderer> = (
   mocked(useLaunchDarkly).mockReturnValue({
     ...flagDefaults,
     enableStatuspageWidget: false,
+    tagEditUi: true,
     ...docsPageParams?.launchDarkly,
   });
   mocked(useCurrentDeployment).mockReturnValue(
     shouldMockCurrentDeployment ? activeDeployment : undefined,
   );
-  mocked(useDeploymentByName).mockReturnValue(undefined);
+  mocked(useDeploymentByName).mockReturnValue({
+    deployment: undefined,
+    notFound: false,
+  });
   mocked(useDeploymentRegions).mockReturnValue({
     regions: [
       {

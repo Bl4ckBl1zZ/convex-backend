@@ -1,3 +1,4 @@
+import { componentTablesIncluded } from "./s3ExportSelection";
 import { useContext, useState } from "react";
 import { ChevronRightIcon, ExternalLinkIcon } from "@radix-ui/react-icons";
 import { Button } from "@ui/Button";
@@ -122,7 +123,9 @@ export function S3ExportStatus({ existing }: { existing: S3Export }) {
             </>
           ) : (
             <>
-              {isStarting(existing) ? (
+              {needsRoleArn(existing) ? (
+                <HealthLabel type="pending">Finish AWS setup</HealthLabel>
+              ) : isStarting(existing) ? (
                 <HealthLabel type="pending">Starting first sync</HealthLabel>
               ) : (
                 <HealthIndicator status={existing.status} />
@@ -148,13 +151,19 @@ export function S3ExportStatus({ existing }: { existing: S3Export }) {
 function S3ExportDetails({ existing }: { existing: S3Export }) {
   const deploymentName = useDeploymentName();
   const { bucket, region, prefix } = existing.config;
-  const tablesPath = `${exportRoot(prefix, deploymentName)}/tables/`;
+  const dataLakePath = `${exportRoot(prefix, deploymentName)}/data-lake/`;
   const database = glueDatabaseName(deploymentName);
   const status = syncStatus(existing);
+  const components = componentTablesIncluded(existing.config.selection);
   return (
     <div className="flex flex-col gap-4 py-3 text-xs">
       {status ? (
         <SyncProgress status={status} />
+      ) : needsRoleArn(existing) ? (
+        <p className="font-medium">
+          Waiting for the role ARN. Edit the export to launch the CloudFormation
+          stack and paste it.
+        </p>
       ) : isStarting(existing) ? (
         <div className="flex items-center gap-1.5">
           {/* `Spinner` defaults to `ml-auto` for use as a trailing element. */}
@@ -172,21 +181,29 @@ function S3ExportDetails({ existing }: { existing: S3Export }) {
         </div>
       )}
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
+        <dt className="text-content-secondary">Component tables</dt>
+        <dd>
+          {components === "indeterminate"
+            ? "Custom selection"
+            : components
+              ? "Included"
+              : "Excluded"}
+        </dd>
         <dt className="text-content-secondary">S3 location</dt>
         <dd className="min-w-0 break-all">
           <Link
-            href={`https://s3.console.aws.amazon.com/s3/buckets/${bucket}?region=${region}&prefix=${encodeURIComponent(tablesPath)}`}
+            href={`https://s3.console.aws.amazon.com/s3/buckets/${bucket}?region=${encodeURIComponent(region)}&prefix=${encodeURIComponent(dataLakePath)}`}
             target="_blank"
             className="inline-flex items-center gap-1"
           >
-            s3://{bucket}/{tablesPath}
+            s3://{bucket}/{dataLakePath}
             <ExternalLinkIcon className="shrink-0" />
           </Link>
         </dd>
         <dt className="text-content-secondary">Glue database</dt>
         <dd className="min-w-0 break-all">
           <Link
-            href={`https://${region}.console.aws.amazon.com/glue/home?region=${region}#/v2/data-catalog/databases/view/${database}`}
+            href={`https://console.aws.amazon.com/glue/home?region=${encodeURIComponent(region)}#/v2/data-catalog/databases/view/${database}`}
             target="_blank"
             className="inline-flex items-center gap-1"
           >
@@ -199,10 +216,20 @@ function S3ExportDetails({ existing }: { existing: S3Export }) {
   );
 }
 
+// A role export the admin has not finished on the AWS side. A failure or a
+// deletion in progress says more, so those statuses win.
+export function needsRoleArn(existing: S3Export) {
+  return (
+    existing.config.roleArn === "" &&
+    existing.status.type !== "failed" &&
+    existing.status.type !== "deleting"
+  );
+}
+
 // No page has landed yet, and nothing has gone wrong.
 function isStarting(existing: S3Export) {
   return (
-    !existing.config.progress &&
+    !existing.exportProgress &&
     existing.status.type !== "failed" &&
     existing.status.type !== "deleting"
   );
@@ -214,7 +241,7 @@ function isStarting(existing: S3Export) {
  * export has failed or is being deleted.
  */
 export function syncStatus(existing: S3Export): SyncStatus | undefined {
-  const { progress } = existing.config;
+  const progress = existing.exportProgress;
   if (
     !progress ||
     existing.status.type === "failed" ||

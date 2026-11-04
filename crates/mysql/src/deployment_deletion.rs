@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::VecDeque,
     sync::Arc,
     time::{
@@ -10,7 +9,7 @@ use std::{
 
 use anyhow::Context;
 use common::{
-    knobs::DATABASE_USE_PREPARED_STATEMENTS,
+    knobs::DEPLOYMENT_DELETION_BATCH_SIZE,
     persistence::PersistenceGlobalKey,
     runtime::Runtime,
     types::{
@@ -22,13 +21,16 @@ use common::{
 };
 use mysql_async::{
     consts::ColumnType,
+    IsolationLevel,
     Row,
     Value,
 };
-use url::Url;
 
 use crate::{
-    connection::MySqlConnection,
+    connection::{
+        MySqlConnection,
+        ER_NO_SUCH_TABLE,
+    },
     v6::{
         sql::{
             LogBucket,
@@ -40,13 +42,10 @@ use crate::{
     MySqlInstanceName,
 };
 
-const BATCH_SIZE: usize = 2500;
 const DOCUMENT_KEY: &[&str] = &["ts", "table_id", "id"];
 const V5_INDEX_KEY: &[&str] = &["index_id", "key_prefix", "key_sha256", "ts"];
 const V6_INDEX_KEY: &[&str] = &["index_id", "key_prefix", "key_suffix_hash"];
 const V6_LOG_KEY: &[&str] = &["index_id", "key_prefix", "key_suffix_hash", "ts"];
-
-const ER_NO_SUCH_TABLE: u16 = 1146;
 
 #[derive(Clone, Debug)]
 pub enum DeploymentDeletionTarget {
@@ -62,6 +61,12 @@ enum TableKind {
     IndexesLatest,
     IndexesBackfillDeletes,
     Log(LogBucket),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DeploymentDeletionTable {
+    Documents,
+    Indexes,
 }
 
 struct TableLayout {
@@ -108,17 +113,21 @@ pub struct DeploymentDeletionCursor {
     deleter_id: Arc<()>,
     documents: Option<TableCursor>,
     indexes: VecDeque<TableCursor>,
+    next_table: DeploymentDeletionTable,
+}
+
+impl DeploymentDeletionCursor {
+    pub fn next_table(&self) -> DeploymentDeletionTable {
+        self.next_table
+    }
 }
 
 pub struct DeploymentDeletionBatch {
-    /// `None` when the document walk finished in an earlier batch.
-    pub documents_deleted: Option<u64>,
-    /// Rows deleted across index tables; `None` if all index walks finished
-    /// earlier.
-    pub indexes_deleted: Option<u64>,
+    pub table: DeploymentDeletionTable,
+    pub rows_deleted: u64,
     pub next_cursor: Option<DeploymentDeletionCursor>,
-    /// Time spent in the slower of the two mutations, used to pace replication.
-    pub delete_elapsed: Duration,
+    /// Minimum cooldown after this batch to protect replication.
+    pub replication_delay: Duration,
 }
 
 struct TableBatch {
@@ -137,35 +146,26 @@ impl<RT: Runtime> DeploymentDeletionPool<RT> {
     pub fn connect(
         cluster_url: &str,
         require_ssl: bool,
-        runtime: RT,
         version: PersistenceVersion,
     ) -> anyhow::Result<Self> {
-        let mut url: Url = cluster_url.parse().context("invalid MySQL cluster URL")?;
-        anyhow::ensure!(
-            !url.username().is_empty(),
-            "MySQL cluster URL username must be set"
-        );
-        let db_name = url.path().trim_start_matches('/').to_string();
-        anyhow::ensure!(
-            !db_name.is_empty(),
-            "MySQL cluster URL must contain a database name"
-        );
-        if require_ssl {
-            url.query_pairs_mut().append_pair("require_ssl", "true");
-        }
-        url.query_pairs_mut()
-            .append_pair("enable_cleartext_plugin", "true");
-        let pool = Arc::new(ConvexMySqlPool::new(
-            &url,
-            *DATABASE_USE_PREPARED_STATEMENTS,
-            true, /* require_leader */
-            Some(runtime),
-        )?);
+        let (pool, db_name) = ConvexMySqlPool::connect_cluster(cluster_url, require_ssl)?;
         Ok(Self {
-            pool,
+            pool: Arc::new(pool),
             db_name,
             version,
         })
+    }
+
+    pub(crate) fn from_pool(
+        pool: Arc<ConvexMySqlPool<RT>>,
+        db_name: String,
+        version: PersistenceVersion,
+    ) -> Self {
+        Self {
+            pool,
+            db_name,
+            version,
+        }
     }
 
     pub fn target(&self, name: MySqlInstanceName, id: DeploymentId) -> DeploymentDeletionTarget {
@@ -279,10 +279,12 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
             deleter_id: self.deleter_id.clone(),
             documents: Some(TableCursor::new(TableKind::Documents)),
             indexes,
+            next_table: DeploymentDeletionTable::Documents,
         })
     }
 
-    /// Deletes one document range and one index-table range per batch.
+    /// Deletes one primary-key range, alternating documents and indexes while
+    /// both have work remaining.
     pub async fn delete_batch(
         &self,
         cursor: &DeploymentDeletionCursor,
@@ -292,40 +294,61 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
             Arc::ptr_eq(&self.deleter_id, &cursor.deleter_id),
             "deletion cursor belongs to a different deleter"
         );
-        let (documents, indexes) = futures::try_join!(
-            self.delete_table_batch(cursor.documents.as_ref()),
-            self.delete_table_batch(cursor.indexes.front()),
-        )?;
-        let mut remaining_indexes = cursor.indexes.clone();
-        remaining_indexes.pop_front();
-        if let Some(next) = indexes.next_cursor {
-            remaining_indexes.push_front(next);
-        }
-        let next_cursor = if documents.next_cursor.is_none() && remaining_indexes.is_empty() {
-            None
-        } else {
-            Some(DeploymentDeletionCursor {
-                deleter_id: self.deleter_id.clone(),
-                documents: documents.next_cursor,
-                indexes: remaining_indexes,
-            })
+
+        let table_cursor = match cursor.next_table {
+            DeploymentDeletionTable::Documents => cursor
+                .documents
+                .as_ref()
+                .context("deletion cursor has no document table")?,
+            DeploymentDeletionTable::Indexes => cursor
+                .indexes
+                .front()
+                .context("deletion cursor has no index table")?,
         };
-        Ok(DeploymentDeletionBatch {
-            documents_deleted: cursor.documents.as_ref().map(|_| documents.rows_deleted),
-            indexes_deleted: cursor.indexes.front().map(|_| indexes.rows_deleted),
+        let TableBatch {
+            rows_deleted,
             next_cursor,
-            delete_elapsed: cmp::max(documents.delete_elapsed, indexes.delete_elapsed),
+            delete_elapsed,
+        } = self.delete_table_batch(table_cursor).await?;
+
+        let mut documents = cursor.documents.clone();
+        let mut remaining_indexes = cursor.indexes.clone();
+        match cursor.next_table {
+            DeploymentDeletionTable::Documents => documents = next_cursor,
+            DeploymentDeletionTable::Indexes => {
+                remaining_indexes.pop_front();
+                if let Some(next) = next_cursor {
+                    remaining_indexes.push_front(next);
+                }
+            },
+        }
+
+        let next_table = match cursor.next_table {
+            DeploymentDeletionTable::Documents if !remaining_indexes.is_empty() => {
+                Some(DeploymentDeletionTable::Indexes)
+            },
+            DeploymentDeletionTable::Indexes if documents.is_some() => {
+                Some(DeploymentDeletionTable::Documents)
+            },
+            _ if documents.is_some() => Some(DeploymentDeletionTable::Documents),
+            _ if !remaining_indexes.is_empty() => Some(DeploymentDeletionTable::Indexes),
+            _ => None,
+        };
+        let next_cursor = next_table.map(|next_table| DeploymentDeletionCursor {
+            deleter_id: self.deleter_id.clone(),
+            documents,
+            indexes: remaining_indexes,
+            next_table,
+        });
+        Ok(DeploymentDeletionBatch {
+            table: cursor.next_table,
+            rows_deleted,
+            next_cursor,
+            replication_delay: delete_elapsed * 2,
         })
     }
 
-    async fn delete_table_batch(&self, cursor: Option<&TableCursor>) -> anyhow::Result<TableBatch> {
-        let Some(cursor) = cursor else {
-            return Ok(TableBatch {
-                rows_deleted: 0,
-                next_cursor: None,
-                delete_elapsed: Duration::ZERO,
-            });
-        };
+    async fn delete_table_batch(&self, cursor: &TableCursor) -> anyhow::Result<TableBatch> {
         let connection_name = match cursor.kind {
             TableKind::Documents => "delete_deployment_documents",
             TableKind::Indexes
@@ -381,7 +404,7 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
         }
         boundary_query.push_str(&format!(
             " ORDER BY {tenant_column}, {columns} LIMIT 1 OFFSET {}",
-            BATCH_SIZE - 1
+            DEPLOYMENT_DELETION_BATCH_SIZE.get() - 1
         ));
         let next_key = conn
             .query_optional(&boundary_query, boundary_params)
@@ -413,11 +436,23 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
                 CursorBound::Through,
             );
         }
+        // The revoked lease excludes valid writers; READ COMMITTED additionally avoids
+        // next-key locks blocking unrelated activity around the bounded range.
         let started = Instant::now();
-        let rows_deleted = conn
+        let mut tx = conn
+            .transaction(
+                self.pool.cluster_name(),
+                Some(IsolationLevel::ReadCommitted),
+            )
+            .await
+            .with_context(|| format!("begin {table} range deletion"))?;
+        let rows_deleted = tx
             .exec_iter(&delete_query, delete_params)
             .await
             .with_context(|| format!("delete {table} range"))?;
+        tx.commit()
+            .await
+            .with_context(|| format!("commit {table} range deletion"))?;
         Ok(TableBatch {
             rows_deleted,
             next_cursor: next_key.map(|key| TableCursor {
@@ -454,6 +489,21 @@ impl<RT: Runtime> DeploymentDeleter<RT> {
         )
         .await?;
         Ok(globals_deleted)
+    }
+
+    /// Pauses between batches to let MySQL replication catch up.
+    pub async fn delete_all(&self) -> anyhow::Result<()> {
+        let mut cursor = self.begin().await?;
+        loop {
+            let batch = self.delete_batch(&cursor).await?;
+            let Some(next) = batch.next_cursor else {
+                break;
+            };
+            cursor = next;
+            tokio::time::sleep(batch.replication_delay).await;
+        }
+        self.finish().await?;
+        Ok(())
     }
 }
 
