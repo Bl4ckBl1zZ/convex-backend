@@ -35,6 +35,7 @@ sb.mock(import("dashboard/src/api/optins.ts"), { spy: true });
 sb.mock(import("dashboard/src/api/api.ts"), { spy: true });
 sb.mock(import("dashboard/src/hooks/useLaunchDarkly.tsx"), { spy: true });
 sb.mock(import("dashboard/src/hooks/usePostHog.ts"), { spy: true });
+sb.mock(import("dashboard/src/hooks/useProjectTagFilter.ts"), { spy: true });
 sb.mock(import("dashboard/src/hooks/useServerSideData.ts"), {
   spy: true,
 });

@@ -4,9 +4,12 @@ import { Tooltip } from "@ui/Tooltip";
 import { Spinner } from "@ui/Spinner";
 import { formatBytes, formatNumberCompact } from "@common/lib/format";
 import { UsageSummaryRow } from "hooks/usageMetrics";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { formatQuantity } from "./lib/formatQuantity";
-import { ReactNode } from "react";
+import { ReactNode, useEffect } from "react";
+import { captureException } from "@sentry/nextjs";
 import { TeamEntitlementsResponse } from "generatedApi";
+
 import {
   QuestionMarkCircledIcon,
   CrossCircledIcon,
@@ -16,6 +19,13 @@ import { cn } from "@ui/cn";
 import { useRouter } from "next/router";
 import { Donut } from "@ui/Donut";
 import { Loading } from "@ui/Loading";
+import type { UsagePricing } from "./lib/usagePrices";
+import {
+  getMultiPeriodUsageSpend,
+  getUsageSpend,
+  formatSpend,
+} from "./lib/usageSpend";
+import type { PricedUsageState, UsageSpend } from "./lib/usageSpend";
 
 const BUSINESS_METRIC_TO_SECTION: Record<string, string> = {
   functionCalls: "functionCalls",
@@ -54,8 +64,11 @@ type BusinessMetricKey =
 
 type Section = {
   metric: BusinessMetricKey;
-  // TODO: Remove string fallback once teamMaxSearchQueries is in generated types
-  entitlement?: keyof TeamEntitlementsResponse | string;
+  entitlement?: {
+    [K in keyof TeamEntitlementsResponse]: TeamEntitlementsResponse[K] extends number
+      ? K
+      : never;
+  }[keyof TeamEntitlementsResponse];
   format: (value: number) => string;
   detail: string;
   title: string;
@@ -234,6 +247,9 @@ export function BusinessPlanSummary({
   entitlements,
   hasSubscription = false,
   showEntitlements = false,
+  pricing = { status: "unavailable", reason: "unsupported-period" },
+  spendApplicable = true,
+  pricedUsage = { status: "loading" },
 }: {
   summary?: UsageSummaryRow[];
   error?: any;
@@ -243,8 +259,20 @@ export function BusinessPlanSummary({
   entitlements?: TeamEntitlementsResponse;
   hasSubscription?: boolean;
   showEntitlements?: boolean;
+  pricing?: UsagePricing;
+  spendApplicable?: boolean;
+  pricedUsage?: PricedUsageState;
 }) {
   const router = useRouter();
+  const { dashboardShowCashUsage } = useLaunchDarkly();
+  const showSpend = dashboardShowCashUsage && pricing.status !== "unavailable";
+  const gridColumns = hasSubscription
+    ? showSpend
+      ? "grid-cols-[4fr_3fr_2fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_2fr_auto]"
+      : "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
+    : showSpend
+      ? "grid-cols-[5fr_4fr_2fr_auto]"
+      : "grid-cols-[5fr_4fr_auto]";
   const activeSections = isBusinessPlan ? businessSections : selfServeSections;
 
   // Deployment counts live on the summary rows but are team-wide (the gauge has
@@ -316,9 +344,7 @@ export function BusinessPlanSummary({
         <div
           className={cn(
             "grid items-center gap-2 rounded-t border-b px-4 py-2 text-sm text-content-secondary",
-            hasSubscription
-              ? "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-              : "grid-cols-[5fr_4fr_auto]",
+            gridColumns,
           )}
         >
           <div>Resource</div>
@@ -345,6 +371,17 @@ export function BusinessPlanSummary({
                 tip="Usage beyond your plan's included limits."
                 side="right"
                 className="hidden sm:block"
+              >
+                <QuestionMarkCircledIcon />
+              </Tooltip>
+            </div>
+          )}
+          {showSpend && (
+            <div className="flex items-center gap-1">
+              Spend
+              <Tooltip
+                tip="Storage metrics show estimated monthly prices based on the most recent usage in the selected period."
+                side="right"
               >
                 <QuestionMarkCircledIcon />
               </Tooltip>
@@ -380,9 +417,7 @@ export function BusinessPlanSummary({
               !aiCostFailed;
             const entitlement =
               section.entitlement && entitlements
-                ? ((entitlements as Record<string, unknown>)[
-                    section.entitlement
-                  ] as number | undefined)
+                ? entitlements[section.entitlement]
                 : undefined;
 
             const includedAmount = section.allOnDemand
@@ -402,27 +437,55 @@ export function BusinessPlanSummary({
                 ? includedAmount
                 : metric;
 
+            const estimatedMonthly =
+              section.metric === "databaseStorage" ||
+              section.metric === "fileStorage" ||
+              section.metric === "searchStorage";
+            const pricedSummaryFailed =
+              !estimatedMonthly &&
+              section.metric !== "aiGatewayCost" &&
+              pricedUsage.status === "error";
+            const pricedSummaryPending =
+              !estimatedMonthly &&
+              section.metric !== "aiGatewayCost" &&
+              pricedUsage.status === "loading";
+
+            const spend =
+              showSpend && pricing.status === "ready" && spendApplicable
+                ? section.metric === "aiGatewayCost"
+                  ? aiCostFailed || aiGatewayCost === undefined
+                    ? undefined
+                    : { amount: aiGatewayCost, missingDimensions: [] }
+                  : estimatedMonthly
+                    ? getUsageSpend(
+                        summary,
+                        section.metric,
+                        pricing.periods.at(-1)?.period,
+                      )
+                    : pricedUsage.status === "ready"
+                      ? getMultiPeriodUsageSpend(
+                          pricedUsage.summaries,
+                          section.metric,
+                        )
+                      : undefined
+                : undefined;
+
             return (
-              <Button
+              <div
                 key={index}
-                variant="unstyled"
-                onClick={() => {
-                  void router.push(linkHref, undefined, { shallow: true });
-                }}
                 className={cn(
-                  "group grid min-h-10 items-center gap-2 rounded-sm px-4 py-2 text-left transition-colors hover:bg-background-primary focus-visible:bg-background-primary focus-visible:outline-2 focus-visible:outline-border-selected",
-                  hasSubscription
-                    ? "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-                    : "grid-cols-[5fr_4fr_auto]",
+                  "group grid min-h-10 items-center gap-2 rounded-sm px-4 py-2 text-left transition-colors focus-within:bg-background-primary hover:bg-background-primary",
+                  gridColumns,
                 )}
               >
                 <div className="flex items-center gap-2">
                   {showEntitlements &&
                     (entitlement !== undefined ? (
                       <Tooltip
+                        aria-label={`${section.title} included usage`}
                         side="bottom"
                         tip={`Your team has used ${(100 * (displayedUsage / entitlement)).toFixed(2)}% of the included amount of ${section.title}.`}
-                        className="flex animate-fadeInFromLoading items-center"
+                        className="flex animate-fadeInFromLoading items-center rounded-sm focus-visible:ring-2 focus-visible:ring-border-selected"
                       >
                         <Donut current={displayedUsage} max={entitlement} />
                       </Tooltip>
@@ -431,9 +494,7 @@ export function BusinessPlanSummary({
                       // the gauged ones.
                       <div className="hidden size-6 sm:block" />
                     ))}
-                  <SectionLabel detail={section.detail}>
-                    {section.title}
-                  </SectionLabel>
+                  <SectionLabel title={section.title} detail={section.detail} />
                 </div>
                 <div className="animate-fadeInFromLoading">
                   {hasSubscription && section.allOnDemand ? (
@@ -498,18 +559,97 @@ export function BusinessPlanSummary({
                     )}
                   </div>
                 )}
-                <span className="flex items-center gap-1 text-xs text-content-secondary">
-                  <span className="hidden whitespace-nowrap opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline">
+                {showSpend && (
+                  <div className="animate-fadeInFromLoading tabular-nums">
+                    {!spendApplicable ||
+                    section.metric === "deploymentCount" ? (
+                      <span className="text-content-secondary">N/A</span>
+                    ) : pricing.status === "error" ||
+                      aiCostFailed ||
+                      pricedSummaryFailed ? (
+                      <span className="text-content-secondary">
+                        Unavailable
+                      </span>
+                    ) : pricing.status === "loading" ||
+                      aiCostPending ||
+                      pricedSummaryPending ? (
+                      <Loading fullHeight={false} className="h-4 w-16" />
+                    ) : (
+                      <SpendValue
+                        spend={spend}
+                        sectionTitle={section.title}
+                        estimatedMonthly={estimatedMonthly}
+                        reportUnavailable={
+                          pricing.status === "ready" &&
+                          section.metric !== "aiGatewayCost"
+                        }
+                      />
+                    )}
+                  </div>
+                )}
+                <Button
+                  variant="unstyled"
+                  aria-label={`View ${section.title} breakdown by day`}
+                  onClick={() => {
+                    void router.push(linkHref, undefined, { shallow: true });
+                  }}
+                  className="flex items-center gap-1 rounded-sm text-xs text-content-secondary hover:text-content-primary focus-visible:outline-2 focus-visible:outline-border-selected"
+                >
+                  <span className="hidden whitespace-nowrap opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 sm:inline">
                     View breakdown by day
                   </span>
                   <ChevronRightIcon className="size-4" />
-                </span>
-              </Button>
+                </Button>
+              </div>
             );
           })
         )}
       </div>
     </Sheet>
+  );
+}
+
+function SpendValue({
+  spend,
+  sectionTitle,
+  reportUnavailable,
+  estimatedMonthly,
+}: {
+  spend: UsageSpend | undefined;
+  sectionTitle: string;
+  reportUnavailable: boolean;
+  estimatedMonthly: boolean;
+}) {
+  const missingDimensions = spend?.missingDimensions.join(", ");
+  const missingBillingInformation =
+    spend === undefined
+      ? reportUnavailable
+      : spend.missingDimensions.length > 0;
+
+  useEffect(() => {
+    if (missingBillingInformation) {
+      captureException(
+        new Error(
+          `Spend unavailable: missing billing information for ${sectionTitle}`,
+        ),
+        { extra: { sectionTitle, missingDimensions } },
+      );
+    }
+  }, [missingBillingInformation, sectionTitle, missingDimensions]);
+
+  return (
+    <span className="inline-flex items-center gap-1 whitespace-nowrap">
+      {spend === undefined || spend.missingDimensions.length > 0 ? (
+        <span className="text-content-secondary">N/A</span>
+      ) : estimatedMonthly ? (
+        <span>
+          {formatSpend(spend.amount)}
+          <span className="ml-1 text-content-secondary">/ month</span>
+        </span>
+      ) : (
+        formatSpend(spend.amount)
+      )}
+    </span>
   );
 }
 
@@ -538,16 +678,21 @@ function PlanSummaryLoading() {
 
 function SectionLabel({
   detail,
-  children,
+  title,
 }: {
   detail?: ReactNode;
-  children: ReactNode;
+  title: string;
 }) {
   return (
     <p className="flex animate-fadeInFromLoading items-center text-sm">
-      {children}
+      {title}
       {detail !== null && detail !== undefined ? (
-        <Tooltip tip={detail} side="right" className="hidden sm:block">
+        <Tooltip
+          aria-label={`${title} details`}
+          tip={detail}
+          side="right"
+          className="hidden rounded-sm focus-visible:ring-2 focus-visible:ring-border-selected sm:block"
+        >
           <QuestionMarkCircledIcon className="ml-1" />
         </Tooltip>
       ) : null}

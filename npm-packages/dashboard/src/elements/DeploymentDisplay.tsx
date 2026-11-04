@@ -11,7 +11,10 @@ import {
 } from "api/deployments";
 import { useCurrentTeam, useTeamEntitlements, useTeamMembers } from "api/teams";
 import { useProfile } from "api/profile";
-import { useRememberLastViewedDeploymentForProject } from "hooks/useLastViewed";
+import {
+  useRememberLastViewedDeploymentForProject,
+  useRememberLastViewedNonDefaultDeployment,
+} from "hooks/useLastViewed";
 import { cn } from "@ui/cn";
 import { useRouter } from "next/router";
 import { PlatformDeploymentResponse } from "@convex-dev/platform/managementApi";
@@ -111,7 +114,7 @@ export function DeploymentDisplay({ project }: { project: ProjectDetails }) {
   const { deployments } = useDeployments(project.id);
   const fetchByName =
     deployments === undefined && !deploymentName?.startsWith("local-");
-  const deploymentFromName = useDeploymentByName(
+  const { deployment: deploymentFromName } = useDeploymentByName(
     fetchByName ? deploymentName : undefined,
   );
   const fallbackDeployment =
@@ -123,6 +126,7 @@ export function DeploymentDisplay({ project }: { project: ProjectDetails }) {
   const member = useProfile();
 
   useRememberLastViewedDeploymentForProject(project.slug, deployment?.name);
+  useRememberLastViewedNonDefaultDeployment(project, deployment);
 
   const teamMembers = useTeamMembers(project.teamId);
 

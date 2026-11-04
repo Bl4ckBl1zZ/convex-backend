@@ -17,7 +17,10 @@ use common::{
     },
     errors::report_error_sync,
     execution_context::ExecutionContext,
-    knobs::ISOLATE_MAX_USER_HEAP_SIZE,
+    knobs::{
+        ISOLATE_MAX_USER_HEAP_SIZE,
+        MAX_LOG_LINES_DATABASE_UDFS,
+    },
 };
 use fastrace::local::LocalSpan;
 use futures::{
@@ -136,7 +139,10 @@ use deno_core::{
     },
 };
 use errors::ErrorMetadata;
-use file_storage::TransactionalFileStorage;
+use file_storage::{
+    FileDownloads,
+    TransactionalFileStorage,
+};
 use keybroker::FunctionRunnerKeyBroker;
 use rand_chacha::ChaCha12Rng;
 use serde_json::Value as JsonValue;
@@ -179,9 +185,9 @@ use crate::{
     },
     environment::{
         helpers::{
+            log_overflow_log_line,
             module_loader::module_specifier_from_path,
             resolve_promise,
-            MAX_LOG_LINES,
         },
         AsyncOpRequest,
         JsEnvironment,
@@ -223,6 +229,7 @@ pub struct DatabaseUdfSyscallProvider<RT: Runtime> {
 
     phase: UdfPhase<RT>,
     file_storage: TransactionalFileStorage<RT>,
+    file_downloads: FileDownloads,
 
     query_manager: QueryManager<RT>,
 
@@ -248,6 +255,10 @@ pub struct DatabaseUdfEnvironment<RT: Runtime, S = DatabaseUdfSyscallProvider<RT
     pub syscall_provider: S,
     pub pending_syscalls: WithHeapSize<VecDeque<PendingSyscall>>,
     pub _phantom: PhantomData<RT>,
+}
+
+pub fn async_op_not_allowed_in_udf(request: &AsyncOpRequest) -> ErrorMetadata {
+    not_allowed_in_udf(request.name_for_error(), &request.description_for_error())
 }
 
 fn not_allowed_in_udf(name: &str, description: &str) -> ErrorMetadata {
@@ -360,10 +371,7 @@ impl<RT: Runtime, S: DatabaseUdfInnerProvider<RT>> JsEnvironment<RT>
         request: AsyncOpRequest,
         _resolver: Self::AsyncResolver,
     ) -> anyhow::Result<()> {
-        anyhow::bail!(not_allowed_in_udf(
-            request.name_for_error(),
-            &request.description_for_error(),
-        ))
+        anyhow::bail!(async_op_not_allowed_in_udf(&request))
     }
 
     fn environment_heap_size(&self) -> usize {
@@ -650,6 +658,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
             journal,
             context,
             environment_data,
+            file_downloads,
         }: UdfRequest<RT>,
         reactor_depth: usize,
         client_id: String,
@@ -682,6 +691,7 @@ impl<RT: Runtime> DatabaseUdfEnvironment<RT> {
                         component,
                     ),
                     file_storage,
+                    file_downloads,
 
                     query_manager: QueryManager::new(),
 
@@ -1324,20 +1334,15 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
     }
 
     pub fn emit_log_line(&mut self, log_line: LogLine) {
+        let max_log_lines = *MAX_LOG_LINES_DATABASE_UDFS;
         // - 1 to reserve for the [ERROR] log line
-        match self.log_lines.len().cmp(&(MAX_LOG_LINES - 1)) {
+        match self.log_lines.len().cmp(&(max_log_lines - 1)) {
             Ordering::Less => self.log_lines.push(log_line),
             Ordering::Equal => {
                 drop(log_line);
-                let log_line = LogLine::new_developer_log_line(
-                    LogLevel::Error,
-                    vec![format!(
-                        "Log overflow (maximum {MAX_LOG_LINES}). Remaining log lines omitted."
-                    )],
-                    // Note: accessing the current time here is still deterministic since
-                    // we don't externalize the time to the function.
-                    self.rt.unix_timestamp(),
-                );
+                // Note: accessing the current time here is still deterministic since
+                // we don't externalize the time to the function.
+                let log_line = log_overflow_log_line(max_log_lines, self.rt.unix_timestamp());
                 self.log_lines.push(log_line);
             },
             Ordering::Greater => (),
@@ -1349,27 +1354,22 @@ impl<RT: Runtime> DatabaseUdfSyscallProvider<RT> {
         path: CanonicalizedComponentFunctionPath,
         log_lines: LogLines,
     ) {
+        let max_log_lines = *MAX_LOG_LINES_DATABASE_UDFS;
         // -1 to reserve for the [ERROR] log line
-        if self.log_lines.len() > MAX_LOG_LINES - 1 {
+        if self.log_lines.len() > max_log_lines - 1 {
             // We have previously exceeded the logging limit, so skip these logs.
             return;
         }
-        if self.log_lines.len() + log_lines.len() > MAX_LOG_LINES - 1 {
+        if self.log_lines.len() + log_lines.len() > max_log_lines - 1 {
             // We are about to exceed the logging limit, so truncate the logs.
-            let allowed_length = MAX_LOG_LINES - 1 - self.log_lines.len();
+            let allowed_length = max_log_lines - 1 - self.log_lines.len();
             self.log_lines.push(LogLine::SubFunction {
                 path,
                 log_lines: log_lines.truncated(allowed_length),
             });
-            let log_line = LogLine::new_developer_log_line(
-                LogLevel::Error,
-                vec![format!(
-                    "Log overflow (maximum {MAX_LOG_LINES}). Remaining log lines omitted."
-                )],
-                // Note: accessing the current time here is still deterministic since
-                // we don't externalize the time to the function.
-                self.rt.unix_timestamp(),
-            );
+            // Note: accessing the current time here is still deterministic since
+            // we don't externalize the time to the function.
+            let log_line = log_overflow_log_line(max_log_lines, self.rt.unix_timestamp());
             self.log_lines.push(log_line);
         } else {
             self.log_lines

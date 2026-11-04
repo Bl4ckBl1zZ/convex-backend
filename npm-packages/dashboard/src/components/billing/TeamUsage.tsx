@@ -1,4 +1,6 @@
 import { BusinessPlanSummary } from "components/billing/PlanSummary";
+import { useUsageByPricingPeriod } from "hooks/useUsageByPricingPeriod";
+import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { Sheet } from "@ui/Sheet";
 import { Spinner } from "@ui/Spinner";
 import { Button } from "@ui/Button";
@@ -12,7 +14,8 @@ import { useTeamEntitlements } from "api/teams";
 import { NoPermissionMessage } from "elements/NoPermissionMessage";
 import { TEAM_RESOURCE } from "lib/permissions";
 import { useProjectById, useProjectBySlug } from "api/projects";
-import { useTeamOrbSubscription } from "api/billing";
+import { useTeamOrbSubscription, useTeamPrices } from "api/billing";
+import { getUsagePricing } from "./lib/usagePrices";
 import groupBy from "lodash/groupBy";
 import sumBy from "lodash/sumBy";
 import { Period } from "elements/UsagePeriodSelector";
@@ -200,19 +203,28 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
         } as const)
       : selectedBillingPeriod;
 
+  const billingPeriodRange = shownBillingPeriod
+    ? { from: shownBillingPeriod.from, to: shownBillingPeriod.to }
+    : null;
   const dateRange =
-    shownBillingPeriod !== null &&
-    shownBillingPeriod.type !== "currentBillingPeriod"
-      ? { from: shownBillingPeriod.from, to: shownBillingPeriod.to }
+    shownBillingPeriod?.type !== "currentBillingPeriod"
+      ? billingPeriodRange
       : null;
 
   const { subscription } = useTeamOrbSubscription(team?.id);
 
   const isBusinessPlanType = subscription?.plan.planType === "CONVEX_BUSINESS";
 
-  const billingPeriodRange = shownBillingPeriod
-    ? { from: shownBillingPeriod.from, to: shownBillingPeriod.to }
-    : null;
+  const prices = useTeamPrices(team.id, billingPeriodRange);
+  const pricing = getUsagePricing(prices, billingPeriodRange);
+  const spendApplicable =
+    !query.projectSlug && projectId === null && !componentPrefix;
+  const { dashboardShowCashUsage } = useLaunchDarkly();
+  const pricedUsage = useUsageByPricingPeriod({
+    teamId: team.id,
+    pricing,
+    enabled: dashboardShowCashUsage && spendApplicable,
+  });
 
   const { data: aiGatewayCostByDay, error: aiGatewayCostError } =
     useAiGatewayCostPerDayByProject(
@@ -321,6 +333,9 @@ function TeamUsageContents({ team }: { team: TeamResponse }) {
                 <BusinessPlanSummary
                   summary={summary}
                   error={summaryError}
+                  pricing={pricing}
+                  pricedUsage={pricedUsage}
+                  spendApplicable={spendApplicable}
                   aiGatewayCost={aiGatewayCost}
                   aiGatewayCostError={aiGatewayCostError}
                   isBusinessPlan={isBusinessPlanType}

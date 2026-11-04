@@ -5,29 +5,55 @@ use std::{
 
 use common::{
     backoff::Backoff,
+    document::ParsedDocument,
     errors::report_error,
+    execution_context::ExecutionId,
+    fastrace_helpers::get_sampled_span,
     runtime::Runtime,
+    types::UdfIdentifier,
+    RequestId,
 };
 use database::Database;
+use errors::ErrorMetadataAnyhowExt;
 use exports::interface::ExportProvider;
+use fastrace::future::FutureExt as _;
 use keybroker::Identity;
-use model::log_sinks::{
-    types::{
-        s3_export::{
-            S3ExportProgress,
-            SyncPeriod,
+use model::{
+    integrations::{
+        types::{
+            s3_export::S3ExportCredentials,
+            IntegrationConfig,
+            IntegrationDocument,
+            IntegrationState,
+            IntegrationType,
         },
-        SinkConfig,
-        SinkType,
+        IntegrationsModel,
     },
-    LogSinksModel,
+    s3_export_state::{
+        types::{
+            S3ExportCheckpoint,
+            S3ExportProgress,
+        },
+        S3ExportStateModel,
+    },
 };
 use streaming_export::{
     managed::{
+        ByoAwsCredentials,
         SyncDestination,
         SyncFormat,
     },
     SyncStatus,
+};
+use usage_tracking::{
+    CallType,
+    UsageCounter,
+};
+
+use crate::metrics::{
+    log_s3_export_progress,
+    log_s3_export_worker_failed,
+    s3_export_sync_timer,
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -39,6 +65,7 @@ pub struct S3ExportWorker<RT: Runtime> {
     database: Database<RT>,
     instance_name: String,
     export_provider: Arc<dyn ExportProvider<RT>>,
+    usage_counter: UsageCounter,
 }
 
 impl<RT: Runtime> S3ExportWorker<RT> {
@@ -47,12 +74,14 @@ impl<RT: Runtime> S3ExportWorker<RT> {
         database: Database<RT>,
         instance_name: String,
         export_provider: Arc<dyn ExportProvider<RT>>,
+        usage_counter: UsageCounter,
     ) -> Self {
         Self {
             runtime,
             database,
             instance_name,
             export_provider,
+            usage_counter,
         }
     }
 
@@ -62,6 +91,7 @@ impl<RT: Runtime> S3ExportWorker<RT> {
             match self.run_once().await {
                 Ok(()) => backoff.reset(),
                 Err(error) => {
+                    log_s3_export_worker_failed(&error);
                     report_error(&mut error.context("S3ExportWorker failed")).await;
                     let delay = backoff.fail(&mut self.runtime.rng());
                     self.runtime.wait(delay).await;
@@ -72,112 +102,209 @@ impl<RT: Runtime> S3ExportWorker<RT> {
 
     async fn run_once(&self) -> anyhow::Result<()> {
         let mut tx = self.database.begin(Identity::system()).await?;
-        let export = LogSinksModel::new(&mut tx)
-            .get_by_provider(SinkType::S3Export)
+        let export = IntegrationsModel::new(&mut tx)
+            .get_by_provider(IntegrationType::S3Export)
             .await?;
-        let token = tx.into_token()?;
         let Some(export) = export else {
+            let token = tx.into_token()?;
             self.database
                 .subscribe_and_wait_for_invalidation(token)
                 .await?;
             return Ok(());
         };
-        let SinkConfig::S3Export(config) = &export.config else {
+        let IntegrationConfig::S3Export(config) = &export.config else {
             anyhow::bail!("S3 export document has a different configuration type");
         };
-        let previous_cursor = config.cursor.as_deref();
-        let page = self
-            .export_provider
-            .sync(
-                &self.instance_name,
-                &self.database.latest_database_snapshot()?,
-                SyncDestination::ByoAwsBucket {
-                    bucket: config.bucket.clone(),
-                    region: config.region.clone(),
-                    prefix: config.prefix.clone(),
-                    endpoint_url: None,
-                    access_key_id: config.access_key_id.0.clone(),
-                    secret_access_key: config.secret_access_key.0.clone(),
-                },
-                SyncFormat::Iceberg,
-                &config.selection,
-                config.cursor.clone(),
-            )
-            .await?;
-        anyhow::ensure!(
-            !page.cursor.is_empty(),
-            "Export provider returned an empty S3 export cursor"
-        );
-        if page.cursor == previous_cursor.unwrap_or_default()
-            && !matches!(&page.status, SyncStatus::UpToDate { .. })
-        {
-            anyhow::bail!(
-                "Export provider returned an unchanged cursor before the export caught up"
-            );
+        if !config.credentials.is_ready() {
+            let token = tx.into_token()?;
+            self.database
+                .subscribe_and_wait_for_invalidation(token)
+                .await?;
+            return Ok(());
         }
-
+        let state = S3ExportStateModel::new(&mut tx)
+            .get(export.developer_id())
+            .await?;
+        let previous_checkpoint = state.map(|state| state.checkpoint.clone());
+        // A page can outlast the write log's retention (30 s on a busy
+        // deployment), and a transaction that old can no longer commit. So
+        // this one ends here, and the progress transaction below re-reads the
+        // export instead.
+        drop(tx);
+        let page = {
+            let database_snapshot = self.database.latest_database_snapshot()?;
+            let timer = s3_export_sync_timer();
+            let span = get_sampled_span(
+                &self.instance_name,
+                "s3_export_worker/sync",
+                &mut self.runtime.rng(),
+            );
+            let page = self
+                .export_provider
+                .sync(
+                    &self.instance_name,
+                    &database_snapshot,
+                    SyncDestination::ByoAwsBucket {
+                        bucket: config.bucket.clone(),
+                        region: config.region.clone(),
+                        prefix: config.prefix.clone(),
+                        endpoint_url: None,
+                        credentials: match &config.credentials {
+                            S3ExportCredentials::AccessKey {
+                                access_key_id,
+                                secret_access_key,
+                            } => ByoAwsCredentials::AccessKey {
+                                access_key_id: access_key_id.0.clone(),
+                                secret_access_key: secret_access_key.0.clone(),
+                            },
+                            S3ExportCredentials::Role {
+                                role_arn,
+                                external_id,
+                            } => ByoAwsCredentials::Role {
+                                role_arn: role_arn.clone(),
+                                external_id: external_id.clone(),
+                            },
+                        },
+                    },
+                    SyncFormat::Iceberg,
+                    &config.selection,
+                    &export.developer_id().to_string(),
+                )
+                .in_span(span)
+                .await;
+            match &page {
+                Ok(_) => {
+                    timer.finish();
+                },
+                Err(error) => {
+                    timer.finish_with(error.metric_status_label_value());
+                },
+            }
+            match page {
+                Ok(page) => page,
+                // A user error from the destination is the customer's to fix,
+                // so the export shows it. The worker keeps retrying, and the
+                // next page that lands marks the export active again.
+                Err(error) if error.is_bad_request() => {
+                    self.set_status(
+                        &export,
+                        IntegrationState::Failed {
+                            reason: error.user_facing_message(),
+                        },
+                    )
+                    .await?;
+                    return Err(error);
+                },
+                Err(error) => return Err(error),
+            }
+        };
+        log_s3_export_progress(&page.status, *self.database.now_ts_for_reads());
+        // Porter commits the page in the destination before returning it, so
+        // a returned page is a billed page. The progress checkpoint below is
+        // for the dashboard and can lose an OCC race without unbilling anything.
+        self.usage_counter
+            .track_call(
+                UdfIdentifier::SystemJob("s3_export".to_string()),
+                ExecutionId::new(),
+                RequestId::new(),
+                CallType::Export,
+                true,
+                page.usage.clone(),
+            )
+            .await;
+        // The page is already committed in the destination, so losing this
+        // progress update to a concurrent configuration edit loses no data.
+        let checkpoint = S3ExportCheckpoint {
+            progress: export_progress(&page.status)?,
+        };
         let mut tx = self.database.begin(Identity::system()).await?;
-        let progress = export_progress(&page.status)?;
-        if !LogSinksModel::new(&mut tx)
-            .advance_s3_export(
+        // A page synced under a configuration that has since changed does not
+        // describe the current export.
+        let current = IntegrationsModel::new(&mut tx)
+            .get_by_provider(IntegrationType::S3Export)
+            .await?;
+        if !is_same_export(current.as_ref(), &export) {
+            return Ok(());
+        }
+        if !S3ExportStateModel::new(&mut tx)
+            .advance(
                 export.developer_id(),
-                config,
-                page.cursor.clone(),
-                progress.clone(),
+                previous_checkpoint.as_ref(),
+                checkpoint.clone(),
             )
             .await?
         {
             return Ok(());
         }
-        if page.cursor != previous_cursor.unwrap_or_default()
-            || config.progress.as_ref() != Some(&progress)
-        {
+        if previous_checkpoint.as_ref() != Some(&checkpoint) {
             self.database
-                .commit_with_write_source(tx, "s3_export_worker_advance_cursor")
+                .commit_with_write_source(tx, "s3_export_worker_record_progress")
                 .await?;
+        } else {
+            drop(tx);
         }
-
+        // After the checkpoint commit, which reads this document.
+        self.set_status(&export, IntegrationState::Active).await?;
         if matches!(&page.status, SyncStatus::UpToDate { .. }) {
             let mut tx = self.database.begin(Identity::system()).await?;
-            let current = LogSinksModel::new(&mut tx)
-                .get_by_provider(SinkType::S3Export)
+            let current = IntegrationsModel::new(&mut tx)
+                .get_by_provider(IntegrationType::S3Export)
                 .await?;
-            let mut updated_config = config.clone();
-            updated_config.cursor = Some(page.cursor.clone());
-            updated_config.progress = Some(progress);
-            let current_is_same_export = current.is_some_and(|current| {
-                current.developer_id() == export.developer_id()
-                    && current.config == SinkConfig::S3Export(updated_config)
-            });
-            if !current_is_same_export {
+            if !is_same_export(current.as_ref(), &export) {
+                return Ok(());
+            }
+            let current_state = S3ExportStateModel::new(&mut tx)
+                .get(export.developer_id())
+                .await?;
+            if current_state.is_none_or(|current| current.checkpoint != checkpoint) {
                 return Ok(());
             }
             let next_write_ts = (*self.database.now_ts_for_reads()).succ()?;
             let token = tx.into_token()?;
-            let interval = match config.period {
-                SyncPeriod::Continuous => None,
-                SyncPeriod::Hourly => Some(Duration::from_secs(60 * 60)),
-                SyncPeriod::Daily => Some(Duration::from_secs(24 * 60 * 60)),
-            };
             let invalidated = self.database.subscribe_and_wait_for_invalidation(token);
-            match interval {
-                None => {
-                    tokio::select! {
-                        result = invalidated => { result?; },
-                        _ = self.database.wait_for_write_ts(next_write_ts) => {},
-                        _ = self.runtime.wait(CONTINUOUS_POLL_INTERVAL) => {},
-                    }
-                },
-                Some(interval) => {
-                    tokio::select! {
-                        result = invalidated => { result?; },
-                        _ = self.runtime.wait(interval) => {},
-                    }
-                },
+            tokio::select! {
+                result = invalidated => { result?; },
+                _ = self.database.wait_for_write_ts(next_write_ts) => {},
+                _ = self.runtime.wait(CONTINUOUS_POLL_INTERVAL) => {},
             }
         }
         Ok(())
     }
+
+    /// Sets the export's status unless it already has it, or the export
+    /// changed since `export` was read.
+    async fn set_status(
+        &self,
+        export: &ParsedDocument<IntegrationDocument>,
+        status: IntegrationState,
+    ) -> anyhow::Result<()> {
+        if export.status == status {
+            return Ok(());
+        }
+        let mut tx = self.database.begin(Identity::system()).await?;
+        let mut model = IntegrationsModel::new(&mut tx);
+        let current = model.get_by_provider(IntegrationType::S3Export).await?;
+        if !is_same_export(current.as_ref(), export)
+            || current.is_some_and(|current| current.status == status)
+        {
+            return Ok(());
+        }
+        model.patch_status(export.developer_id(), status).await?;
+        self.database
+            .commit_with_write_source(tx, "s3_export_worker_set_status")
+            .await?;
+        Ok(())
+    }
+}
+
+/// Whether `current` is still the export a page was synced for.
+fn is_same_export(
+    current: Option<&ParsedDocument<IntegrationDocument>>,
+    export: &ParsedDocument<IntegrationDocument>,
+) -> bool {
+    current.is_some_and(|current| {
+        current.developer_id() == export.developer_id() && current.config == export.config
+    })
 }
 
 fn export_progress(status: &SyncStatus) -> anyhow::Result<S3ExportProgress> {

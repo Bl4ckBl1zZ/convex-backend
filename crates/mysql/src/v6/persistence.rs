@@ -3,10 +3,10 @@ use std::{
         BTreeMap,
         BTreeSet,
     },
-    ops::Bound,
     sync::{
         atomic::{
             AtomicBool,
+            AtomicI64,
             Ordering,
         },
         Arc,
@@ -20,20 +20,11 @@ use std::{
 use anyhow::Context;
 use async_trait::async_trait;
 use common::{
-    cover,
-    errors::lease_lost_error,
-    index::{
-        IndexKeyBytes,
-        MAX_INDEX_KEY_PREFIX_LEN,
+    errors::{
+        database_operational_error,
+        lease_lost_error,
     },
     interval::Interval,
-    knobs::{
-        INDEX_RETENTION_DELETE_CHUNK,
-        MYSQL_FALLBACK_PAGE_SIZE,
-        MYSQL_MAX_QUERY_BATCH_SIZE,
-        MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE,
-        MYSQL_MIN_QUERY_BATCH_SIZE,
-    },
     persistence::{
         ConflictStrategy,
         DocumentLogEntry,
@@ -44,7 +35,6 @@ use common::{
         IndexRetentionProgress,
         IndexRetentionRequest,
         IndexStream,
-        LatestDocument,
         PersistenceGlobalKey,
         PersistenceIndexEntry,
         PersistenceReader,
@@ -75,7 +65,6 @@ use common::{
         TabletId,
     },
 };
-use errors::ErrorMetadata;
 use fastrace::prelude::*;
 use futures::{
     StreamExt,
@@ -96,9 +85,9 @@ use super::{
         self,
         IndexEngine,
     },
+    reader::DocumentScope,
     sql::{
         self,
-        LogBucket,
         LogBucketBounds,
     },
     PersistenceDeploymentId,
@@ -110,13 +99,11 @@ use crate::{
         ApproxSize,
     },
     connection::{
-        is_message_too_large_error,
         MySqlConnection,
         MySqlTransaction,
     },
     document_encoding,
     metrics,
-    ConnectError,
     ConvexMySqlPool,
     MySqlOptions,
     MySqlReaderOptions,
@@ -137,16 +124,67 @@ struct Inner<RT: Runtime> {
     db_name: String,
     deployment_id: PersistenceDeploymentId,
     fresh: AtomicBool,
+    published: PublishedBucketBounds,
     engine: IndexEngine,
 }
 
+/// Readers and writers share the maximum observed maintenance bounds.
+/// A torn read is safe: scans retry a stale ceiling, and a stale floor includes
+/// extra buckets (refreshing the bounds if maintenance has dropped one).
+#[derive(Default)]
+pub(crate) struct PublishedBucketBounds {
+    created_through_ts: AtomicI64,
+    oldest_kept_ts: AtomicI64,
+}
+
+impl PublishedBucketBounds {
+    pub(super) fn observe(&self, created_through_ts: i64, oldest_kept_ts: i64) {
+        self.created_through_ts
+            .fetch_max(created_through_ts, Ordering::Relaxed);
+        self.oldest_kept_ts
+            .fetch_max(oldest_kept_ts, Ordering::Relaxed);
+    }
+
+    pub(super) fn load(&self) -> anyhow::Result<LogBucketBounds> {
+        LogBucketBounds::from_state(
+            self.created_through_ts.load(Ordering::Relaxed),
+            self.oldest_kept_ts.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(super) async fn refresh<RT: Runtime>(
+        &self,
+        connection: &mut MySqlConnection<'_, RT>,
+    ) -> anyhow::Result<()> {
+        let row: Row = connection
+            .query_optional(sql::READ_LOG_BUCKET_BOUNDS, vec![])
+            .await?
+            .context("MySQL V6 log bucket maintenance state is missing")?;
+        self.observe(
+            row.get_opt(0).context("created_through_ts")??,
+            row.get_opt(1).context("oldest_kept_ts")??,
+        );
+        Ok(())
+    }
+}
+
 impl<RT: Runtime> Persistence<RT> {
+    fn backfill(&self) -> super::backfill::Backfill<'_, RT, Lease<RT>> {
+        super::backfill::Backfill {
+            pool: &self.inner.pool,
+            db_name: &self.inner.db_name,
+            deployment_id: self.inner.deployment_id,
+            engine: &self.inner.engine,
+            lease: &self.lease,
+        }
+    }
+
     pub(crate) async fn new(
         pool: Arc<ConvexMySqlPool<RT>>,
         db_name: String,
         options: MySqlOptions,
         lease_lost_shutdown: ShutdownSignal,
-    ) -> Result<Self, ConnectError> {
+    ) -> anyhow::Result<Self> {
         let deployment_id = deployment_id_from_options(
             options.version,
             options.multitenant,
@@ -168,40 +206,37 @@ impl<RT: Runtime> Persistence<RT> {
         deployment_id: PersistenceDeploymentId,
         allow_read_only: bool,
         lease_lost_shutdown: ShutdownSignal,
-    ) -> Result<Self, ConnectError> {
+    ) -> anyhow::Result<Self> {
         Self::initialize_schema(&pool, &db_name).await?;
         let mut connection = pool.acquire("v6_init_deployment", &db_name).await?;
         connection
             .exec_iter(super::INIT_LEASE, vec![deployment_id.into()])
             .await?;
-        if !allow_read_only
-            && connection
-                .query_optional(super::CHECK_READ_ONLY, vec![deployment_id.into()])
-                .await?
-                .is_some()
-        {
-            return Err(ConnectError::ReadOnly);
-        }
-        let fresh = connection
-            .query_optional(documents::check_newly_created(), vec![deployment_id.into()])
-            .await?
-            .is_none();
         drop(connection);
         let lease = Arc::new(
             Lease::acquire(
                 pool.clone(),
                 db_name.clone(),
                 deployment_id,
+                allow_read_only,
                 lease_lost_shutdown,
             )
             .await?,
         );
+        // Check after acquiring the lease
+        let mut connection = pool.acquire("v6_check_newly_created", &db_name).await?;
+        let fresh = connection
+            .query_optional(documents::check_newly_created(), vec![deployment_id.into()])
+            .await?
+            .is_none();
+        drop(connection);
         Ok(Self {
             inner: Arc::new(Inner {
                 pool,
                 db_name,
                 deployment_id,
                 fresh: AtomicBool::new(fresh),
+                published: PublishedBucketBounds::default(),
                 engine: IndexEngine::new(deployment_id),
             }),
             lease,
@@ -290,6 +325,7 @@ impl<RT: Runtime> Persistence<RT> {
                 db_name,
                 deployment_id,
                 fresh: AtomicBool::new(false),
+                published: PublishedBucketBounds::default(),
                 engine: IndexEngine::new(deployment_id),
             }),
         })
@@ -334,6 +370,33 @@ impl<RT: Runtime> Persistence<RT> {
             .is_some())
     }
 
+    /// Publication precedes every displacement into a bucket. The ceiling only
+    /// advances, so a cached ceiling remains safe across maintenance rounds.
+    async fn ensure_published_bucket(&self, ts: Timestamp) -> anyhow::Result<()> {
+        let ts = i64::from(ts);
+        let ceiling = || {
+            self.inner
+                .published
+                .created_through_ts
+                .load(Ordering::Relaxed)
+        };
+        if ts < ceiling() {
+            return Ok(());
+        }
+        let mut connection = self
+            .inner
+            .pool
+            .acquire("v6_write_ceiling", &self.inner.db_name)
+            .await?;
+        self.inner.published.refresh(&mut connection).await?;
+        if ts >= ceiling() {
+            return Err(database_operational_error(anyhow::anyhow!(
+                "MySQL V6 index displacement at {ts} awaits log bucket publication"
+            )));
+        }
+        Ok(())
+    }
+
     fn document_params(&self, update: &DocumentLogEntry) -> anyhow::Result<Vec<Value>> {
         if let Some(document) = &update.value {
             anyhow::ensure!(update.id == document.id_with_table_id());
@@ -364,7 +427,7 @@ impl<RT: Runtime> Reader<RT> {
         include_previous_revision: bool,
         range: TimestampRange,
         order: Order,
-        mut page_size: u32,
+        page_size: u32,
         retention_validator: Arc<dyn RetentionValidator>,
     ) {
         anyhow::ensure!(page_size > 0);
@@ -400,26 +463,9 @@ impl<RT: Runtime> Reader<RT> {
                 params.push(Value::Bytes(tablet_id.0.into()));
             }
             params.push(Value::Int(i64::from(page_size)));
-            let rows = match connection
+            let rows = connection
                 .query_collect(&query, params, page_size as usize, Ok)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if is_message_too_large_error(error).is_some() => {
-                    if page_size == 1 {
-                        anyhow::bail!(
-                            "Failed to load a V6 document within the Vitess message limit"
-                        );
-                    }
-                    page_size = if page_size <= *MYSQL_FALLBACK_PAGE_SIZE {
-                        1
-                    } else {
-                        *MYSQL_FALLBACK_PAGE_SIZE
-                    };
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+                .await?;
             drop(connection);
             retention_validator
                 .validate_document_snapshot(range.min_timestamp_inclusive())
@@ -458,228 +504,6 @@ impl<RT: Runtime> Reader<RT> {
             }
         }
         metrics::finish_load_documents_timer(timer, num_returned, self.inner.pool.cluster_name());
-    }
-
-    /// What maintenance last published about the log buckets, read on the
-    /// scan's connection right before the page that uses it.
-    async fn log_bucket_bounds(
-        &self,
-        connection: &mut crate::connection::MySqlConnection<'_, RT>,
-    ) -> anyhow::Result<LogBucketBounds> {
-        let row: Row = connection
-            .query_optional(sql::READ_LOG_BUCKET_BOUNDS, vec![])
-            .await?
-            .context("MySQL V6 log bucket maintenance state is missing")?;
-        let created_through_ts: i64 = row.get_opt(0).context("created_through_ts")??;
-        let oldest_kept_ts: i64 = row.get_opt(1).context("oldest_kept_ts")??;
-        LogBucketBounds::from_state(created_through_ts, oldest_kept_ts)
-    }
-
-    #[try_stream(ok = (IndexKeyBytes, LatestDocument), error = anyhow::Error)]
-    async fn index_scan_impl(
-        &self,
-        index: IndexRef,
-        tablet_id: TabletId,
-        read_timestamp: Timestamp,
-        interval: Interval,
-        order: Order,
-        size_hint: usize,
-        retention_validator: Arc<dyn RetentionValidator>,
-    ) {
-        retention_validator.optimistic_validate_snapshot(read_timestamp)?;
-        let _timer = metrics::query_index_timer(self.inner.pool.cluster_name());
-        let mut stats = metrics::QueryIndexStats::new(self.inner.pool.cluster_name());
-        let (mut lower, mut upper) = sql::to_sql_bounds(interval.clone());
-        let snapshot_bucket = LogBucket::from_successor_ts(read_timestamp);
-        let persistence_index_id = index.persistence_index_id().with_context(|| {
-            format!(
-                "MySQL V6 requires a persistence index ID to read index {}",
-                index.id()
-            )
-        })?;
-        // The size hint makes the common case one query. Later pages grow to
-        // correct for tombstones, long prefixes and a wrong hint, unless a
-        // fallback pinned the size.
-        let mut page_size =
-            size_hint.clamp(*MYSQL_MIN_QUERY_BATCH_SIZE, *MYSQL_MAX_QUERY_BATCH_SIZE);
-        let mut fallback = false;
-        let mut buffered_prefix = None;
-        let mut buffered = Vec::new();
-        loop {
-            let mut connection = self
-                .inner
-                .pool
-                .acquire("v6_index_scan", &self.inner.db_name)
-                .await?;
-            let bounds = self.log_bucket_bounds(&mut connection).await?;
-            stats.sql_statements += 1;
-            let buckets = bounds.covering(snapshot_bucket);
-            let prepare_timer =
-                metrics::query_index_sql_prepare_timer(self.inner.pool.cluster_name());
-            let (query, params) = sql::index_query(
-                self.inner.deployment_id,
-                persistence_index_id,
-                read_timestamp,
-                lower.clone(),
-                upper.clone(),
-                order,
-                page_size,
-                &buckets,
-            );
-            prepare_timer.finish();
-            let execute_timer =
-                metrics::query_index_sql_execute_timer(self.inner.pool.cluster_name());
-            let rows = match connection
-                .query_collect(&query, params, page_size, Ok)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if let Some(server_error) = is_message_too_large_error(error) => {
-                    anyhow::ensure!(
-                        page_size > 1,
-                        "Failed to load index rows with minimum page size `1`: {}",
-                        server_error.message
-                    );
-                    let fallback_size = usize::try_from(*MYSQL_FALLBACK_PAGE_SIZE)?;
-                    if page_size <= fallback_size {
-                        tracing::warn!(
-                            "Falling back to page size `1` due to repeated server error: {}",
-                            server_error.message
-                        );
-                        page_size = 1;
-                    } else {
-                        tracing::warn!(
-                            "Falling back to page size `{fallback_size}` due to server error: {}",
-                            server_error.message
-                        );
-                        page_size = fallback_size;
-                    }
-                    fallback = true;
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
-            execute_timer.finish();
-            // Check after reading the page to include concurrent displacements.
-            // Below the floor, any later commit may have displaced a revision
-            // into an omitted bucket. `write` requires a document revision for
-            // every displacement, so the documents table provides this check
-            // even after the bucket is dropped.
-            if snapshot_bucket < bounds.floor {
-                stats.sql_statements += 1;
-                let displaced_since_snapshot = connection
-                    .query_optional(
-                        sql::HAS_COMMIT_BETWEEN,
-                        vec![
-                            self.inner.deployment_id.into(),
-                            Value::Int(i64::from(read_timestamp)),
-                            Value::Int(i64::from(bounds.floor.start_ts()?)),
-                        ],
-                    )
-                    .await?
-                    .is_some();
-                if displaced_since_snapshot {
-                    cover!(super::coverage::OUT_OF_RETENTION);
-                    return Err(out_of_retention_error(
-                        read_timestamp,
-                        format!(
-                            "a later commit displaced revisions into a log bucket below the \
-                             maintenance floor {}",
-                            bounds.floor.value()
-                        ),
-                    ));
-                }
-            }
-            drop(connection);
-            let retention_validate_timer =
-                metrics::retention_validate_timer(self.inner.pool.cluster_name());
-            retention_validator
-                .validate_snapshot(read_timestamp)
-                .await?;
-            retention_validate_timer.finish();
-            let rows_loaded = rows.len();
-            let mut cursor = None;
-            for row in rows {
-                stats.rows_read += 1;
-                let prefix = column::bytes(&row, 1)?.to_vec();
-                let suffix_hash = column::bytes(&row, 2)?.to_vec();
-                cursor = Some(sql::SqlKey {
-                    prefix: prefix.clone(),
-                    suffix_hash,
-                });
-                if buffered_prefix.as_ref().is_some_and(|p| p != &prefix) {
-                    buffered.sort_by(|a: &(IndexKeyBytes, LatestDocument), b| a.0.cmp(&b.0));
-                    if order == Order::Desc {
-                        buffered.reverse();
-                    }
-                    for result in buffered.drain(..) {
-                        yield result;
-                    }
-                }
-                buffered_prefix = Some(prefix.clone());
-                // A prefix shorter than the limit is the whole key, so no other
-                // row can share it: yield now instead of reading the next page
-                // to find where this prefix's run ends.
-                let complete_key = prefix.len() < MAX_INDEX_KEY_PREFIX_LEN;
-
-                let mut key = prefix;
-                if let Some(suffix) = column::maybe_bytes(&row, 3)? {
-                    cover!(super::coverage::LONG_KEY_SUFFIX);
-                    key.extend_from_slice(suffix);
-                }
-                let key = IndexKeyBytes(key);
-                if !interval.contains(&key) {
-                    stats.rows_skipped_out_of_range += 1;
-                    continue;
-                }
-                let ts: i64 = row.get_opt(4).context("row[4]")??;
-                let ts = Timestamp::try_from(ts)?;
-                let table_id = TabletId(InternalId::try_from(column::bytes(&row, 5)?)?);
-                anyhow::ensure!(table_id == tablet_id);
-                let encoded = column::maybe_bytes(&row, 7)?
-                    .with_context(|| format!("Dangling index reference for {key:?} {ts:?}"))?;
-                let document =
-                    document_encoding::decode(encoded, table_id)?.with_context(|| {
-                        format!("Index reference to deleted document {key:?} {ts:?}")
-                    })?;
-                let prev_ts: Option<i64> = row.get_opt(8).context("row[8]")??;
-                buffered.push((
-                    key,
-                    LatestDocument {
-                        ts,
-                        value: document,
-                        prev_ts: prev_ts.map(Timestamp::try_from).transpose()?,
-                    },
-                ));
-                stats.rows_returned += 1;
-                stats.max_rows_buffered = stats.max_rows_buffered.max(buffered.len());
-                if complete_key {
-                    buffered_prefix = None;
-                    for result in buffered.drain(..) {
-                        yield result;
-                    }
-                }
-            }
-            if rows_loaded < page_size {
-                break;
-            }
-            let cursor = cursor.context("full V6 index page has no cursor")?;
-            cover!(super::coverage::SCAN_RESUMED);
-            match order {
-                Order::Asc => lower = Bound::Excluded(cursor),
-                Order::Desc => upper = Bound::Excluded(cursor),
-            }
-            if page_size < *MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE && !fallback {
-                page_size = (page_size * 2).min(*MYSQL_MAX_QUERY_DYNAMIC_BATCH_SIZE);
-            }
-        }
-        buffered.sort_by(|a: &(IndexKeyBytes, LatestDocument), b| a.0.cmp(&b.0));
-        if order == Order::Desc {
-            buffered.reverse();
-        }
-        for result in buffered {
-            yield result;
-        }
     }
 }
 
@@ -720,23 +544,13 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             .inner
             .engine
             .plan_index_writes(index_updates, conflict_strategy)?;
-        // The scan's history check finds displaced revisions through the
-        // commits that made them, so every replaced entry needs the document
-        // revision that replaced it. Only a backfill writes entries alone.
-        let revisions: BTreeSet<_> = document_updates
-            .iter()
-            .map(|update| (update.ts, update.id))
-            .collect();
-        for (ts, document_id) in batch.replacement_commits() {
-            anyhow::ensure!(
-                revisions.contains(&(ts, document_id)),
-                "MySQL V6 index write replaces an entry of document {document_id} at {ts} without \
-                 that document revision"
-            );
+        batch.validate_documents(document_updates)?;
+        if let Some(ts) = batch.replacement_commits().map(|(ts, _)| ts).max() {
+            self.ensure_published_bucket(ts).await?;
         }
         let cluster_name = self.inner.pool.cluster_name();
         self.lease
-            .transact(async |tx| {
+            .transact("write", async |tx| {
                 for chunk in fill_chunks(document_updates) {
                     let query = match conflict_strategy {
                         ConflictStrategy::Error => documents::insert_chunk(chunk.len()),
@@ -792,7 +606,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         let cluster_name = self.inner.pool.cluster_name();
         for chunk in fill_chunks(&rows) {
             self.lease
-                .transact(async |tx| {
+                .transact("write_index_backfill", async |tx| {
                     self.inner
                         .engine
                         .write_backfill_chunk(tx, chunk, cluster_name)
@@ -805,84 +619,20 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         Ok(())
     }
 
-    /// READ COMMITTED keeps conditional deletes from gap-locking concurrent
-    /// index inserts.
     #[fastrace::trace]
     async fn reconcile_index_backfill(&self, index: PersistenceIndexId) -> anyhow::Result<()> {
-        let cluster_name = self.inner.pool.cluster_name();
-        let mut after: Bound<sql::SqlKey> = Bound::Unbounded;
-        loop {
-            // Backfill insertion has finished and markers only advance.
-            // The cutoff remains valid after this read; the conditional
-            // delete rechecks the current row while holding its record
-            // lock, so a concurrent recreation remains visible.
-            let page = {
-                let mut connection = self
-                    .inner
-                    .pool
-                    .acquire("v6_reconcile_backfill_page", &self.inner.db_name)
-                    .await?;
-                self.inner
-                    .engine
-                    .read_backfill_markers_page(&mut connection, index, after.clone())
-                    .await?
-            };
-            self.lease
-                .transact_read_committed(async |tx| {
-                    self.inner
-                        .engine
-                        .delete_stale(tx, &page, cluster_name)
-                        .await
-                })
-                .await?;
-            let Some(last) = page
-                .last()
-                .filter(|_| page.len() >= *INDEX_RETENTION_DELETE_CHUNK)
-            else {
-                break;
-            };
-            after = Bound::Excluded(last.key.clone());
-        }
-        Ok(())
+        self.backfill().reconcile(index).await
     }
 
     async fn index_backfill_marker_indexes(&self) -> anyhow::Result<Vec<PersistenceIndexId>> {
-        self.inner
-            .pool
-            .acquire("v6_backfill_marker_indexes", &self.inner.db_name)
-            .await?
-            .query_collect(
-                sql::LIST_BACKFILL_MARKER_INDEXES,
-                vec![self.inner.deployment_id.into()],
-                16,
-                |row| {
-                    let id: u32 = row.get_opt(0).context("index_id")??;
-                    PersistenceIndexId::try_from(id)
-                },
-            )
-            .await
+        self.backfill().marker_indexes().await
     }
 
-    /// READ COMMITTED allows concurrent marker inserts for other indexes
-    /// during the `LIMIT` scan by avoiding gap locks.
     async fn delete_index_backfill_markers_chunk(
         &self,
         index: PersistenceIndexId,
     ) -> anyhow::Result<u64> {
-        let chunk_size = u64::try_from(*INDEX_RETENTION_DELETE_CHUNK)?;
-        self.lease
-            .transact_read_committed(async |tx| {
-                tx.exec_iter(
-                    sql::DELETE_BACKFILL_MARKERS_CHUNK,
-                    vec![
-                        self.inner.deployment_id.into(),
-                        index.value().into(),
-                        chunk_size.into(),
-                    ],
-                )
-                .await
-            })
-            .await
+        self.backfill().delete_chunk(index).await
     }
 
     async fn write_persistence_global(
@@ -897,7 +647,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             Value::Bytes(serde_json::to_vec(&value)?),
         ];
         self.lease
-            .transact(async |tx| {
+            .transact("write_persistence_global", async |tx| {
                 tx.exec_drop(super::WRITE_PERSISTENCE_GLOBAL, params)
                     .await?;
                 Ok(())
@@ -951,10 +701,6 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         })
     }
 
-    fn needs_index_retention_deletes(&self) -> bool {
-        false
-    }
-
     async fn delete(
         &self,
         mut document_ids: Vec<(Timestamp, InternalDocumentId)>,
@@ -975,7 +721,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
             }
         });
         self.lease
-            .transact(async |tx| {
+            .transact("delete_documents", async |tx| {
                 let mut deleted = 0;
                 for chunk in fill_chunks(&document_ids) {
                     let mut params = vec![self.inner.deployment_id.into()];
@@ -1001,7 +747,7 @@ impl<RT: Runtime> common::persistence::Persistence for Persistence<RT> {
         chunk_size: usize,
     ) -> anyhow::Result<usize> {
         self.lease
-            .transact(async |tx| {
+            .transact("delete_tablet_documents", async |tx| {
                 Ok(tx
                     .exec_iter(
                         documents::delete_tablet_chunk(),
@@ -1082,9 +828,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
         let min_queried_ts = ids.iter().map(|(_, ts)| *ts).min();
         let ids: Vec<_> = ids.into_iter().collect();
         let mut result = BTreeMap::new();
-        let mut remaining: &[(InternalDocumentId, Timestamp)] = &ids;
-        let mut fallback_chunk_size = None;
-        while !remaining.is_empty() {
+        for chunk in smart_chunks(&ids) {
             // Acquired per chunk so a long lookup does not pin a connection
             // across yield points.
             let mut connection = self
@@ -1092,7 +836,6 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                 .pool
                 .acquire("v6_previous_revision", &self.inner.db_name)
                 .await?;
-            let chunk = next_chunk(remaining, fallback_chunk_size);
             let mut params = Vec::with_capacity(chunk.len() * 5);
             for (id, query_ts) in chunk {
                 params.extend([
@@ -1103,7 +846,7 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                     Value::Int(i64::from(*query_ts)),
                 ]);
             }
-            let rows = match connection
+            let rows = connection
                 .query_collect(
                     &documents::previous_revision_chunk(chunk.len()),
                     params,
@@ -1113,21 +856,11 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                         anyhow::Ok((Timestamp::try_from(query_ts)?, row_to_document(&row)?))
                     },
                 )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if is_message_too_large_error(error).is_some() => {
-                    fallback_chunk_size =
-                        Some(smaller_chunk(fallback_chunk_size.unwrap_or(chunk.len()))?);
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+                .await?;
             for (query_ts, entry) in rows {
                 metrics::log_prev_revisions_row_read(self.inner.pool.cluster_name());
                 result.insert((entry.id, query_ts), entry);
             }
-            remaining = &remaining[chunk.len()..];
         }
         // Validate the snapshots read at, not the revisions found: a previous
         // revision may legitimately predate the retention floor.
@@ -1149,15 +882,12 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
         let min_queried_ts = ids.iter().map(|query| query.ts).min();
         let ids: Vec<_> = ids.into_iter().collect();
         let mut result = BTreeMap::new();
-        let mut remaining: &[DocumentPrevTsQuery] = &ids;
-        let mut fallback_chunk_size = None;
-        while !remaining.is_empty() {
+        for chunk in smart_chunks(&ids) {
             let mut connection = self
                 .inner
                 .pool
                 .acquire("v6_exact_revision", &self.inner.db_name)
                 .await?;
-            let chunk = next_chunk(remaining, fallback_chunk_size);
             let mut params = Vec::with_capacity(1 + chunk.len() * 3);
             params.push(self.inner.deployment_id.into());
             // Several queries can ask for the same revision at different
@@ -1175,23 +905,14 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                     .or_default()
                     .push(*query);
             }
-            let rows = match connection
+            let rows = connection
                 .query_collect(
-                    &documents::exact_revision_chunk(chunk.len()),
+                    &documents::exact_revision_chunk(chunk.len(), &DocumentScope::DeploymentId),
                     params,
                     chunk.len(),
                     |row| row_to_document(&row),
                 )
-                .await
-            {
-                Ok(rows) => rows,
-                Err(ref error) if is_message_too_large_error(error).is_some() => {
-                    fallback_chunk_size =
-                        Some(smaller_chunk(fallback_chunk_size.unwrap_or(chunk.len()))?);
-                    continue;
-                },
-                Err(error) => return Err(error),
-            };
+                .await?;
             for entry in rows {
                 for query in queries_by_revision
                     .get(&(entry.id, entry.ts))
@@ -1201,7 +922,6 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
                     result.insert(*query, entry.clone());
                 }
             }
-            remaining = &remaining[chunk.len()..];
         }
         // As in `previous_revisions`, validate the snapshots read at.
         if let Some(min_queried_ts) = min_queried_ts {
@@ -1223,7 +943,14 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
         size_hint: usize,
         retention_validator: Arc<dyn RetentionValidator>,
     ) -> IndexStream<'_> {
-        self.index_scan_impl(
+        super::reader::IndexReader {
+            documents: super::reader::DocumentScope::DeploymentId,
+            published: &self.inner.published,
+            pool: &self.inner.pool,
+            db_name: &self.inner.db_name,
+            deployment_id: self.inner.deployment_id,
+        }
+        .scan(
             index,
             tablet_id,
             read_timestamp,
@@ -1286,6 +1013,10 @@ impl<RT: Runtime> PersistenceReader for Reader<RT> {
     fn version(&self) -> PersistenceVersion {
         PersistenceVersion::V6
     }
+
+    fn needs_index_retention_deletes(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct Lease<RT: Runtime> {
@@ -1301,6 +1032,7 @@ impl<RT: Runtime> Lease<RT> {
         pool: Arc<ConvexMySqlPool<RT>>,
         db_name: String,
         deployment_id: PersistenceDeploymentId,
+        allow_read_only: bool,
         lease_lost_shutdown: ShutdownSignal,
     ) -> anyhow::Result<Self> {
         let timer = metrics::lease_acquire_timer(pool.cluster_name());
@@ -1309,19 +1041,34 @@ impl<RT: Runtime> Lease<RT> {
             .duration_since(UNIX_EPOCH)
             .expect("system time is before 1970")
             .as_nanos() as i64;
-        let rows_modified = client
-            .exec_iter(
-                super::LEASE_ACQUIRE,
-                vec![
-                    Value::Int(lease_ts),
-                    Value::Int(lease_ts),
-                    deployment_id.into(),
-                ],
-            )
-            .await?;
+        let rows_modified = if allow_read_only {
+            client
+                .exec_iter(
+                    super::LEASE_ACQUIRE_ALLOW_READ_ONLY,
+                    vec![
+                        Value::Int(lease_ts),
+                        Value::Int(lease_ts),
+                        deployment_id.into(),
+                    ],
+                )
+                .await?
+        } else {
+            client
+                .exec_iter(
+                    super::LEASE_ACQUIRE,
+                    vec![
+                        Value::Int(lease_ts),
+                        Value::Int(lease_ts),
+                        deployment_id.into(),
+                        deployment_id.into(),
+                    ],
+                )
+                .await?
+        };
+        drop(client);
         anyhow::ensure!(
             rows_modified == 1,
-            "failed to acquire V6 lease: a higher lease timestamp already exists"
+            "failed to acquire V6 lease: already acquired with higher timestamp, or read-only"
         );
         timer.finish();
         Ok(Self {
@@ -1333,27 +1080,33 @@ impl<RT: Runtime> Lease<RT> {
         })
     }
 
-    pub(crate) async fn transact<F, T>(&self, f: F) -> anyhow::Result<T>
+    /// `op` names the persistence operation on the commit metric.
+    pub(crate) async fn transact<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(None, f).await
+        self.transact_with_isolation(op, None, f).await
     }
 
     /// Like [`Self::transact`], but runs at READ COMMITTED instead of the
     /// InnoDB session default (REPEATABLE READ). Index retention deletes use
     /// this so their DELETEs take only record locks, sparing concurrent index
     /// writers the next-key/gap locks REPEATABLE READ adds.
-    pub(crate) async fn transact_read_committed<F, T>(&self, f: F) -> anyhow::Result<T>
+    pub(crate) async fn transact_read_committed<F, T>(
+        &self,
+        op: &'static str,
+        f: F,
+    ) -> anyhow::Result<T>
     where
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
-        self.transact_with_isolation(Some(IsolationLevel::ReadCommitted), f)
+        self.transact_with_isolation(op, Some(IsolationLevel::ReadCommitted), f)
             .await
     }
 
     async fn transact_with_isolation<F, T>(
         &self,
+        op: &'static str,
         isolation: Option<IsolationLevel>,
         f: F,
     ) -> anyhow::Result<T>
@@ -1361,30 +1114,26 @@ impl<RT: Runtime> Lease<RT> {
         F: for<'a> AsyncFnOnce(&'a mut MySqlTransaction<'_>) -> anyhow::Result<T>,
     {
         let mut client = self.pool.acquire("v6_transact", &self.db_name).await?;
-        let result = async {
-            let mut tx = client
-                .transaction(self.pool.cluster_name(), isolation)
-                .await?;
-            let timer = metrics::lease_precond_timer(self.pool.cluster_name());
-            let lease: Option<Row> = tx
-                .exec_first(
-                    super::LEASE_PRECONDITION,
-                    vec![Value::Int(self.lease_ts), self.deployment_id.into()],
-                )
-                .await?;
-            if lease.is_none() {
-                self.lease_lost_shutdown.signal(lease_lost_error());
-                anyhow::bail!(lease_lost_error());
-            }
-            timer.finish();
-            let value = f(&mut tx).await?;
-            let timer = metrics::commit_timer(self.pool.cluster_name());
-            tx.commit().await?;
-            timer.finish();
-            Ok(value)
+        let mut tx = client
+            .transaction(self.pool.cluster_name(), isolation)
+            .await?;
+        let timer = metrics::lease_precond_timer(self.pool.cluster_name());
+        let lease: Option<Row> = tx
+            .exec_first(
+                super::LEASE_PRECONDITION,
+                vec![Value::Int(self.lease_ts), self.deployment_id.into()],
+            )
+            .await?;
+        if lease.is_none() {
+            self.lease_lost_shutdown.signal(lease_lost_error());
+            anyhow::bail!(lease_lost_error());
         }
-        .await;
-        client.handle_errors(result).await
+        timer.finish();
+        let value = f(&mut tx).await?;
+        let timer = metrics::commit_timer(self.pool.cluster_name(), op);
+        tx.commit().await?;
+        timer.finish();
+        Ok(value)
     }
 }
 
@@ -1402,32 +1151,26 @@ fn deployment_id_from_options(
     deployment_id.try_into()
 }
 
-fn out_of_retention_error(read_timestamp: Timestamp, reason: String) -> anyhow::Error {
-    anyhow::anyhow!(ErrorMetadata::out_of_retention()).context(format!(
-        "V6 index snapshot {read_timestamp} is outside the retained log buckets: {reason}"
-    ))
-}
-
-/// The chunk size to retry with after a chunk exceeded the server's message
-/// limit, following the same two steps as the V5 driver.
-fn smaller_chunk(current: usize) -> anyhow::Result<usize> {
-    anyhow::ensure!(
-        current > 1,
-        "a single-row chunk exceeds the MySQL message limit"
-    );
-    let fallback = usize::try_from(*MYSQL_FALLBACK_PAGE_SIZE)?;
-    Ok(if current <= fallback { 1 } else { fallback })
-}
-
-/// The next chunk of a bulk lookup: `smart_chunks`' first chunk until a
-/// message-limit error imposed a fixed size.
-fn next_chunk<T: ApproxSize>(remaining: &[T], fallback_chunk_size: Option<usize>) -> &[T] {
-    match fallback_chunk_size {
-        Some(max) => &remaining[..remaining.len().min(max)],
-        None => smart_chunks(remaining)
-            .next()
-            .expect("smart_chunks yields a chunk for a non-empty slice"),
+pub(super) async fn fetch_document_revisions<RT: Runtime>(
+    pool: &ConvexMySqlPool<RT>,
+    db_name: &str,
+    deployment_id: PersistenceDeploymentId,
+    scope: &DocumentScope,
+    revisions: &[(InternalDocumentId, Timestamp)],
+) -> anyhow::Result<Vec<DocumentLogEntry>> {
+    let mut params = vec![scope.tenant_value(deployment_id)];
+    for &(id, ts) in revisions {
+        params.extend([
+            Value::Bytes(id.table().0.into()),
+            Value::Bytes(id.internal_id().into()),
+            Value::Int(i64::from(ts)),
+        ]);
     }
+    let query = documents::exact_revision_chunk(revisions.len(), scope);
+    let mut connection = pool.acquire("v6_index_scan_documents", db_name).await?;
+    connection
+        .query_collect(&query, params, revisions.len(), |row| row_to_document(&row))
+        .await
 }
 
 fn row_to_document(row: &Row) -> anyhow::Result<DocumentLogEntry> {
@@ -1450,4 +1193,15 @@ fn row_to_document(row: &Row) -> anyhow::Result<DocumentLogEntry> {
         value,
         prev_ts: prev_ts.map(Timestamp::try_from).transpose()?,
     })
+}
+
+impl<RT: Runtime> crate::v6::backfill::BackfillLease for Lease<RT> {
+    async fn transact_read_committed<F, T>(&self, op: &'static str, f: F) -> anyhow::Result<T>
+    where
+        F: for<'a> AsyncFnOnce(
+            &'a mut crate::connection::MySqlTransaction<'_>,
+        ) -> anyhow::Result<T>,
+    {
+        Lease::transact_read_committed(self, op, f).await
+    }
 }
