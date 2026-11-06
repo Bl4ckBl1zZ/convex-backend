@@ -520,7 +520,7 @@ impl<RT: Runtime, T: SearchIndex + 'static> SearchFlusher<RT, T> {
             },
         };
         self.database
-            .commit_with_write_source(tx, "search_flusher_initialize_backfill")
+            .commit(tx, "search_flusher_initialize_backfill")
             .await?;
 
         let MultiSegmentBuildResult {
@@ -778,6 +778,7 @@ async fn incremental_table_scan_stream<'a, T: SearchIndex>(
             reader.index_scan(by_id, tablet_id, &cursor.interval(), Order::Asc, page_size),
             IndexScanCaller::SearchFlusher,
             IndexScanKind::ById,
+            None,
         );
         let page: Vec<_> = stream.take(page_size).try_collect().await?;
         if page.len() < page_size {

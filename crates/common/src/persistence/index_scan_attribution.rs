@@ -1,6 +1,6 @@
 //! Attributes index scans that reach persistence to what issued them and to
-//! the kind of index they read, so persistence read load can be broken down
-//! by caller.
+//! the kind of index and the table they read, so persistence read load can be
+//! broken down by caller.
 
 use std::{
     pin::Pin,
@@ -18,6 +18,7 @@ use futures::{
     Stream,
     StreamExt,
 };
+use value::TableName;
 
 use super::{
     IndexStream,
@@ -36,9 +37,14 @@ pub enum IndexScanCaller {
     /// Functions' reads: funrun's, which the conductor serves through
     /// `Database::index_page`, and the in-process function runner's.
     FunctionRunner,
-    /// Loading table and index metadata, when the database loads and when
-    /// table summaries bootstrap.
+    /// Loading table and index metadata when the database loads, including
+    /// the committer's first table summary, and in tools.
     Bootstrap,
+    /// Reloading table and index metadata for each table summary checkpoint.
+    TableSummaryCheckpoint,
+    /// Reloading table and index metadata to catch table shapes up to a
+    /// timestamp other than the published one.
+    TableShapes,
     InMemoryIndexLoad,
     IndexWorker,
     Retention,
@@ -58,17 +64,19 @@ pub enum IndexScanKind {
 }
 
 /// Counts the documents `stream` yields, and the time its consumer spends
-/// waiting for them, under `caller` and `kind` once the stream ends or is
-/// dropped.
+/// waiting for them, under `caller`, `kind` and `table` once the stream ends
+/// or is dropped. `table` is the table `stream` reads, if the caller knows it.
 pub fn attribute_index_scan(
     stream: IndexStream<'_>,
     caller: IndexScanCaller,
     kind: IndexScanKind,
+    table: Option<TableName>,
 ) -> IndexStream<'_> {
     Box::pin(AttributedIndexScan {
         inner: stream,
         caller,
         kind,
+        table,
         documents: 0,
         waited: Duration::ZERO,
         waiting_since: None,
@@ -80,6 +88,7 @@ struct AttributedIndexScan<'a> {
     inner: IndexStream<'a>,
     caller: IndexScanCaller,
     kind: IndexScanKind,
+    table: Option<TableName>,
     documents: u64,
     waited: Duration,
     /// When the consumer asked for the document it is waiting for. Time the
@@ -92,7 +101,13 @@ impl AttributedIndexScan<'_> {
     fn log(&mut self) {
         if !self.logged {
             self.logged = true;
-            log_index_scan(self.caller, self.kind, self.documents, self.waited);
+            log_index_scan(
+                self.caller,
+                self.kind,
+                self.table.as_ref(),
+                self.documents,
+                self.waited,
+            );
         }
     }
 }

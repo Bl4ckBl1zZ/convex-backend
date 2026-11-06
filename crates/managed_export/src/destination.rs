@@ -6,7 +6,6 @@
 
 use std::collections::{
     BTreeMap,
-    BTreeSet,
     HashMap,
 };
 
@@ -42,14 +41,13 @@ use iceberg::spec::{
     TableMetadata,
     Type,
 };
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use keybroker::RandomEncryptor;
+use pb::managed_export as pb_state;
+use prost::Message;
 
 use crate::iceberg::{
-    Format,
     S3Destination,
+    TableState,
 };
 
 const EXPORT_ID_PARAMETER: &str = "convex.export-id";
@@ -61,40 +59,26 @@ const PAGE_PARAMETER: &str = "convex.page";
 /// The state and a table's metadata are a few KB per table.
 const MAX_OBJECT_BYTES: i64 = 16 * (1 << 20); // 16 MiB
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// One export's progress, sealed at `<root>/_convex/exports/<export id>/state`
+/// in the customer's bucket. The export ID is in the key, so a recreated
+/// export starts empty instead of reading the old export's state.
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExportState {
-    /// The `_log_sinks` document of the export that wrote this state. A
-    /// different ID means the export was recreated, so the state is ignored.
-    pub export_id: String,
-    /// The format of the export's Iceberg tables, for life. A state from
-    /// before this field is in the JSON format, the only one that existed then.
-    #[serde(default = "default_format")]
-    pub format: Format,
     /// Number of pages committed by this export.
     pub page: u64,
     /// Base64 `SyncCursor` after page `page`. `None` before the first page.
     pub cursor: Option<String>,
-    /// Current metadata location of each Iceberg table, by Glue table name.
-    pub tables: BTreeMap<String, String>,
-    /// Tables in `tables` marked retired. A page reloads every table only
-    /// when the selection no longer matches this set.
-    pub retired: BTreeSet<String>,
-}
-
-fn default_format() -> Format {
-    Format::Json
+    /// Every table ever created, live and retired, by Glue name.
+    pub tables: BTreeMap<String, TableState>,
 }
 
 impl ExportState {
-    /// A state with no pages, in the format new exports start in.
-    pub fn fresh(export_id: &str) -> Self {
+    /// A state with no pages.
+    pub fn fresh() -> Self {
         Self {
-            export_id: export_id.to_owned(),
-            format: Format::Typed,
             page: 0,
             cursor: None,
             tables: BTreeMap::new(),
-            retired: BTreeSet::new(),
         }
     }
 
@@ -108,30 +92,83 @@ impl ExportState {
     }
 
     /// The state after one more committed page.
-    pub fn next(
-        &self,
-        cursor: String,
-        tables: BTreeMap<String, String>,
-        retired: BTreeSet<String>,
-    ) -> Result<Self> {
+    pub fn next(&self, cursor: String, tables: BTreeMap<String, TableState>) -> Result<Self> {
         Ok(Self {
-            export_id: self.export_id.clone(),
-            format: self.format,
             page: self.next_page()?,
             cursor: Some(cursor),
             tables,
-            retired,
         })
     }
 
-    /// Whether a Glue table with `parameters` was published by this export at
-    /// page `page` or later.
-    fn published(&self, parameters: &HashMap<String, String>) -> bool {
-        parameters.get(EXPORT_ID_PARAMETER) == Some(&self.export_id)
+    /// Whether `publish` should drop a Glue table with `parameters` that the
+    /// state does not list: one a Convex export wrote, and not this export at
+    /// this page or later.
+    fn is_stale(&self, export_id: &str, parameters: Option<&HashMap<String, String>>) -> bool {
+        parameters
+            .is_some_and(|p| p.contains_key(EXPORT_ID_PARAMETER) && !self.published(export_id, p))
+    }
+
+    /// Whether `export_id` published this Glue table at `page` or later.
+    fn published(&self, export_id: &str, parameters: &HashMap<String, String>) -> bool {
+        parameters.get(EXPORT_ID_PARAMETER).map(String::as_str) == Some(export_id)
             && parameters
                 .get(PAGE_PARAMETER)
                 .and_then(|page| page.parse::<u64>().ok())
                 .is_some_and(|page| page >= self.page)
+    }
+}
+
+impl From<ExportState> for pb_state::ExportState {
+    fn from(state: ExportState) -> Self {
+        Self {
+            page: state.page,
+            cursor: state.cursor,
+            tables: state
+                .tables
+                .into_iter()
+                .map(|(name, table)| (name, table.into()))
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<pb_state::ExportState> for ExportState {
+    type Error = anyhow::Error;
+
+    fn try_from(state: pb_state::ExportState) -> Result<Self> {
+        Ok(Self {
+            page: state.page,
+            cursor: state.cursor,
+            tables: state
+                .tables
+                .into_iter()
+                .map(|(name, table)| (name, table.into()))
+                .collect(),
+        })
+    }
+}
+
+impl From<TableState> for pb_state::TableState {
+    fn from(table: TableState) -> Self {
+        Self {
+            component: table.component,
+            table: table.table,
+            tablet: table.tablet,
+            metadata: table.metadata,
+            retired: table.retired,
+        }
+    }
+}
+
+impl From<pb_state::TableState> for TableState {
+    fn from(table: pb_state::TableState) -> Self {
+        Self {
+            component: table.component,
+            table: table.table,
+            tablet: table.tablet,
+            metadata: table.metadata,
+            retired: table.retired,
+        }
     }
 }
 
@@ -143,10 +180,18 @@ pub struct ExportStore {
     bucket: String,
     key: String,
     database: String,
+    /// Stamped on every Glue table so `publish` can tell our tables from a
+    /// deleted export's.
+    export_id: String,
 }
 
 impl ExportStore {
-    pub fn new(destination: &S3Destination, key: String, database: String) -> Self {
+    pub fn new(
+        destination: &S3Destination,
+        key: String,
+        database: String,
+        export_id: String,
+    ) -> Self {
         let credentials = Credentials::new(
             destination.access_key_id.clone(),
             destination.secret_access_key.clone(),
@@ -174,11 +219,14 @@ impl ExportStore {
             bucket: destination.bucket.clone(),
             key,
             database,
+            export_id,
         }
     }
 
     /// Returns the state and its ETag, or `None` when no page has committed.
-    pub async fn read(&self) -> Result<Option<(ExportState, String)>> {
+    /// The customer can write this object, so only bytes `encryptor` opens
+    /// get parsed.
+    pub async fn read(&self, encryptor: &RandomEncryptor) -> Result<Option<(ExportState, String)>> {
         let output = match self
             .s3
             .get_object()
@@ -195,21 +243,28 @@ impl ExportStore {
         };
         let etag = output.e_tag.clone().context("Export state has no ETag")?;
         let bytes = collect_bounded(output, "the export state").await?;
-        let state = serde_json::from_slice(&bytes).context("Cannot parse the export state")?;
+        let state = unseal_state(encryptor, &self.key, bytes)?;
         Ok(Some((state, etag)))
     }
 
     /// Replaces the state only if it still has `etag`, or creates it only if
     /// it does not exist when `etag` is `None`. Another writer's commit fails
     /// this with a conflict error.
-    pub async fn commit(&self, state: &ExportState, etag: Option<&str>) -> Result<()> {
+    pub async fn commit(
+        &self,
+        state: &ExportState,
+        etag: Option<&str>,
+        encryptor: &RandomEncryptor,
+    ) -> Result<()> {
+        let message = pb_state::ExportState::from(state.clone());
+        let bytes = encryptor.encrypt_bytes(self.key.as_bytes(), message.encode_to_vec());
         let put = self
             .s3
             .put_object()
             .bucket(&self.bucket)
             .key(&self.key)
-            .content_type("application/json")
-            .body(ByteStream::from(serde_json::to_vec(state)?));
+            .content_type("application/octet-stream")
+            .body(ByteStream::from(bytes));
         let put = match etag {
             Some(etag) => put.if_match(etag),
             None => put.if_none_match("*"),
@@ -230,8 +285,9 @@ impl ExportStore {
         }
     }
 
-    /// Makes Glue match `state`. The database belongs to the deployment, so
-    /// tables the state does not list are dropped. Requires one writer per
+    /// Makes Glue match `state`. Tables a Convex export wrote that the state
+    /// does not list are dropped; anything else the customer keeps in this
+    /// database is left alone. Requires one writer per
     /// database: a table already at this export's page or later is left
     /// alone, so a slow mirror cannot move Glue backward.
     pub async fn publish(&self, state: &ExportState) -> Result<()> {
@@ -249,22 +305,42 @@ impl ExportStore {
                 published.insert(table.name().to_owned(), table.clone());
             }
         }
-        for (name, location) in &state.tables {
+        for (name, table) in &state.tables {
+            let location = &table.metadata;
             let Some(current) = published.remove(name) else {
                 let columns = self.read_glue_columns(location).await?;
                 self.glue
                     .create_table()
                     .database_name(&self.database)
-                    .table_input(table_input(name, location, None, columns, state)?)
+                    .table_input(table_input(
+                        name,
+                        location,
+                        None,
+                        columns,
+                        &self.export_id,
+                        state,
+                    )?)
                     .send()
                     .await
                     .map_err(|e| aws_error(e, "create a Glue table"))?;
                 continue;
             };
             let parameters = current.parameters.unwrap_or_default();
+            // A table no Convex export wrote is the customer's, even when its
+            // name matches ours.
+            anyhow::ensure!(
+                parameters.contains_key(EXPORT_ID_PARAMETER),
+                ErrorMetadata::bad_request(
+                    "S3ExportForeignTable",
+                    format!(
+                        "Glue table {name} was not written by a Convex export. Remove it from the \
+                         export's Glue database or recreate the export."
+                    ),
+                )
+            );
             let previous = parameters.get("metadata_location").map(String::as_str);
             // Most pages change few tables.
-            if previous == Some(location) || state.published(&parameters) {
+            if previous == Some(location) || state.published(&self.export_id, &parameters) {
                 continue;
             }
             let columns = self.read_glue_columns(location).await?;
@@ -272,7 +348,14 @@ impl ExportStore {
                 .glue
                 .update_table()
                 .database_name(&self.database)
-                .table_input(table_input(name, location, previous, columns, state)?)
+                .table_input(table_input(
+                    name,
+                    location,
+                    previous,
+                    columns,
+                    &self.export_id,
+                    state,
+                )?)
                 .skip_archive(true);
             if let Some(version_id) = current.version_id {
                 update = update.version_id(version_id);
@@ -283,7 +366,7 @@ impl ExportStore {
                 .map_err(|e| aws_error(e, "update a Glue table"))?;
         }
         for (name, table) in published {
-            if table.parameters().is_some_and(|p| state.published(p)) {
+            if !state.is_stale(&self.export_id, table.parameters()) {
                 continue;
             }
             self.glue
@@ -350,6 +433,24 @@ const DESTINATION_ERROR_CODES: &[&str] = &[
     "NoSuchBucket",
     "PermanentRedirect",
 ];
+
+/// Opens and parses the state. Only Porter can have sealed it, and only for
+/// this `key` (it holds the export ID), so a state copied from a deleted or
+/// sibling export does not open. Anything else means: recreate the export.
+fn unseal_state(encryptor: &RandomEncryptor, key: &str, bytes: Vec<u8>) -> Result<ExportState> {
+    let plain = encryptor
+        .decrypt_bytes(key.as_bytes(), bytes)
+        .map_err(|error| {
+            error.context(ErrorMetadata::bad_request(
+                "S3ExportStateModified",
+                "The export state in the bucket was not written by Convex or was modified. \
+                 Recreate the export to start it again.",
+            ))
+        })?;
+    pb_state::ExportState::decode(&*plain)
+        .context("Cannot parse the export state")?
+        .try_into()
+}
 
 /// The body of `output`, refused before any byte is read when S3 reports it
 /// larger than [`MAX_OBJECT_BYTES`].
@@ -421,6 +522,7 @@ fn table_input(
     metadata_location: &str,
     previous: Option<&str>,
     columns: Vec<Column>,
+    export_id: &str,
     state: &ExportState,
 ) -> Result<TableInput> {
     let location = metadata_location
@@ -430,7 +532,7 @@ fn table_input(
     let mut parameters = HashMap::from([
         ("table_type".to_owned(), "ICEBERG".to_owned()),
         ("metadata_location".to_owned(), metadata_location.to_owned()),
-        (EXPORT_ID_PARAMETER.to_owned(), state.export_id.clone()),
+        (EXPORT_ID_PARAMETER.to_owned(), export_id.to_owned()),
         (PAGE_PARAMETER.to_owned(), state.page.to_string()),
     ]);
     if let Some(previous) = previous {

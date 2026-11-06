@@ -13,7 +13,7 @@ export type PricedUsageState =
 type UsageField = keyof Omit<UsageSummaryRow, "deploymentClass" | "region">;
 type Metric = {
   name: string;
-  field: UsageField | UsageField[];
+  field: UsageField | UsageField[] | ((row: UsageSummaryRow) => number);
   divisor?: number;
 };
 type MetricSection = Metric | Metric[];
@@ -66,6 +66,17 @@ const sections: Record<string, MetricSection> = {
     field: "auditLogBandwidth",
     divisor: BYTES_PER_GB,
   },
+  // The deployment fee is waived for paused and idle deployments.
+  deploymentCount: {
+    name: "activeDeployments",
+    field: (row) =>
+      Math.max(
+        row.deploymentCount -
+          row.pausedDeploymentCount -
+          row.idleDeploymentCount,
+        0,
+      ),
+  },
 };
 
 function parseNonNegativeNumber(value: string): number | undefined {
@@ -91,21 +102,106 @@ function discountedRate(price: PriceAmount | undefined): number | undefined {
 
 export type UsageSpend = {
   amount: number;
+  includedAmount: number;
   missingDimensions: string[];
 };
+
+function priceAmounts(price: MetricPrice | undefined): PriceAmount[] {
+  return !price
+    ? []
+    : "rate" in price
+      ? [price.rate]
+      : "regionRate" in price
+        ? Object.values(price.regionRate)
+        : Object.values(price.deploymentClassRate).flatMap((regional) =>
+            Object.values(regional.regionRate),
+          );
+}
+
+export function getIncludedUsage(
+  periods: PricesPeriod[],
+  sectionMetric: string,
+): number | undefined {
+  if (!Object.hasOwn(sections, sectionMetric)) return undefined;
+  const section = sections[sectionMetric];
+  const metrics = Array.isArray(section) ? section : [section];
+  let total = 0;
+  let hasConsumedUnits = false;
+  for (const period of periods) {
+    for (const metric of metrics) {
+      for (const rate of priceAmounts(period.metrics[metric.name])) {
+        const discount = rate.percentageDiscount ?? 0;
+        if (!Number.isFinite(discount) || discount < 0 || discount > 1) {
+          return undefined;
+        }
+        const consumed = rate.consumedUnits;
+        if (consumed === undefined || consumed === null) continue;
+        if (!Number.isFinite(consumed) || consumed < 0) return undefined;
+        hasConsumedUnits = true;
+        if (discount === 1) {
+          if (consumed > 0) return undefined;
+          continue;
+        }
+        // The consumed count is post-discount, so we need to un-apply the
+        // discount to get the actual included usage.
+        total += (consumed / (1 - discount)) * (metric.divisor ?? 1);
+      }
+    }
+  }
+  return hasConsumedUnits && Number.isFinite(total) ? total : undefined;
+}
+
+// Gauge metrics bill monthly on a snapshot rather than on accumulated usage, so
+// their spend is a monthly estimate from the most recent snapshot.
+export function isGaugeMetric(sectionMetric: string): boolean {
+  return (
+    sectionMetric === "databaseStorage" ||
+    sectionMetric === "fileStorage" ||
+    sectionMetric === "searchStorage" ||
+    sectionMetric === "deploymentCount"
+  );
+}
 
 function metricSpend(
   summary: UsageSummaryRow[],
   metric: Metric,
   price: MetricPrice | undefined,
+  estimateMonthly: boolean,
 ): UsageSpend | undefined {
   let gross = 0;
+  let estimatedUnits = 0;
+  let coveredSpend = 0;
   const missingDimensions = new Set<string>();
+
+  const rates = estimateMonthly ? [] : priceAmounts(price);
+  for (const amount of rates) {
+    if (amount.consumedUnits === undefined || amount.consumedUnits === null) {
+      continue;
+    }
+    const rate = discountedRate(amount);
+
+    if (
+      rate === undefined ||
+      !Number.isFinite(amount.consumedUnits) ||
+      amount.consumedUnits < 0
+    ) {
+      return undefined;
+    }
+    // consumedUnits is already post-discount application, so multiply by the
+    // undiscounted rate here.
+    coveredSpend += amount.consumedUnits * Number(amount.amount);
+  }
+  const usageByDimension = new Map<
+    string,
+    { quantity: number; amount: PriceAmount }
+  >();
   for (const row of summary) {
-    const fields = Array.isArray(metric.field) ? metric.field : [metric.field];
-    const quantities = fields.map(
-      (field) => row[field] / (metric.divisor ?? 1),
-    );
+    const { field } = metric;
+    const quantities = (
+      typeof field === "function"
+        ? [field(row)]
+        : (Array.isArray(field) ? field : [field]).map((f) => row[f])
+    ).map((value) => value / (metric.divisor ?? 1));
     if (
       quantities.some((quantity) => !Number.isFinite(quantity) || quantity < 0)
     ) {
@@ -133,12 +229,43 @@ function metricSpend(
       );
       continue;
     }
+    const dimension =
+      "rate" in price
+        ? "global"
+        : "regionRate" in price
+          ? row.region
+          : JSON.stringify([row.deploymentClass, row.region]);
+    const existing = usageByDimension.get(dimension);
+    usageByDimension.set(dimension, {
+      quantity: (existing?.quantity ?? 0) + quantity,
+      amount,
+    });
+  }
+  for (const { quantity, amount } of usageByDimension.values()) {
     const rate = discountedRate(amount);
     if (rate === undefined) return undefined;
-    gross += Math.ceil(quantity) * rate;
+    const roundedQuantity = Math.ceil(quantity);
+    gross += roundedQuantity * rate;
+    estimatedUnits += roundedQuantity;
   }
-  return Number.isFinite(gross)
-    ? { amount: gross, missingDimensions: [...missingDimensions].sort() }
+  if (estimateMonthly) {
+    const includedUnits = price
+      ? parseNonNegativeNumber(price.includedUnits)
+      : 0;
+    if (includedUnits === undefined) return undefined;
+    // Monthly estimates value a shared allowance at the snapshot's weighted
+    // average rate across deployment classes and regions.
+    coveredSpend =
+      estimatedUnits > 0
+        ? gross * Math.min(includedUnits / estimatedUnits, 1)
+        : 0;
+  }
+  return Number.isFinite(gross) && Number.isFinite(coveredSpend)
+    ? {
+        amount: gross,
+        includedAmount: coveredSpend,
+        missingDimensions: [...missingDimensions].sort(),
+      }
     : undefined;
 }
 
@@ -161,21 +288,28 @@ export function getUsageSpend(
   }
 
   let total = 0;
+  let includedAmount = 0;
   const missingDimensions = new Set<string>();
   for (const metric of metrics) {
     const spend = metricSpend(
       summary,
       metric,
       pricesPeriod.metrics[metric.name],
+      isGaugeMetric(sectionMetric),
     );
     if (spend === undefined) return undefined;
     total += spend.amount;
+    includedAmount += spend.includedAmount;
     for (const dimension of spend.missingDimensions) {
       missingDimensions.add(dimension);
     }
   }
   return Number.isFinite(total)
-    ? { amount: total, missingDimensions: [...missingDimensions].sort() }
+    ? {
+        amount: total,
+        includedAmount,
+        missingDimensions: [...missingDimensions].sort(),
+      }
     : undefined;
 }
 
@@ -191,17 +325,23 @@ export function getMultiPeriodUsageSpend(
   if (!pricedSummaries?.length) return undefined;
 
   let total = 0;
+  let includedAmount = 0;
   const missingDimensions = new Set<string>();
   for (const { period, summary } of pricedSummaries) {
     const spend = getUsageSpend(summary, sectionMetric, period);
     if (spend === undefined) return undefined;
     total += spend.amount;
+    includedAmount += spend.includedAmount;
     for (const dimension of spend.missingDimensions) {
       missingDimensions.add(dimension);
     }
   }
   return Number.isFinite(total)
-    ? { amount: total, missingDimensions: [...missingDimensions].sort() }
+    ? {
+        amount: total,
+        includedAmount,
+        missingDimensions: [...missingDimensions].sort(),
+      }
     : undefined;
 }
 

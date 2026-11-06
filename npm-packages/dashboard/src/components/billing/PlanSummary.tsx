@@ -23,6 +23,8 @@ import type { UsagePricing } from "./lib/usagePrices";
 import {
   getMultiPeriodUsageSpend,
   getUsageSpend,
+  getIncludedUsage,
+  isGaugeMetric,
   formatSpend,
 } from "./lib/usageSpend";
 import type { PricedUsageState, UsageSpend } from "./lib/usageSpend";
@@ -73,6 +75,8 @@ type Section = {
   detail: string;
   title: string;
   suffix?: string;
+  // The plan caps usage at the included limit instead of billing beyond it, so
+  // the metric has no spend.
   noOnDemand?: boolean;
   // The plan includes none of this metric; the whole amount bills on demand.
   allOnDemand?: boolean;
@@ -247,6 +251,7 @@ export function BusinessPlanSummary({
   entitlements,
   hasSubscription = false,
   showEntitlements = false,
+  isCurrentBillingPeriod = true,
   pricing = { status: "unavailable", reason: "unsupported-period" },
   spendApplicable = true,
   pricedUsage = { status: "loading" },
@@ -259,21 +264,51 @@ export function BusinessPlanSummary({
   entitlements?: TeamEntitlementsResponse;
   hasSubscription?: boolean;
   showEntitlements?: boolean;
+  isCurrentBillingPeriod?: boolean;
   pricing?: UsagePricing;
   spendApplicable?: boolean;
   pricedUsage?: PricedUsageState;
 }) {
   const router = useRouter();
   const { dashboardShowCashUsage } = useLaunchDarkly();
-  const showSpend = dashboardShowCashUsage && pricing.status !== "unavailable";
-  const gridColumns = hasSubscription
+  const showSpend =
+    dashboardShowCashUsage &&
+    (pricing.status === "ready" || pricing.status === "loading");
+  const activeSections = isBusinessPlan ? businessSections : selfServeSections;
+  // Only show the audit log egress section for teams that can configure custom audit logs.
+  const visibleSections = activeSections.filter(
+    (section) =>
+      section.metric !== "auditLogBandwidth" ||
+      entitlements?.customAuditLogsInLogStreamsConfigEnabled === true,
+  );
+  const historicalIncludedUsage =
+    !isCurrentBillingPeriod && spendApplicable && pricing.status === "ready"
+      ? Object.fromEntries(
+          visibleSections.map((section) => [
+            section.metric,
+            section.metric === "deploymentCount"
+              ? undefined
+              : getIncludedUsage(
+                  pricing.periods.map(({ period }) => period),
+                  section.metric,
+                ),
+          ]),
+        )
+      : undefined;
+  const showHistoricalIncluded =
+    historicalIncludedUsage !== undefined &&
+    Object.values(historicalIncludedUsage).some(
+      (usage) => usage !== undefined && usage > 0,
+    );
+  const showIncluded = hasSubscription || showHistoricalIncluded;
+  const showIncludedLimits = showEntitlements && isCurrentBillingPeriod;
+  const gridColumns = showIncluded
     ? showSpend
       ? "grid-cols-[4fr_3fr_2fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_2fr_auto]"
       : "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
     : showSpend
       ? "grid-cols-[5fr_4fr_2fr_auto]"
       : "grid-cols-[5fr_4fr_auto]";
-  const activeSections = isBusinessPlan ? businessSections : selfServeSections;
 
   // Deployment counts live on the summary rows but are team-wide (the gauge has
   // no project/component dimension we filter on), so sum across every row.
@@ -316,13 +351,6 @@ export function BusinessPlanSummary({
   // Aggregate across deployment classes and regions
   const aggregated = summary ? aggregateRows(summary) : undefined;
 
-  // Only show the audit log egress section for teams that can configure custom audit logs.
-  const visibleSections = activeSections.filter(
-    (section) =>
-      section.metric !== "auditLogBandwidth" ||
-      entitlements?.customAuditLogsInLogStreamsConfigEnabled === true,
-  );
-
   // Apply the team-wide deployment count to the aggregate.
   if (aggregated && deploymentCount !== undefined) {
     aggregated.deploymentCount = deploymentCount;
@@ -349,7 +377,7 @@ export function BusinessPlanSummary({
         >
           <div>Resource</div>
           <div>
-            {hasSubscription ? (
+            {showIncluded ? (
               <div className="flex items-center gap-1">
                 Included{" "}
                 <Tooltip
@@ -364,7 +392,7 @@ export function BusinessPlanSummary({
               "Usage"
             )}
           </div>
-          {hasSubscription && (
+          {showIncluded && (
             <div className="flex items-center gap-1">
               On-demand{" "}
               <Tooltip
@@ -380,7 +408,7 @@ export function BusinessPlanSummary({
             <div className="flex items-center gap-1">
               Spend
               <Tooltip
-                tip="Storage metrics show estimated monthly prices based on the most recent usage in the selected period."
+                tip="Usage is rounded up to the nearest whole unit before calculating spend. Storage and deployment metrics show estimated monthly prices based on the most recent usage in the selected period."
                 side="right"
               >
                 <QuestionMarkCircledIcon />
@@ -422,31 +450,30 @@ export function BusinessPlanSummary({
 
             const includedAmount = section.allOnDemand
               ? 0
-              : entitlement !== undefined
-                ? Math.min(metric, entitlement)
-                : undefined;
+              : showHistoricalIncluded
+                ? historicalIncludedUsage?.[section.metric]
+                : entitlement !== undefined
+                  ? Math.min(metric, entitlement)
+                  : undefined;
             const onDemandAmount =
               metric !== undefined && includedAmount !== undefined
-                ? metric - includedAmount
+                ? Math.max(0, metric - includedAmount)
                 : undefined;
 
             const displayedUsage =
-              hasSubscription &&
-              !section.noOnDemand &&
+              showIncluded &&
+              (showHistoricalIncluded || !section.noOnDemand) &&
               includedAmount !== undefined
                 ? includedAmount
                 : metric;
 
-            const estimatedMonthly =
-              section.metric === "databaseStorage" ||
-              section.metric === "fileStorage" ||
-              section.metric === "searchStorage";
+            const isGauge = isGaugeMetric(section.metric);
             const pricedSummaryFailed =
-              !estimatedMonthly &&
+              !isGauge &&
               section.metric !== "aiGatewayCost" &&
               pricedUsage.status === "error";
             const pricedSummaryPending =
-              !estimatedMonthly &&
+              !isGauge &&
               section.metric !== "aiGatewayCost" &&
               pricedUsage.status === "loading";
 
@@ -455,8 +482,12 @@ export function BusinessPlanSummary({
                 ? section.metric === "aiGatewayCost"
                   ? aiCostFailed || aiGatewayCost === undefined
                     ? undefined
-                    : { amount: aiGatewayCost, missingDimensions: [] }
-                  : estimatedMonthly
+                    : {
+                        amount: aiGatewayCost,
+                        includedAmount: 0,
+                        missingDimensions: [],
+                      }
+                  : isGauge
                     ? getUsageSpend(
                         summary,
                         section.metric,
@@ -479,7 +510,7 @@ export function BusinessPlanSummary({
                 )}
               >
                 <div className="flex items-center gap-2">
-                  {showEntitlements &&
+                  {showIncludedLimits &&
                     (entitlement !== undefined ? (
                       <Tooltip
                         aria-label={`${section.title} included usage`}
@@ -497,20 +528,30 @@ export function BusinessPlanSummary({
                   <SectionLabel title={section.title} detail={section.detail} />
                 </div>
                 <div className="animate-fadeInFromLoading">
-                  {hasSubscription && section.allOnDemand ? (
-                    <span className="text-content-secondary">–</span>
+                  {showIncluded &&
+                  (section.allOnDemand ||
+                    (showHistoricalIncluded &&
+                      includedAmount === undefined &&
+                      section.metric !== "deploymentCount")) ? (
+                    <EmptyValue />
                   ) : aiCostFailed ? (
                     <span className="text-content-secondary">Unavailable</span>
                   ) : aiCostPending ? (
                     <Loading fullHeight={false} className="h-4 w-16" />
+                  ) : showIncluded &&
+                    displayedUsage === 0 &&
+                    !(showIncludedLimits && entitlement !== undefined) ? (
+                    // "0 / limit" reads fine next to a cap, but a bare zero
+                    // looks like missing data.
+                    <EmptyValue />
                   ) : (
                     <span>
                       {section.format(displayedUsage)}
                       {section.suffix &&
-                        (!showEntitlements ? ` ${section.suffix}` : "")}
+                        (!showIncludedLimits ? ` ${section.suffix}` : "")}
                     </span>
                   )}
-                  {showEntitlements && entitlement !== undefined && (
+                  {showIncludedLimits && entitlement !== undefined && (
                     <span>
                       {" "}
                       / {section.format(entitlement)}
@@ -537,9 +578,11 @@ export function BusinessPlanSummary({
                       </span>
                     )}
                 </div>
-                {hasSubscription && (
+                {showIncluded && (
                   <div className="animate-fadeInFromLoading">
-                    {section.allOnDemand ? (
+                    {section.metric === "deploymentCount" ? (
+                      <EmptyValue />
+                    ) : section.allOnDemand ? (
                       aiCostFailed ? (
                         <span className="text-content-secondary">
                           Unavailable
@@ -551,22 +594,20 @@ export function BusinessPlanSummary({
                         // increment over an included amount.
                         `${section.format(metric)}${section.suffix ? ` ${section.suffix}` : ""}`
                       )
+                    ) : section.noOnDemand ||
+                      onDemandAmount === undefined ? null : onDemandAmount ===
+                      0 ? (
+                      <EmptyValue />
                     ) : (
-                      !section.noOnDemand &&
-                      onDemandAmount !== undefined &&
-                      onDemandAmount > 0 &&
                       `+${section.format(onDemandAmount)}${section.suffix ? ` ${section.suffix}` : ""}`
                     )}
                   </div>
                 )}
                 {showSpend && (
                   <div className="animate-fadeInFromLoading tabular-nums">
-                    {!spendApplicable ||
-                    section.metric === "deploymentCount" ? (
-                      <span className="text-content-secondary">N/A</span>
-                    ) : pricing.status === "error" ||
-                      aiCostFailed ||
-                      pricedSummaryFailed ? (
+                    {!spendApplicable || section.noOnDemand ? (
+                      <EmptyValue />
+                    ) : aiCostFailed || pricedSummaryFailed ? (
                       <span className="text-content-secondary">
                         Unavailable
                       </span>
@@ -578,7 +619,7 @@ export function BusinessPlanSummary({
                       <SpendValue
                         spend={spend}
                         sectionTitle={section.title}
-                        estimatedMonthly={estimatedMonthly}
+                        estimatedMonthly={isGauge}
                         reportUnavailable={
                           pricing.status === "ready" &&
                           section.metric !== "aiGatewayCost"
@@ -609,6 +650,12 @@ export function BusinessPlanSummary({
   );
 }
 
+// Fills cells with no value to show (zero, not applicable, or missing
+// billing information) so the table doesn't read as missing data.
+function EmptyValue() {
+  return <span className="text-content-secondary">—</span>;
+}
+
 function SpendValue({
   spend,
   sectionTitle,
@@ -637,17 +684,15 @@ function SpendValue({
     }
   }, [missingBillingInformation, sectionTitle, missingDimensions]);
 
+  if (spend === undefined || spend.missingDimensions.length > 0) {
+    return <EmptyValue />;
+  }
+
   return (
-    <span className="inline-flex items-center gap-1 whitespace-nowrap">
-      {spend === undefined || spend.missingDimensions.length > 0 ? (
-        <span className="text-content-secondary">N/A</span>
-      ) : estimatedMonthly ? (
-        <span>
-          {formatSpend(spend.amount)}
-          <span className="ml-1 text-content-secondary">/ month</span>
-        </span>
-      ) : (
-        formatSpend(spend.amount)
+    <span className="whitespace-nowrap">
+      {formatSpend(Math.max(0, spend.amount - spend.includedAmount))}
+      {estimatedMonthly && (
+        <span className="ml-1 text-content-secondary">/ month</span>
       )}
     </span>
   );

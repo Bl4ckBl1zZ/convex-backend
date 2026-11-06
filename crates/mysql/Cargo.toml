@@ -27,6 +27,7 @@ common = { workspace = true }
 const-hex = { workspace = true }
 const_format = { workspace = true }
 dynfmt = { workspace = true }
+enum-iterator = { workspace = true }
 errors = { workspace = true }
 fastrace = { workspace = true }
 futures = { workspace = true }
@@ -56,6 +57,7 @@ database = { workspace = true, features = ["testing"] }
 errors = { workspace = true, features = ["testing"] }
 indexing = { workspace = true }
 metrics = { workspace = true, features = ["testing"] }
+mysql = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }
 runtime = { workspace = true }
 value = { workspace = true, features = ["testing"] }
