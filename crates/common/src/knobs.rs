@@ -693,6 +693,12 @@ pub static INDEX_RETENTION_DELETE_PARALLEL: LazyLock<usize> =
 pub static DOCUMENT_RETENTION_DELETE_PARALLEL: LazyLock<usize> =
     LazyLock::new(|| env_config("DOCUMENT_RETENTION_DELETE_PARALLEL", 1));
 
+/// Maximum interval in seconds between retention cutoff updates; jitter
+/// shortens each interval. Clamped to at least one second. Lower values expire
+/// history sooner at the cost of more frequent persistence writes.
+pub static ADVANCE_RETENTION_TS_FREQUENCY: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("ADVANCE_RETENTION_TS_FREQUENCY", 30).max(1)));
+
 /// INDEX_RETENTION_DELAY determines the size of the index retention window.
 ///
 /// Larger window means we keep around old snapshots for longer, which can cause
@@ -1895,8 +1901,8 @@ pub static MAX_USER_MODULES: LazyLock<usize> =
 pub static REQUEST_TRACE_SAMPLE_CONFIG: LazyLock<SamplingConfig> =
     LazyLock::new(|| env_config("REQUEST_TRACE_SAMPLE_CONFIG", "{}".parse().unwrap()));
 
-/// Size of the cache for access token authentication
-pub static AUTH_CACHE_SIZE: LazyLock<u64> = LazyLock::new(|| env_config("AUTH_CACHE_SIZE", 1000));
+/// Maximum auth cache entries shared across a conductor's deployments.
+pub static AUTH_CACHE_SIZE: LazyLock<u64> = LazyLock::new(|| env_config("AUTH_CACHE_SIZE", 10_000));
 
 /// Length of time an entry to the access authentication cache is valid
 pub static AUTH_CACHE_TTL_SECONDS: LazyLock<u64> =
@@ -2222,3 +2228,10 @@ pub static MAX_LOG_LINES_NODE_ACTIONS: LazyLock<usize> =
 /// Max number of log lines in a single query or mutation
 pub static MAX_LOG_LINES_DATABASE_UDFS: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_LOG_LINES_DATABASE_UDFS", 256).max(1));
+
+/// Snapshots an S3 export table keeps. Each page commits one snapshot per
+/// changed table, and each commit rewrites the whole snapshot list, so the
+/// list is bounded. Readers need only the current snapshot, which holds every
+/// data file; `_ts` serves incremental reads.
+pub static S3_EXPORT_RETAINED_SNAPSHOTS: LazyLock<usize> =
+    LazyLock::new(|| env_config("S3_EXPORT_RETAINED_SNAPSHOTS", 10).max(1));

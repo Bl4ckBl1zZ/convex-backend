@@ -435,6 +435,8 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
         persistence_snapshot: &PersistenceSnapshot,
         index: IndexRef,
         tablet_id: TabletId,
+        table: TableName,
+        caller: IndexScanCaller,
     ) -> anyhow::Result<(Vec<(Timestamp, PackedDocument)>, Vec<ParsedDocument<D>>)> {
         attribute_index_scan(
             persistence_snapshot.index_scan(
@@ -444,8 +446,9 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
                 Order::Asc,
                 usize::MAX,
             ),
-            IndexScanCaller::Bootstrap,
+            caller,
             IndexScanKind::ById,
+            Some(table),
         )
         .map(|row| {
             let rev = row?.1;
@@ -509,6 +512,7 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
     #[fastrace::trace]
     pub async fn load_table_and_index_metadata(
         persistence_snapshot: &PersistenceSnapshot,
+        caller: IndexScanCaller,
     ) -> anyhow::Result<(
         TableMapping,
         OrdMap<TabletId, TableState>,
@@ -530,12 +534,16 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
             persistence_snapshot,
             index_by_id,
             index_tablet_id,
+            INDEX_TABLE,
+            caller,
         )
         .await?;
         let (table_documents, parsed_table_documents) = Self::load_raw_and_parsed_table_documents(
             persistence_snapshot,
             tables_by_id,
             tables_tablet_id,
+            TABLES_TABLE,
+            caller,
         )
         .await?;
 
@@ -821,7 +829,8 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
             table_documents,
             index_documents,
             bootstrap_metadata,
-        ) = Self::load_table_and_index_metadata(&persistence_snapshot).await?;
+        ) = Self::load_table_and_index_metadata(&persistence_snapshot, IndexScanCaller::Bootstrap)
+            .await?;
 
         // Step 2: Load bootstrap tables indexes into memory.
         let load_indexes_into_memory_timer = load_indexes_into_memory_timer();
@@ -925,6 +934,7 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
             self.retention_validator.clone(),
             self.ts,
             BootstrapKind::FromCheckpoint,
+            IndexScanCaller::Bootstrap,
         )
         .await?;
         let table_counts = TableCounts::new(
@@ -1009,6 +1019,7 @@ impl<RT: Runtime> DatabaseSnapshot<RT> {
                 self.persistence_snapshot.clone(),
                 IndexScanCaller::Transaction,
                 Some(self.snapshot.index_registry.clone()),
+                Some(self.snapshot.table_registry.table_mapping().clone()),
             )),
             self.index_cache_handle.clone(),
             None,
@@ -1215,6 +1226,7 @@ impl<RT: Runtime> Database<RT> {
             self.retention_validator(),
             ts,
             BootstrapKind::FromCheckpoint,
+            IndexScanCaller::TableShapes,
         )
         .await?;
         Ok(Some(Arc::new(snapshot.into())))
@@ -1784,6 +1796,9 @@ impl<RT: Runtime> Database<RT> {
                 snapshot
                     .as_ref()
                     .map(|snapshot| snapshot.index_registry.clone()),
+                snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.table_registry.table_mapping().clone()),
             )) as Arc<dyn IndexReader>;
             if let Some(snapshot) = snapshot {
                 // TODO: it is probably OK to still use the index cache even if
@@ -1856,9 +1871,7 @@ impl<RT: Runtime> Database<RT> {
             let result = async {
                 let t = f(&mut tx).0.await?;
                 let func_end_time = Instant::now();
-                let ts = self
-                    .commit_with_write_source(tx, write_source.clone())
-                    .await?;
+                let ts = self.commit(tx, write_source.clone()).await?;
                 let commit_end_time = Instant::now();
                 Ok((ts, t, func_end_time, commit_end_time))
             }
@@ -2057,6 +2070,7 @@ impl<RT: Runtime> Database<RT> {
                     .read_snapshot(repeatable_ts)?,
                     IndexScanCaller::Transaction,
                     Some(snapshot.index_registry.clone()),
+                    Some(snapshot.table_registry.table_mapping().clone()),
                 )),
                 Some(self.index_cache_handle.clone()),
                 index_cache,
@@ -2137,7 +2151,7 @@ impl<RT: Runtime> Database<RT> {
     }
 
     #[fastrace::trace]
-    pub async fn commit_with_write_source(
+    pub async fn commit(
         &self,
         transaction: Transaction<RT>,
         write_source: impl Into<WriteSource>,

@@ -49,6 +49,7 @@ use keybroker::{
 use pb_data_sync::convex_data_sync as pb_ds;
 use table_iteration::data_sync::{
     DataSyncCursor,
+    DataSyncIterator,
     DataSyncStatus,
 };
 use usage_tracking::{
@@ -63,7 +64,7 @@ use value::{
     TabletId,
 };
 
-/// A single document-level entry emitted by [`data_sync`], addressed by
+/// A single document-level entry emitted by [`DataSync::next`], addressed by
 /// (component, table) name rather than tablet id. Table truncations are
 /// reported separately, in [`SyncResult::truncates`].
 #[derive(Debug)]
@@ -71,6 +72,7 @@ pub enum SyncEntry {
     /// The latest revision of a document as of its `ts`.
     Document {
         ts: Timestamp,
+        tablet: TabletId,
         component: ComponentPath,
         table: TableName,
         document: StreamingExportDocument,
@@ -78,6 +80,7 @@ pub enum SyncEntry {
     /// A document was deleted at `ts`.
     Tombstone {
         ts: Timestamp,
+        tablet: TabletId,
         component: ComponentPath,
         table: TableName,
         id: DeveloperDocumentId,
@@ -92,6 +95,9 @@ pub enum SyncEntry {
 /// Truncations logically apply before any [`SyncEntry`]s in the same page.
 #[derive(Debug)]
 pub struct SyncTruncate {
+    /// The tablet entering the export. `import --replace` enters as a new
+    /// tablet under the same name.
+    pub tablet: TabletId,
     pub component: ComponentPath,
     pub table: TableName,
 }
@@ -221,11 +227,11 @@ impl SyncCursor {
         Self::from_proto(prost::Message::decode(bytes)?)
     }
 
-    /// Tables the cursor has captured. At a consistent snapshot
+    /// Tables the cursor has captured, by tablet. At a consistent snapshot
     /// ([`SyncStatus::Stale`] or [`SyncStatus::UpToDate`]) this is every
     /// target table.
-    pub fn tables(&self) -> impl Iterator<Item = &(ComponentPath, TableName)> {
-        self.names.values()
+    pub fn tables(&self) -> impl Iterator<Item = (TabletId, &(ComponentPath, TableName))> {
+        self.names.iter().map(|(tablet, name)| (*tablet, name))
     }
 
     /// Unique id of the sync this cursor belongs to.
@@ -436,14 +442,15 @@ fn resolve_name(
 pub fn selected_tables<RT: Runtime>(
     db_snapshot: &DatabaseSnapshot<RT>,
     selection: &StreamingExportSelection,
-) -> anyhow::Result<Vec<(ComponentPath, TableName)>> {
+) -> anyhow::Result<Vec<(TabletId, ComponentPath, TableName)>> {
     let snapshot = &db_snapshot.snapshot;
     let table_mapping = snapshot.table_mapping();
     let component_paths = snapshot.component_ids_to_paths();
     let mut tables = vec![];
     for (tablet_id, ..) in table_mapping.iter() {
         if table_included(selection, tablet_id, table_mapping, &component_paths)? {
-            tables.push(resolve_name(snapshot, &component_paths, tablet_id)?);
+            let (component, table) = resolve_name(snapshot, &component_paths, tablet_id)?;
+            tables.push((tablet_id, component, table));
         }
     }
     Ok(tables)
@@ -455,169 +462,188 @@ fn new_sync_id<RT: Runtime>(runtime: &RT, sync_client: DataSyncClient) -> String
     format!("{}{}", sync_client.sync_id_prefix(), runtime.new_uuid_v4())
 }
 
-/// Produce the next page of a streaming export ("data sync").
+/// Streaming export pages resolved against a consistent metadata snapshot.
 ///
-/// `cursor: None` starts a fresh sync. `selection` picks the components, tables
-/// and columns to export; it is compared against the cursor on every call so
-/// tables can be added or removed between pages. Any table that enters the
-/// export from scratch — newly selected, replaced (e.g. by `npx convex
-/// import`), or seen for the first time on a cold start — yields a
-/// [`SyncTruncate`] on the page where its fresh traversal begins. A deselected
-/// table just stops being exported.
-#[fastrace::trace]
-pub async fn data_sync<RT: Runtime>(
-    db_snapshot: &DatabaseSnapshot<RT>,
-    identity: Identity,
-    cursor: Option<SyncCursor>,
+/// The iterator must read the same database as `db_snapshot`, with compatible
+/// timestamps and retention settings. It can be reused when constructing a sync
+/// for a newer snapshot or a changed table selection.
+pub struct DataSync<'a, RT: Runtime> {
+    db_snapshot: &'a DatabaseSnapshot<RT>,
+    iterator: &'a DataSyncIterator<RT>,
     selection: StreamingExportSelection,
-    // Integration issuing the sync, prepended to the freshly-minted sync id on
-    // a cold start so callers can tell apart syncs from different sources.
     sync_client: DataSyncClient,
-) -> anyhow::Result<SyncResult> {
-    let usage = FunctionUsageTracker::new();
-    anyhow::ensure!(
-        identity.is_system() || identity.is_admin(),
-        unauthorized_error("data_sync")
-    );
+}
 
-    // Resolve the selection against `db_snapshot`'s consistent snapshot. Tablet ids
-    // are stable, so the mapping stays valid for the iterator's own (possibly
-    // slightly newer) read snapshot.
-    let snapshot = &db_snapshot.snapshot;
-    let component_paths = snapshot.component_ids_to_paths();
-    let target_tables = ResolvedStreamingExportSelection::new(snapshot, &selection)?.target_tables;
-    let resolve_name = |tablet_id: TabletId| resolve_name(snapshot, &component_paths, tablet_id);
-
-    // The tablets the cursor was tracking (synced plus in-progress) before this
-    // page, compared against the tracked set after it to emit truncates.
-    let tracked_before: BTreeSet<TabletId> = cursor
-        .as_ref()
-        .map(|c| {
-            c.inner
-                .synced_tables()
-                .iter()
-                .copied()
-                .chain(c.inner.in_progress_table().map(|(tablet_id, _)| tablet_id))
-                .collect()
+impl<'a, RT: Runtime> DataSync<'a, RT> {
+    pub fn new(
+        db_snapshot: &'a DatabaseSnapshot<RT>,
+        iterator: &'a DataSyncIterator<RT>,
+        identity: Identity,
+        selection: StreamingExportSelection,
+        sync_client: DataSyncClient,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            identity.is_system() || identity.is_admin(),
+            unauthorized_error("data_sync")
+        );
+        Ok(Self {
+            db_snapshot,
+            iterator,
+            selection,
+            sync_client,
         })
-        .unwrap_or_default();
-
-    // Adopt the cursor's sync id, assigning a fresh one on cold start.
-    let sync_id = cursor
-        .as_ref()
-        .map(|c| c.sync_id.clone())
-        .unwrap_or_else(|| new_sync_id(db_snapshot.runtime(), sync_client));
-
-    let mut entries = Vec::new();
-    let iterator = db_snapshot.data_sync_iterator()?;
-    let page = iterator
-        .next_page(cursor.map(|c| c.inner), &target_tables)
-        .await?;
-
-    for DocumentLogEntry { ts, id, value, .. } in page.entries {
-        let tablet_id = id.table();
-        let (component, table) = resolve_name(tablet_id)?;
-        match value {
-            Some(doc) => {
-                let column_filter = selection.column_filter(&component, &table)?;
-                let document = column_filter.filter_document(doc.to_developer())?;
-                usage.track_database_egress_v2(
-                    component.clone(),
-                    &table,
-                    document.size() as u64,
-                    false,
-                );
-                usage.track_database_egress_rows(component.clone(), &table, 1, false);
-                entries.push(SyncEntry::Document {
-                    ts,
-                    component,
-                    table,
-                    document,
-                });
-            },
-            None => {
-                let table_number = snapshot.table_mapping().tablet_number(tablet_id)?;
-                let developer_id = DeveloperDocumentId::new(table_number, id.internal_id());
-                entries.push(SyncEntry::Tombstone {
-                    ts,
-                    component,
-                    table,
-                    id: developer_id,
-                });
-            },
-        }
     }
 
-    // Resolve names for every tablet the new cursor captures. After
-    // reconciliation these are all live tablets present in `table_mapping`.
-    let mut names = BTreeMap::new();
-    for tablet_id in page.cursor.synced_tables() {
-        names.insert(*tablet_id, resolve_name(*tablet_id)?);
-    }
-    if let Some((tablet_id, _)) = page.cursor.in_progress_table() {
-        names.insert(tablet_id, resolve_name(tablet_id)?);
-    }
+    /// `cursor: None` starts a fresh sync. The selection is compared against
+    /// the cursor so tables can be added or removed between pages. A table
+    /// entering the export from scratch yields a [`SyncTruncate`] when its
+    /// traversal begins. A deselected table stops being exported.
+    #[fastrace::trace]
+    pub async fn next(&self, cursor: Option<SyncCursor>) -> anyhow::Result<SyncResult> {
+        let usage = FunctionUsageTracker::new();
+        // Resolve the selection against the consistent metadata snapshot. Tablet ids
+        // are stable, so the mapping stays valid for the iterator's own (possibly
+        // slightly newer) read snapshot.
+        let snapshot = &self.db_snapshot.snapshot;
+        let component_paths = snapshot.component_ids_to_paths();
+        let target_tables =
+            ResolvedStreamingExportSelection::new(snapshot, &self.selection)?.target_tables;
+        let resolve_name =
+            |tablet_id: TabletId| resolve_name(snapshot, &component_paths, tablet_id);
 
-    // A [`SyncTruncate`] tells the consumer to drop everything it synced for a
-    // table before applying this page's values. Emit one for every tablet that
-    // entered the tracked set this page — newly selected, the fresh side of an
-    // import replacement, or any table on its first page of a cold-start
-    // snapshot — since its rows are synced from scratch. Tables truncate only on
-    // entry: a deselected table keeps whatever the consumer synced for it until
-    // it is re-selected, which truncates it then.
-    let truncated: BTreeSet<(ComponentPath, TableName)> = names
-        .iter()
-        .filter(|(tablet_id, _)| !tracked_before.contains(tablet_id))
-        .map(|(_, name)| name.clone())
-        .collect();
-    let truncates = truncated
-        .into_iter()
-        .map(|(component, table)| SyncTruncate { component, table })
-        .collect();
+        // The tablets the cursor was tracking (synced plus in-progress) before this
+        // page, compared against the tracked set after it to emit truncates.
+        let tracked_before: BTreeSet<TabletId> = cursor
+            .as_ref()
+            .map(|c| {
+                c.inner
+                    .synced_tables()
+                    .iter()
+                    .copied()
+                    .chain(c.inner.in_progress_table().map(|(tablet_id, _)| tablet_id))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-    let status = match page.status {
-        DataSyncStatus::Stale { ts } => SyncStatus::Stale { ts },
-        DataSyncStatus::UpToDate { ts } => SyncStatus::UpToDate { ts },
-        DataSyncStatus::Snapshotting { progress } => {
-            let (current_component, current_table) = resolve_name(progress.current_table)?;
-            // Progress denominators from the incrementally-maintained table
-            // counts: no table scans, just map lookups.
-            let total_documents_in_current_table = snapshot
-                .table_counts
-                .as_ref()
-                .map(|counts| counts.tablet_count(&progress.current_table).num_values());
-            let total_documents = snapshot.table_counts.as_ref().map(|counts| {
-                target_tables
-                    .keys()
-                    .map(|tablet_id| counts.tablet_count(tablet_id).num_values())
-                    .sum()
-            });
-            SyncStatus::Snapshotting {
-                progress: SyncProgress {
-                    num_tables_synced: progress.num_tables_synced,
-                    total_tables: progress.total_tables,
-                    current_component,
-                    current_table,
-                    num_documents_in_current_table: progress.num_documents_in_current_table,
-                    total_documents_in_current_table,
-                    num_documents_synced: progress.num_documents_synced,
-                    total_documents,
+        // Adopt the cursor's sync id, assigning a fresh one on cold start.
+        let sync_id = cursor
+            .as_ref()
+            .map(|c| c.sync_id.clone())
+            .unwrap_or_else(|| new_sync_id(self.db_snapshot.runtime(), self.sync_client));
+
+        let mut entries = Vec::new();
+        let page = self
+            .iterator
+            .next_page(cursor.map(|c| c.inner), &target_tables)
+            .await?;
+
+        for DocumentLogEntry { ts, id, value, .. } in page.entries {
+            let tablet_id = id.table();
+            let (component, table) = resolve_name(tablet_id)?;
+            match value {
+                Some(doc) => {
+                    let column_filter = self.selection.column_filter(&component, &table)?;
+                    let document = column_filter.filter_document(doc.to_developer())?;
+                    usage.track_database_egress_v2(
+                        component.clone(),
+                        &table,
+                        document.size() as u64,
+                        false,
+                    );
+                    usage.track_database_egress_rows(component.clone(), &table, 1, false);
+                    entries.push(SyncEntry::Document {
+                        ts,
+                        tablet: tablet_id,
+                        component,
+                        table,
+                        document,
+                    });
+                },
+                None => {
+                    let table_number = snapshot.table_mapping().tablet_number(tablet_id)?;
+                    let developer_id = DeveloperDocumentId::new(table_number, id.internal_id());
+                    entries.push(SyncEntry::Tombstone {
+                        ts,
+                        tablet: tablet_id,
+                        component,
+                        table,
+                        id: developer_id,
+                    });
                 },
             }
-        },
-    };
+        }
 
-    Ok(SyncResult {
-        truncates,
-        entries,
-        cursor: SyncCursor {
-            inner: page.cursor,
-            names,
-            sync_id,
-        },
-        status,
-        usage: usage.gather_user_stats(),
-    })
+        // Resolve names for every tablet the new cursor captures. After
+        // reconciliation these are all live tablets present in `table_mapping`.
+        let mut names = BTreeMap::new();
+        for tablet_id in page.cursor.synced_tables() {
+            names.insert(*tablet_id, resolve_name(*tablet_id)?);
+        }
+        if let Some((tablet_id, _)) = page.cursor.in_progress_table() {
+            names.insert(tablet_id, resolve_name(tablet_id)?);
+        }
+
+        // A [`SyncTruncate`] tells the consumer to drop everything it synced for a
+        // table before applying this page's values. Emit one for every tablet that
+        // entered the tracked set this page — newly selected, the fresh side of an
+        // import replacement, or any table on its first page of a cold-start
+        // snapshot — since its rows are synced from scratch. Tables truncate only on
+        // entry: a deselected table keeps whatever the consumer synced for it until
+        // it is re-selected, which truncates it then.
+        let truncates = names
+            .iter()
+            .filter(|(tablet_id, _)| !tracked_before.contains(tablet_id))
+            .map(|(tablet, (component, table))| SyncTruncate {
+                tablet: *tablet,
+                component: component.clone(),
+                table: table.clone(),
+            })
+            .collect();
+
+        let status = match page.status {
+            DataSyncStatus::Stale { ts } => SyncStatus::Stale { ts },
+            DataSyncStatus::UpToDate { ts } => SyncStatus::UpToDate { ts },
+            DataSyncStatus::Snapshotting { progress } => {
+                let (current_component, current_table) = resolve_name(progress.current_table)?;
+                // Progress denominators from the incrementally-maintained table
+                // counts: no table scans, just map lookups.
+                let total_documents_in_current_table = snapshot
+                    .table_counts
+                    .as_ref()
+                    .map(|counts| counts.tablet_count(&progress.current_table).num_values());
+                let total_documents = snapshot.table_counts.as_ref().map(|counts| {
+                    target_tables
+                        .keys()
+                        .map(|tablet_id| counts.tablet_count(tablet_id).num_values())
+                        .sum()
+                });
+                SyncStatus::Snapshotting {
+                    progress: SyncProgress {
+                        num_tables_synced: progress.num_tables_synced,
+                        total_tables: progress.total_tables,
+                        current_component,
+                        current_table,
+                        num_documents_in_current_table: progress.num_documents_in_current_table,
+                        total_documents_in_current_table,
+                        num_documents_synced: progress.num_documents_synced,
+                        total_documents,
+                    },
+                }
+            },
+        };
+
+        Ok(SyncResult {
+            truncates,
+            entries,
+            cursor: SyncCursor {
+                inner: page.cursor,
+                names,
+                sync_id,
+            },
+            status,
+            usage: usage.gather_user_stats(),
+        })
+    }
 }
 
 /// Convert a legacy `document_deltas` cursor to a [`SyncCursor`]

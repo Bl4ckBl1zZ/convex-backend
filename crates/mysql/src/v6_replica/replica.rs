@@ -5,6 +5,7 @@ use std::{
     sync::{
         atomic::{
             AtomicBool,
+            AtomicU64,
             Ordering,
         },
         Arc,
@@ -47,6 +48,7 @@ use tokio::{
     sync::{
         mpsc,
         oneshot,
+        watch,
         Semaphore,
     },
     time::Instant,
@@ -61,6 +63,7 @@ use super::{
     },
     ReplicaTarget,
 };
+use crate::v5;
 
 pub(crate) enum ReplayOperation {
     Write {
@@ -92,49 +95,51 @@ pub(crate) enum ReplayOperation {
 
 type Reply = oneshot::Sender<anyhow::Result<u64>>;
 
-enum ReplayQueueMessage<RT: Runtime> {
-    Replay {
-        // Queued operations keep the writer alive. The worker holds only the
-        // receiver, so the channel closes once these and the source are dropped.
-        replica: Arc<ReplicaWriter<RT>>,
-        operation: ReplayOperation,
-        reply: Reply,
-    },
-    NotifyAfterPriorReplay(oneshot::Sender<()>),
+/// A queued operation. Queued operations keep the writer alive: the worker
+/// holds only the receiver, so the channel closes once these and the source
+/// are dropped.
+struct ReplayJob<RT: Runtime> {
+    replica: Arc<ReplicaWriter<RT>>,
+    operation: ReplayOperation,
+    reply: Reply,
 }
 
-/// Applies messages in order, merging consecutive writes into one V6
-/// transaction, until the last sender is dropped.
-async fn replay_queue<RT: Runtime>(mut receiver: mpsc::Receiver<ReplayQueueMessage<RT>>) {
+/// Applies jobs in order, merging consecutive writes into one V6
+/// transaction, until the last sender is dropped. `applied` publishes the
+/// number of jobs settled so far, in queue order, for `wait_for_prior_replay`.
+async fn replay_queue<RT: Runtime>(
+    mut receiver: mpsc::Receiver<ReplayJob<RT>>,
+    applied: watch::Sender<u64>,
+) {
+    let mut applied_jobs = 0;
     let mut next = receiver.recv().await;
-    while let Some(message) = next.take() {
-        match message {
-            ReplayQueueMessage::NotifyAfterPriorReplay(reply) => {
-                let _ = reply.send(());
-            },
-            ReplayQueueMessage::Replay {
+    while let Some(job) = next.take() {
+        // Scoped so the worker holds no writer reference while it waits for
+        // the next job, letting the channel close once the source is dropped.
+        {
+            let ReplayJob {
                 replica,
                 operation,
                 reply,
-            } => {
-                let (operation, replies) = match operation {
-                    ReplayOperation::Write {
-                        documents,
-                        indexes,
-                        conflict_strategy,
-                    } => {
-                        let mut batch =
-                            WriteBatch::new(documents, indexes, conflict_strategy, reply);
-                        next = batch.fill(&mut receiver, replica.settings.max_merged_writes);
-                        batch.finish()
-                    },
-                    operation => (operation, vec![reply]),
-                };
-                let jobs = replies.len() as u64;
-                let outcome = replica.run(&operation, jobs).await;
-                metrics::add_queued(&replica.cluster_name, -(jobs as f64));
-                send_outcome(replies, outcome);
-            },
+            } = job;
+            let (operation, replies) = match operation {
+                ReplayOperation::Write {
+                    documents,
+                    indexes,
+                    conflict_strategy,
+                } => {
+                    let mut batch = WriteBatch::new(documents, indexes, conflict_strategy, reply);
+                    next = batch.fill(&mut receiver, replica.settings.max_merged_writes);
+                    batch.finish()
+                },
+                operation => (operation, vec![reply]),
+            };
+            let jobs = replies.len() as u64;
+            let outcome = replica.run(&operation, jobs).await;
+            metrics::add_queued(&replica.cluster_name, -(jobs as f64));
+            send_outcome(replies, outcome);
+            applied_jobs += jobs;
+            applied.send_replace(applied_jobs);
         }
         if next.is_none() {
             next = receiver.recv().await;
@@ -170,29 +175,27 @@ impl WriteBatch {
     }
 
     /// Takes queued jobs while they merge and `max_jobs` allows, returning the
-    /// first message that must wait for the next transaction.
+    /// first job that must wait for the next transaction.
     fn fill<RT: Runtime>(
         &mut self,
-        receiver: &mut mpsc::Receiver<ReplayQueueMessage<RT>>,
+        receiver: &mut mpsc::Receiver<ReplayJob<RT>>,
         max_jobs: usize,
-    ) -> Option<ReplayQueueMessage<RT>> {
+    ) -> Option<ReplayJob<RT>> {
         while self.replies.len() < max_jobs {
-            match receiver.try_recv().ok()? {
-                ReplayQueueMessage::Replay {
-                    replica,
-                    operation,
-                    reply,
-                } => match self.merge(operation) {
-                    Ok(()) => self.replies.push(reply),
-                    Err(operation) => {
-                        return Some(ReplayQueueMessage::Replay {
-                            replica,
-                            operation,
-                            reply,
-                        })
-                    },
+            let ReplayJob {
+                replica,
+                operation,
+                reply,
+            } = receiver.try_recv().ok()?;
+            match self.merge(operation) {
+                Ok(()) => self.replies.push(reply),
+                Err(operation) => {
+                    return Some(ReplayJob {
+                        replica,
+                        operation,
+                        reply,
+                    })
                 },
-                message => return Some(message),
             }
         }
         None
@@ -269,7 +272,22 @@ pub(crate) struct ReplicaWriter<RT: Runtime> {
     /// Stops replay and comparisons permanently on retirement, lease loss,
     /// or clean shutdown.
     stopped: AtomicBool,
-    queue: mpsc::Sender<ReplayQueueMessage<RT>>,
+    queue: mpsc::Sender<ReplayJob<RT>>,
+    /// Serializes `queue.try_send` with the `enqueued` increment, so the count
+    /// never exceeds the jobs the worker will receive and a count read after a
+    /// source call finished includes that call's job.
+    enqueue_order: parking_lot::Mutex<()>,
+    /// Jobs the queue has accepted.
+    enqueued: AtomicU64,
+    /// Jobs the worker has settled, in queue order.
+    applied: watch::Receiver<u64>,
+    /// Serializes closes from lease loss and shutdown; the second finds the
+    /// writer stopped.
+    close_lock: tokio::sync::Mutex<()>,
+    /// Persistence globals this writer wrote to the source. Their queued
+    /// replay supersedes the previous writer's values, so handoff
+    /// verification skips them.
+    rewritten_globals: parking_lot::Mutex<BTreeSet<PersistenceGlobalKey>>,
     pub(super) settings: Settings,
     /// Held by sampled reads from sampling through outcome logging.
     pub(super) comparison_permits: Arc<Semaphore>,
@@ -287,6 +305,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         writer_state_gauge: Arc<metrics::WriterStateGauge>,
     ) -> Arc<Self> {
         let (queue, receiver) = mpsc::channel(settings.max_queued_jobs);
+        let (applied_sender, applied) = watch::channel(0);
         let (activate, activated) = oneshot::channel();
         let replica = Arc::new(Self {
             v6: OnceLock::new(),
@@ -298,6 +317,11 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             lease_ts: source.lease_ts,
             stopped: AtomicBool::new(false),
             queue,
+            enqueue_order: parking_lot::Mutex::new(()),
+            enqueued: AtomicU64::new(0),
+            applied,
+            close_lock: tokio::sync::Mutex::new(()),
+            rewritten_globals: parking_lot::Mutex::new(BTreeSet::new()),
             comparison_permits: Arc::new(Semaphore::new(settings.max_concurrent_comparisons)),
             replica_read_permits: Semaphore::new(settings.max_concurrent_replica_reads),
             settings,
@@ -313,7 +337,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             // A pending writer holds its jobs until the handoff resolves. A
             // dropped sender means it stopped, and the loop skips them.
             let _ = activated.await;
-            replay_queue(receiver).await;
+            replay_queue(receiver, applied_sender).await;
         });
         replica
     }
@@ -353,11 +377,19 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         }
         let (reply, result) = oneshot::channel();
         metrics::add_queued(&self.cluster_name, 1.0);
-        if let Err(error) = self.queue.try_send(ReplayQueueMessage::Replay {
-            replica: self.clone(),
-            operation,
-            reply,
-        }) {
+        let sent = {
+            let _order = self.enqueue_order.lock();
+            let sent = self.queue.try_send(ReplayJob {
+                replica: self.clone(),
+                operation,
+                reply,
+            });
+            if sent.is_ok() {
+                self.enqueued.fetch_add(1, Ordering::SeqCst);
+            }
+            sent
+        };
+        if let Err(error) = sent {
             metrics::add_queued(&self.cluster_name, -1.0);
             let reason = match error {
                 mpsc::error::TrySendError::Full(_) => metrics::RetireReason::QueueFull,
@@ -370,6 +402,10 @@ impl<RT: Runtime> ReplicaWriter<RT> {
             return None;
         }
         Some(result)
+    }
+
+    pub(crate) fn note_global_write(&self, key: PersistenceGlobalKey) {
+        self.rewritten_globals.lock().insert(key);
     }
 
     /// `jobs` is the number of source calls `operation` replays.
@@ -461,22 +497,19 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         }
     }
 
-    /// Acknowledges earlier operations after success, failure, or skipping.
+    /// Resolves once every job queued before this call has been applied,
+    /// failed, or skipped, or returns false when the worker exited or
+    /// `deadline` passed first. Waiting reads the worker's progress counter,
+    /// so writes queued around a wait still merge into one transaction.
     pub(crate) async fn wait_for_prior_replay(&self, deadline: Option<Instant>) -> bool {
-        let notification = async {
-            let (reply, completed) = oneshot::channel();
-            self.queue
-                .send(ReplayQueueMessage::NotifyAfterPriorReplay(reply))
-                .await
-                .ok()?;
-            completed.await.ok()
-        };
+        let target = self.enqueued.load(Ordering::SeqCst);
+        let mut applied = self.applied.clone();
+        let settled = async move { applied.wait_for(|applied| *applied >= target).await.is_ok() };
         match deadline {
-            Some(deadline) => matches!(
-                tokio::time::timeout_at(deadline, notification).await,
-                Ok(Some(()))
-            ),
-            None => notification.await.is_some(),
+            Some(deadline) => tokio::time::timeout_at(deadline, settled)
+                .await
+                .unwrap_or(false),
+            None => settled.await,
         }
     }
 
@@ -506,6 +539,7 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     /// The caller must finish all source calls before starting replica
     /// shutdown.
     pub(crate) async fn close(self: &Arc<Self>) {
+        let _closing = self.close_lock.lock().await;
         if self.is_stopped() {
             return;
         }
@@ -535,6 +569,10 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         match result {
             Ok(Ok(())) => {
                 self.stop(metrics::WriterState::Closed);
+                tracing::info!(
+                    instance_name = %self.instance_name,
+                    "V6 replica certified a clean shutdown"
+                );
             },
             _ => self.retire(
                 metrics::RetireReason::UncleanHandoff,
@@ -600,6 +638,48 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     }
 }
 
+/// The source as of this writer taking its lease, for judging a replica whose
+/// previous writer left no certificate.
+pub(super) struct HandoffVerification<RT: Runtime> {
+    pub(super) v5: Arc<v5::Persistence<RT>>,
+    /// The source's latest timestamp before this writer's first commit. The
+    /// previous writer's replay is complete once the replica reaches it.
+    pub(super) boundary_ts: Option<Timestamp>,
+}
+
+impl<RT: Runtime> HandoffVerification<RT> {
+    /// Replay is FIFO, so a replica at the boundary applied every earlier
+    /// document write. Persistence globals carry no timestamp and are compared
+    /// directly, except globals this writer has since rewritten. Index backfill
+    /// chunks and reconciliation need no check: the backfill worker commits its
+    /// cursor and its scan-complete boundary as documents only after those
+    /// calls return, so work whose replay was lost with its process has no
+    /// checkpoint behind it and the resumed backfill redoes it.
+    async fn replica_matches_source(
+        &self,
+        v6: &Arc<dyn PersistenceTrait>,
+        rewritten_globals: &BTreeSet<PersistenceGlobalKey>,
+    ) -> anyhow::Result<bool> {
+        let (source, replica) = (self.v5.reader(), v6.reader());
+        if replica.max_ts().await? != self.boundary_ts {
+            return Ok(false);
+        }
+        for key in enum_iterator::all::<PersistenceGlobalKey>() {
+            if rewritten_globals.contains(&key) {
+                continue;
+            }
+            let (source_value, replica_value) = tokio::try_join!(
+                source.get_persistence_global(key),
+                replica.get_persistence_global(key)
+            )?;
+            if source_value != replica_value {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 enum Handoff {
     /// The previous writer drained its replay and certified its shutdown.
     Certified,
@@ -616,24 +696,29 @@ impl<RT: Runtime> ReplicaWriter<RT> {
     /// Rolling updates start the new conductor before stopping the old one,
     /// so the previous writer is usually still draining when this writer
     /// loads. Queue writes until it certifies a clean shutdown, then take the
-    /// registration; retire if the certificate does not arrive in time.
+    /// registration. Without a certificate in time, compare the replica with
+    /// the source as of the lease change and resume only when they match.
     pub(super) fn resolve_handoff(
         self: &Arc<Self>,
         source: ReplicaHandoffState,
         previous_lease_ts: i64,
+        verification: HandoffVerification<RT>,
     ) {
         let replica = self.clone();
         common::runtime::tokio_spawn("v6_replica_handoff", async move {
             match replica.await_certificate(previous_lease_ts).await {
-                Handoff::Certified => replica.claim(&source).await,
-                Handoff::Expired => replica.retire(
-                    metrics::RetireReason::UncleanHandoff,
-                    &anyhow::anyhow!(
-                        "the previous writer did not certify a clean shutdown within {:?}",
-                        replica.settings.handoff_grace
-                    ),
-                ),
+                Handoff::Certified => {
+                    metrics::log_handoff(&replica.cluster_name, metrics::HandoffOutcome::Certified);
+                    replica
+                        .claim(&source, state::Resume::IfCertified, None)
+                        .await
+                },
+                Handoff::Expired => replica.verify_and_claim(&source, verification).await,
                 Handoff::Superseded => {
+                    metrics::log_handoff(
+                        &replica.cluster_name,
+                        metrics::HandoffOutcome::Superseded,
+                    );
                     if replica.stop(metrics::WriterState::Displaced) {
                         tracing::info!(
                             instance_name = %replica.instance_name,
@@ -642,11 +727,67 @@ impl<RT: Runtime> ReplicaWriter<RT> {
                     }
                 },
                 Handoff::Retired => {
+                    metrics::log_handoff(&replica.cluster_name, metrics::HandoffOutcome::Retired);
                     replica.stop(metrics::WriterState::Retired);
                 },
                 Handoff::Stopped => {},
             }
         });
+    }
+
+    /// Taking the V6 lease first ends any replay the previous writer is still
+    /// running, so the comparison sees the replica's final state.
+    async fn verify_and_claim(
+        self: &Arc<Self>,
+        source: &ReplicaHandoffState,
+        verification: HandoffVerification<RT>,
+    ) {
+        let grace = self.settings.handoff_grace;
+        let no_certificate =
+            format!("the previous writer did not certify a clean shutdown within {grace:?}");
+        let v6 = match super::connect_v6(&self.target, source).await {
+            Ok(v6) => v6,
+            Err(error) => {
+                metrics::log_handoff(&self.cluster_name, metrics::HandoffOutcome::Expired);
+                self.retire(
+                    metrics::RetireReason::UncleanHandoff,
+                    &error.context(format!(
+                        "{no_certificate} and the replica could not be opened for verification"
+                    )),
+                );
+                return;
+            },
+        };
+        let rewritten_globals = self.rewritten_globals.lock().clone();
+        match verification
+            .replica_matches_source(&v6, &rewritten_globals)
+            .await
+        {
+            Ok(true) => {
+                metrics::log_handoff(&self.cluster_name, metrics::HandoffOutcome::Verified);
+                tracing::info!(
+                    instance_name = %self.instance_name,
+                    "V6 replica matches the source at the handoff; resuming without a certificate"
+                );
+                self.claim(source, state::Resume::Verified, Some(v6)).await
+            },
+            Ok(false) => {
+                metrics::log_handoff(&self.cluster_name, metrics::HandoffOutcome::Expired);
+                self.retire(
+                    metrics::RetireReason::UncleanHandoff,
+                    &anyhow::anyhow!("{no_certificate} and the replica differs from the source"),
+                )
+            },
+            Err(error) => {
+                metrics::log_handoff(&self.cluster_name, metrics::HandoffOutcome::Expired);
+                self.retire(
+                    metrics::RetireReason::UncleanHandoff,
+                    &error.context(format!(
+                        "{no_certificate} and the replica could not be compared with the source"
+                    )),
+                )
+            },
+        }
     }
 
     async fn await_certificate(&self, previous_lease_ts: i64) -> Handoff {
@@ -679,11 +820,26 @@ impl<RT: Runtime> ReplicaWriter<RT> {
         }
     }
 
-    async fn claim(self: &Arc<Self>, source: &ReplicaHandoffState) {
-        match state::register(&self.target.pool, &self.target.db_name, source, false).await {
-            Ok(true) => match super::open_v6(&self.target, source).await {
-                Ok(v6) => self.activate(v6),
-                Err(error) => self.retire(metrics::RetireReason::InitializationFailed, &error),
+    /// `v6` is a connection already holding the V6 lease, whose registration
+    /// only needs confirming.
+    async fn claim(
+        self: &Arc<Self>,
+        source: &ReplicaHandoffState,
+        resume: state::Resume,
+        v6: Option<Arc<dyn PersistenceTrait>>,
+    ) {
+        match state::register(&self.target.pool, &self.target.db_name, source, resume).await {
+            Ok(true) => {
+                let opened = match v6 {
+                    Some(v6) => super::confirm_ownership(&self.target, source)
+                        .await
+                        .map(|()| v6),
+                    None => super::open_v6(&self.target, source).await,
+                };
+                match opened {
+                    Ok(v6) => self.activate(v6),
+                    Err(error) => self.retire(metrics::RetireReason::InitializationFailed, &error),
+                }
             },
             Ok(false) => {
                 super::spawn_delete_data(self.target.clone(), self.deployment_id);
