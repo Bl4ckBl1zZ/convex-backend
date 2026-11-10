@@ -1,3 +1,5 @@
+#![cfg_attr(test, feature(try_blocks_heterogeneous))]
+
 use std::{
     sync::Arc,
     time::Duration,
@@ -24,7 +26,6 @@ use keybroker::{
 use model::{
     integrations::{
         types::{
-            s3_export::S3ExportCredentials,
             IntegrationConfig,
             IntegrationDocument,
             IntegrationState,
@@ -58,6 +59,8 @@ use crate::metrics::{
     log_s3_export_worker_failed,
     s3_export_sync_timer,
 };
+
+mod metrics;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -121,7 +124,7 @@ impl<RT: Runtime> S3ExportWorker<RT> {
         let IntegrationConfig::S3Export(config) = &export.config else {
             anyhow::bail!("S3 export document has a different configuration type");
         };
-        if !config.credentials.is_ready() {
+        if config.credentials.role_arn.is_empty() {
             let token = tx.into_token()?;
             self.database
                 .subscribe_and_wait_for_invalidation(token)
@@ -155,21 +158,9 @@ impl<RT: Runtime> S3ExportWorker<RT> {
                         region: config.region.clone(),
                         prefix: config.prefix.clone(),
                         endpoint_url: None,
-                        credentials: match &config.credentials {
-                            S3ExportCredentials::AccessKey {
-                                access_key_id,
-                                secret_access_key,
-                            } => ByoAwsCredentials::AccessKey {
-                                access_key_id: access_key_id.0.clone(),
-                                secret_access_key: secret_access_key.0.clone(),
-                            },
-                            S3ExportCredentials::Role {
-                                role_arn,
-                                external_id,
-                            } => ByoAwsCredentials::Role {
-                                role_arn: role_arn.clone(),
-                                external_id: external_id.clone(),
-                            },
+                        credentials: ByoAwsCredentials {
+                            role_arn: config.credentials.role_arn.clone(),
+                            external_id: config.credentials.external_id.clone(),
                         },
                     },
                     SyncFormat::Iceberg,

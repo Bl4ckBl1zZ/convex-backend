@@ -145,6 +145,7 @@ use common::{
         IndexId,
         IndexName,
         IndexRef,
+        MemberId,
         ModuleEnvironment,
         NodeDependency,
         ObjectKey,
@@ -209,6 +210,7 @@ use keybroker::{
     Identity,
     KeyBroker,
 };
+use managed_export_worker::S3ExportWorker;
 use maplit::{
     btreemap,
     btreeset,
@@ -422,7 +424,6 @@ use crate::{
         RedactedJsError,
         RedactedLogLines,
     },
-    s3_export_worker::S3ExportWorker,
     snapshot_import::{
         clear_tables,
         SnapshotImportWorker,
@@ -448,7 +449,6 @@ pub mod integrations;
 pub mod log_visibility;
 mod metrics;
 pub mod redaction;
-mod s3_export_worker;
 pub mod scheduled_jobs;
 mod schema_worker;
 pub mod snapshot_import;
@@ -1662,6 +1662,7 @@ impl<RT: Runtime> Application<RT> {
                      message should be returned instead."
                 )
             },
+            UdfType::Init => anyhow::bail!("Unexpected init function"),
         }
     }
 
@@ -2925,6 +2926,7 @@ impl<RT: Runtime> Application<RT> {
                     "HTTP actions are not supported in the REPL yet."
                 ))
             },
+            UdfType::Init => anyhow::bail!("Unexpected init function"),
         }?;
         let log_lines = RedactedLogLines::from_log_lines(log_lines, block_logging);
         Ok(match result {
@@ -3422,13 +3424,39 @@ impl<RT: Runtime> Application<RT> {
     /// transaction commits successfully.
     pub async fn commit_with_audit_log_events(
         &self,
-        mut transaction: Transaction<RT>,
+        transaction: Transaction<RT>,
         events: Vec<DeploymentAuditLogEvent>,
         request_metadata: RequestMetadata,
         write_source: impl Into<WriteSource>,
     ) -> anyhow::Result<Timestamp> {
+        self.commit_with_audit_log_events_with_member_override(
+            transaction,
+            events,
+            None,
+            request_metadata,
+            write_source,
+        )
+        .await
+    }
+
+    /// System tasks can attribute changes to the member who initiated them
+    /// while retaining their system identity for authorization.
+    pub async fn commit_with_audit_log_events_with_member_override(
+        &self,
+        mut transaction: Transaction<RT>,
+        events: Vec<DeploymentAuditLogEvent>,
+        member_id_override: Option<MemberId>,
+        request_metadata: RequestMetadata,
+        write_source: impl Into<WriteSource>,
+    ) -> anyhow::Result<Timestamp> {
+        if member_id_override.is_some() && !transaction.identity().is_system() {
+            anyhow::bail!(ErrorMetadata::forbidden(
+                "MemberIdOverrideRequiresSystemIdentity",
+                "Only system identities can override the audit log member ID.",
+            ));
+        }
         DeploymentAuditLogModel::new(&mut transaction)
-            .insert(events.clone(), &request_metadata)
+            .insert_with_member_override(events.clone(), member_id_override, &request_metadata)
             .await?;
         let ts = self.commit(transaction, write_source).await?;
         let logs = events

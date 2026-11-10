@@ -1,4 +1,3 @@
-import { Button } from "@ui/Button";
 import { Sheet } from "@ui/Sheet";
 import { Tooltip } from "@ui/Tooltip";
 import { Spinner } from "@ui/Spinner";
@@ -6,7 +5,7 @@ import { formatBytes, formatNumberCompact } from "@common/lib/format";
 import { UsageSummaryRow } from "hooks/usageMetrics";
 import { useLaunchDarkly } from "hooks/useLaunchDarkly";
 import { formatQuantity } from "./lib/formatQuantity";
-import { ReactNode, useEffect } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import { captureException } from "@sentry/nextjs";
 import { TeamEntitlementsResponse } from "generatedApi";
 
@@ -16,6 +15,7 @@ import {
   ChevronRightIcon,
 } from "@radix-ui/react-icons";
 import { cn } from "@ui/cn";
+import Link from "next/link";
 import { useRouter } from "next/router";
 import { Donut } from "@ui/Donut";
 import { Loading } from "@ui/Loading";
@@ -250,6 +250,7 @@ export function BusinessPlanSummary({
   isBusinessPlan = true,
   entitlements,
   hasSubscription = false,
+  subscriptionLoading = false,
   showEntitlements = false,
   isCurrentBillingPeriod = true,
   pricing = { status: "unavailable", reason: "unsupported-period" },
@@ -263,6 +264,7 @@ export function BusinessPlanSummary({
   isBusinessPlan?: boolean;
   entitlements?: TeamEntitlementsResponse;
   hasSubscription?: boolean;
+  subscriptionLoading?: boolean;
   showEntitlements?: boolean;
   isCurrentBillingPeriod?: boolean;
   pricing?: UsagePricing;
@@ -302,11 +304,30 @@ export function BusinessPlanSummary({
     );
   const showIncluded = hasSubscription || showHistoricalIncluded;
   const showIncludedLimits = showEntitlements && isCurrentBillingPeriod;
-  const gridColumns = showIncluded
-    ? showSpend
+
+  const layoutDecided =
+    !subscriptionLoading &&
+    (!dashboardShowCashUsage || pricing.status !== "loading");
+  const [settledColumns, setSettledColumns] = useState<{
+    showIncluded: boolean;
+    showSpend: boolean;
+  }>();
+  if (
+    layoutDecided &&
+    (settledColumns?.showIncluded !== showIncluded ||
+      settledColumns?.showSpend !== showSpend)
+  ) {
+    setSettledColumns({ showIncluded, showSpend });
+  }
+  const columns = (!layoutDecided && settledColumns) || {
+    showIncluded,
+    showSpend,
+  };
+  const gridColumns = columns.showIncluded
+    ? columns.showSpend
       ? "grid-cols-[4fr_3fr_2fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_2fr_auto]"
       : "grid-cols-[4fr_3fr_2fr_auto] sm:grid-cols-[4fr_3fr_3fr_auto]"
-    : showSpend
+    : columns.showSpend
       ? "grid-cols-[5fr_4fr_2fr_auto]"
       : "grid-cols-[5fr_4fr_auto]";
 
@@ -368,16 +389,13 @@ export function BusinessPlanSummary({
       className="animate-fadeInFromLoading overflow-hidden"
       padding={false}
     >
-      <div className="flex flex-col gap-1 overflow-x-clip">
-        <div
-          className={cn(
-            "grid items-center gap-2 rounded-t border-b px-4 py-2 text-sm text-content-secondary",
-            gridColumns,
-          )}
-        >
+      {/* Rows are subgrids of one shared grid, so a wide value in any row
+          widens its column for every row instead of shifting just its own. */}
+      <div className={cn("grid gap-x-2 gap-y-1 overflow-x-clip", gridColumns)}>
+        <div className="col-span-full grid grid-cols-subgrid items-center rounded-t border-b px-4 py-2 text-sm text-content-secondary">
           <div>Resource</div>
           <div>
-            {showIncluded ? (
+            {columns.showIncluded ? (
               <div className="flex items-center gap-1">
                 Included{" "}
                 <Tooltip
@@ -392,7 +410,7 @@ export function BusinessPlanSummary({
               "Usage"
             )}
           </div>
-          {showIncluded && (
+          {columns.showIncluded && (
             <div className="flex items-center gap-1">
               On-demand{" "}
               <Tooltip
@@ -404,7 +422,7 @@ export function BusinessPlanSummary({
               </Tooltip>
             </div>
           )}
-          {showSpend && (
+          {columns.showSpend && (
             <div className="flex items-center gap-1">
               Spend
               <Tooltip
@@ -424,7 +442,7 @@ export function BusinessPlanSummary({
         </div>
         {error ? (
           <PlanSummaryError />
-        ) : !aggregated ? (
+        ) : !aggregated || !layoutDecided ? (
           <PlanSummaryLoading />
         ) : (
           visibleSections.map((section, index) => {
@@ -504,10 +522,7 @@ export function BusinessPlanSummary({
             return (
               <div
                 key={index}
-                className={cn(
-                  "group grid min-h-10 items-center gap-2 rounded-sm px-4 py-2 text-left transition-colors focus-within:bg-background-primary hover:bg-background-primary",
-                  gridColumns,
-                )}
+                className="group relative col-span-full grid min-h-10 grid-cols-subgrid items-center rounded-sm px-4 py-2 text-left transition-colors focus-within:bg-background-primary hover:bg-background-primary"
               >
                 <div className="flex items-center gap-2">
                   {showIncludedLimits &&
@@ -516,7 +531,7 @@ export function BusinessPlanSummary({
                         aria-label={`${section.title} included usage`}
                         side="bottom"
                         tip={`Your team has used ${(100 * (displayedUsage / entitlement)).toFixed(2)}% of the included amount of ${section.title}.`}
-                        className="flex animate-fadeInFromLoading items-center rounded-sm focus-visible:ring-2 focus-visible:ring-border-selected"
+                        className="relative z-10 flex animate-fadeInFromLoading items-center rounded-sm focus-visible:ring-2 focus-visible:ring-border-selected"
                       >
                         <Donut current={displayedUsage} max={entitlement} />
                       </Tooltip>
@@ -628,19 +643,17 @@ export function BusinessPlanSummary({
                     )}
                   </div>
                 )}
-                <Button
-                  variant="unstyled"
+                <Link
+                  href={linkHref}
+                  shallow
                   aria-label={`View ${section.title} breakdown by day`}
-                  onClick={() => {
-                    void router.push(linkHref, undefined, { shallow: true });
-                  }}
-                  className="flex items-center gap-1 rounded-sm text-xs text-content-secondary hover:text-content-primary focus-visible:outline-2 focus-visible:outline-border-selected"
+                  className="flex items-center gap-1 text-xs text-content-secondary group-hover:text-content-primary after:absolute after:inset-0 after:rounded-sm focus-visible:outline-none focus-visible:after:outline-2 focus-visible:after:outline-border-selected"
                 >
                   <span className="hidden whitespace-nowrap opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 sm:inline">
                     View breakdown by day
                   </span>
                   <ChevronRightIcon className="size-4" />
-                </Button>
+                </Link>
               </div>
             );
           })
@@ -700,7 +713,7 @@ function SpendValue({
 
 function PlanSummaryError() {
   return (
-    <div className="flex h-56 flex-col items-center justify-center p-4 text-center">
+    <div className="col-span-full flex h-56 flex-col items-center justify-center p-4 text-center">
       <CrossCircledIcon className="size-6 text-content-error" />
       <h5 className="mt-2">Error fetching Usage summary data</h5>
       <p className="mt-1 text-sm text-content-secondary">
@@ -713,7 +726,7 @@ function PlanSummaryError() {
 
 function PlanSummaryLoading() {
   return (
-    <div className="flex h-100 items-center justify-center p-4">
+    <div className="col-span-full flex h-100 items-center justify-center p-4">
       <div className="flex items-center justify-center">
         <Spinner className="size-12" />
       </div>
@@ -736,7 +749,7 @@ function SectionLabel({
           aria-label={`${title} details`}
           tip={detail}
           side="right"
-          className="hidden rounded-sm focus-visible:ring-2 focus-visible:ring-border-selected sm:block"
+          className="relative z-10 hidden rounded-sm focus-visible:ring-2 focus-visible:ring-border-selected sm:block"
         >
           <QuestionMarkCircledIcon className="ml-1" />
         </Tooltip>
