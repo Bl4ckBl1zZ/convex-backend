@@ -254,12 +254,12 @@ export const screenshots = [
     "light": {
       "filename": "components_transfer_project_light.webp",
       "width": 1856,
-      "height": 548
+      "height": 588
     },
     "dark": {
       "filename": "components_transfer_project_dark.webp",
       "width": 1856,
-      "height": 548
+      "height": 588
     }
   },
   {
@@ -1209,6 +1209,19 @@ export const screenshots = [
       "filename": "pages_project_deployment_settings_usage_limits_empty_dark.webp",
       "width": 3024,
       "height": 2440
+    }
+  },
+  {
+    "storyTitle": "docs/pages/project/ReviewDefaultEnvironmentVariableChanges",
+    "light": {
+      "filename": "pages_project_review_default_environment_variable_changes_light.webp",
+      "width": 2200,
+      "height": 838
+    },
+    "dark": {
+      "filename": "pages_project_review_default_environment_variable_changes_dark.webp",
+      "width": 2200,
+      "height": 842
     }
   }
 ] as const;
