@@ -740,11 +740,26 @@ pub static ADVANCE_RETENTION_TS_FREQUENCY: LazyLock<Duration> =
 pub static INDEX_RETENTION_DELAY: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("INDEX_RETENTION_DELAY", 4 * 60)));
 
+/// How long maintenance keeps a MySQL V6 `indexes_log_<bucket>` table after its
+/// last timestamp, as index history to inspect by hand during an incident.
+/// Reads and writes never use a bucket below the published floor, which follows
+/// `INDEX_RETENTION_DELAY`, so this only delays drops. A bucket is never
+/// dropped above the floor, even when this is shorter.
+pub static V6_INDEX_LOG_RETENTION_DELAY: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("V6_INDEX_LOG_RETENTION_DELAY", 3 * 60 * 60)));
+
 /// How often each conductor checks that the MySQL V6 `indexes_log_<bucket>`
 /// tables its cluster needs exist, and that buckets past retention are gone.
 pub static INDEXES_LOG_MAINTENANCE_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     Duration::from_secs(env_config("INDEXES_LOG_MAINTENANCE_INTERVAL", 60).max(1))
 });
+
+/// Kill switch for MySQL V6 `indexes_log` bucket maintenance. While off,
+/// rounds do nothing, so commits start failing once writes pass the last
+/// bucket created; that is at most `INDEXES_LOG_LOOKAHEAD_BUCKETS` buckets
+/// away.
+pub static V6_MAINTENANCE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("V6_MAINTENANCE_ENABLED", true));
 
 /// How many `indexes_log_<bucket>` tables to create beyond the one taking
 /// writes now.
