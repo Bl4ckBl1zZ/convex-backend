@@ -25,13 +25,22 @@ use common::{
         },
     },
     components::{
+        CanonicalizedComponentFunctionPath,
         ComponentDefinitionPath,
         ComponentId,
         ComponentPath,
+        PublicFunctionPath,
     },
     errors::JsError,
-    execution_context::RequestMetadata,
-    knobs::FINISH_PUSH_MAX_OCC_FAILURES,
+    execution_context::{
+        ExecutionContext,
+        RequestContext,
+        RequestMetadata,
+    },
+    knobs::{
+        COMPONENT_ARGS_MAX_SIZE_BYTES,
+        FINISH_PUSH_MAX_OCC_FAILURES,
+    },
     runtime::{
         try_join,
         Runtime,
@@ -43,13 +52,16 @@ use common::{
         TableValidationOutcome,
     },
     types::{
+        AllowedVisibility,
         EnvVarName,
         EnvVarValue,
+        FunctionCaller,
         IndexName,
         ModuleEnvironment,
         NodeDependency,
         RepeatableTimestamp,
         Timestamp,
+        UdfType,
     },
     version::Version,
 };
@@ -96,6 +108,11 @@ use model::{
             SchemaChange,
         },
         file_based_routing::file_based_exports,
+        init::{
+            init_args_validator,
+            init_function,
+            resolve_component_args,
+        },
         type_checking::{
             CheckedComponent,
             TypecheckContext,
@@ -146,18 +163,26 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use serde_json::Value as JsonValue;
 use sync_types::{
     module_path::InvalidModulePathError,
+    types::SerializedArgs,
     CanonicalizedModulePath,
+    CanonicalizedUdfPath,
     ModulePath,
 };
 use udf::{
     environment::system_env_var_overrides,
+    validation::{
+        PendingArgsPolicy,
+        ValidatedPathAndArgs,
+    },
     EvaluateAppDefinitionsResult,
 };
 use usage_tracking::FunctionUsageTracker;
 use value::{
     sha256::Sha256Digest,
+    ConvexObject,
     DeveloperDocumentId,
     ResolvedDocumentId,
     TableName,
@@ -165,12 +190,24 @@ use value::{
 };
 
 use crate::{
+    application_function_runner::{
+        ComponentInit,
+        ComponentInitOutcome,
+    },
     schema_worker::table_shape_provider,
     validate_env_var_values,
     Application,
     ApplyConfigArgs,
     ConfigMetadataAndSchema,
 };
+
+fn init_failure(
+    init_path: &CanonicalizedUdfPath,
+    component_path: &ComponentPath,
+    details: &str,
+) -> String {
+    format!("init {init_path} of component {component_path}:\n{details}")
+}
 
 pub struct PushAnalytics {
     pub config: ConfigMetadata,
@@ -329,6 +366,7 @@ impl<RT: Runtime> Application<RT> {
             )
             .await?;
         validate_env_var_declarations(&evaluated_components)?;
+        validate_component_args_size(&evaluated_components)?;
         // Build and typecheck the component tree. We don't strictly need to do this
         // before `/finish_push`, but it's better to fail fast here on errors before
         // waiting for schema backfills to complete.
@@ -832,7 +870,7 @@ impl<RT: Runtime> Application<RT> {
     pub async fn finish_push(
         &self,
         identity: Identity,
-        request_metadata: RequestMetadata,
+        request_context: RequestContext,
         mut start_push: StartPushResponse,
         message: Option<PushMessage>,
     ) -> anyhow::Result<(FinishPushDiff, Timestamp)> {
@@ -856,13 +894,14 @@ impl<RT: Runtime> Application<RT> {
         let (diff, ts) = self
             .execute_with_audit_log_events_and_occ_retries_with_timestamp(
                 identity.clone(),
-                request_metadata,
+                request_context.request_metadata.clone(),
                 finish_push_write_source,
                 *FINISH_PUSH_MAX_OCC_FAILURES,
                 |tx| {
                     let start_push = &start_push;
                     let downloaded_source_packages = &downloaded_source_packages;
                     let message = &message;
+                    let request_context = &request_context;
                     async move {
                         // Validate that environment variables haven't changed since `start_push`.
                         let environment_variables =
@@ -961,6 +1000,12 @@ impl<RT: Runtime> Application<RT> {
                             definition_diffs,
                             component_diffs,
                         };
+
+                        // Run component inits after the transaction has the new modules and
+                        // component tree
+                        self.run_component_inits(tx, start_push, request_context.clone())
+                            .await?;
+
                         Ok((diff, audit_log_events))
                     }
                     .in_span(Span::enter_with_local_parent("finish_push_tx"))
@@ -985,6 +1030,134 @@ impl<RT: Runtime> Application<RT> {
             })?;
 
         Ok((diff, ts))
+    }
+
+    async fn run_component_inits(
+        &self,
+        tx: &mut Transaction<RT>,
+        start_push: &StartPushResponse,
+        request_context: RequestContext,
+    ) -> anyhow::Result<()> {
+        // Walk the component tree to resolve component arguments
+        // Since parent components may forward their args to their child components, we
+        // must resolve the parent component first
+        let mut requests = Vec::new();
+        let mut stack = vec![(&start_push.app, ConvexObject::empty())];
+        while let Some((component, args)) = stack.pop() {
+            let evaluated = start_push
+                .analysis
+                .get(&component.definition_path)
+                .context("Missing analysis for component definition")?;
+            let args_validator = init_args_validator(&component.component_path, evaluated)?;
+            for instantiation in &evaluated.definition.child_components {
+                let child = component
+                    .child_components
+                    .get(&instantiation.name)
+                    .with_context(|| format!("Missing child component {:?}", instantiation.name))?;
+                let child_args =
+                    resolve_component_args(tx, component, &args_validator, &args, instantiation)
+                        .await?;
+                stack.push((child, child_args));
+            }
+            // init is only available within components, not the app.
+            if component.component_path.is_root() {
+                continue;
+            }
+            let Some((init_path, _)) = init_function(&component.component_path, evaluated)? else {
+                continue;
+            };
+            requests.push(
+                self.prepare_component_init(tx, &component.component_path, init_path, args)
+                    .await?,
+            );
+        }
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        let context = ExecutionContext::new(request_context, &FunctionCaller::Push);
+        let outcomes = self
+            .runner
+            .run_component_inits(tx, context.clone(), requests)
+            .await?;
+        let mut failures = Vec::new();
+        for (
+            path,
+            ComponentInitOutcome {
+                execution_id,
+                outcome,
+            },
+        ) in outcomes
+        {
+            if let Err(js_error) = &outcome.result {
+                let failure =
+                    init_failure(&path.udf_path, &path.component_path, &js_error.to_string());
+                failures.push((path.component_path, failure));
+            }
+            let execution_time = outcome.user_execution_time.unwrap_or_default();
+            // N.B.: the init has not yet committed yet at this point, and we may roll back
+            // the push even if all the inits succeeded.
+            let mut init_context = context.clone();
+            init_context.execution_id = execution_id;
+            self.function_log
+                .log_component_init(outcome, execution_time, init_context);
+        }
+        if !failures.is_empty() {
+            failures.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let failures: Vec<_> = failures.into_iter().map(|(_, failure)| failure).collect();
+            let what_failed = if failures.len() == 1 {
+                "an init failed".to_string()
+            } else {
+                format!("{} inits failed", failures.len())
+            };
+            anyhow::bail!(ErrorMetadata::bad_request(
+                "InitFailed",
+                format!(
+                    "The push was rolled back because {what_failed}:\n\n{}",
+                    failures.join("\n\n"),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn prepare_component_init(
+        &self,
+        tx: &mut Transaction<RT>,
+        component_path: &ComponentPath,
+        init_path: &CanonicalizedUdfPath,
+        args: ConvexObject,
+    ) -> anyhow::Result<ComponentInit> {
+        let arguments = SerializedArgs::from_args(vec![JsonValue::from(args)])?;
+
+        let path = CanonicalizedComponentFunctionPath {
+            component: component_path.clone(),
+            udf_path: init_path.clone(),
+        };
+        let validated = ValidatedPathAndArgs::new_with_returns_validator(
+            AllowedVisibility::All,
+            tx,
+            PublicFunctionPath::Component(path),
+            arguments,
+            UdfType::Mutation,
+            PendingArgsPolicy::Reject,
+        )
+        .await?;
+        let (path_and_args, returns_validator, _) = match validated {
+            Ok(validated) => validated,
+            Err(js_error) => anyhow::bail!(ErrorMetadata::bad_request(
+                "InvalidComponentArgs",
+                init_failure(init_path, component_path, &js_error.to_string()),
+            )),
+        };
+        let component = path_and_args.path().component;
+        let table_mapping = tx.table_mapping().namespace(component.into());
+
+        Ok(ComponentInit {
+            path_and_args,
+            returns_validator,
+            table_mapping,
+        })
     }
 
     /// N.B.: does not check auth
@@ -1105,6 +1278,33 @@ fn validate_env_var_declarations(
                         "Env var `{name}` on {component_label} has a non-string validator. \
                          Component env vars must be declared with `v.string()`, \
                          `v.literal(\"...\")`, or a union of those."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_component_args_size(
+    evaluated_components: &BTreeMap<ComponentDefinitionPath, EvaluatedComponentDefinition>,
+) -> anyhow::Result<()> {
+    let limit = *COMPONENT_ARGS_MAX_SIZE_BYTES;
+    for (path, evaluated) in evaluated_components {
+        for instantiation in &evaluated.definition.child_components {
+            let size = instantiation.serialized_args_size()?;
+            if size > limit {
+                let component_label = if path.is_root() {
+                    "the app".to_string()
+                } else {
+                    format!("component {path}", path = String::from(path.clone()))
+                };
+                anyhow::bail!(ErrorMetadata::bad_request(
+                    "ComponentArgsTooLarge",
+                    format!(
+                        "The arguments {component_label} passes to component `{name}` are {size} \
+                         bytes, over the limit of {limit} bytes.",
+                        name = String::from(instantiation.name.clone()),
                     ),
                 ));
             }

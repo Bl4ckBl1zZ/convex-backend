@@ -2536,7 +2536,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
 dependencies = [
  "lazy_static",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2545,7 +2545,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fde0e0ec90c9dfb3b4b1a0891a7dcd0e2bffde2f7efed5fe7c9bb00e5bfb915e"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4128,7 +4128,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6254,9 +6254,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-tzdb"
-version = "0.1.8"
+version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "142bd39932ad231f10513df9ab62661fead8719872150b7ad02a2df79f4e141e"
+checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
 
 [[package]]
 name = "jiff-tzdb-platform"
@@ -6957,31 +6957,6 @@ name = "macro_rules_attribute-proc_macro"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8dd856d451cc0da70e2ef2ce95a18e39a93b7558bedf10201ad28503f918568"
-
-[[package]]
-name = "managed_export"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "aws-credential-types",
- "aws-sdk-glue",
- "aws-sdk-s3",
- "common",
- "errors",
- "fastrace",
- "futures",
- "iceberg",
- "iceberg-storage-opendal",
- "keybroker",
- "parquet",
- "pb",
- "prost 0.14.3",
- "serde_json",
- "tokio",
- "uuid",
- "value",
-]
 
 [[package]]
 name = "managed_export_worker"
@@ -8864,7 +8839,7 @@ dependencies = [
 [[package]]
 name = "prometheus"
 version = "0.14.0"
-source = "git+https://github.com/convex/rust-prometheus?rev=367f80d0d3678ed7989814fd5864598746a3b946#367f80d0d3678ed7989814fd5864598746a3b946"
+source = "git+https://github.com/convex/rust-prometheus?rev=89a17d8d6185120517bddda124a494d6960c8515#89a17d8d6185120517bddda124a494d6960c8515"
 dependencies = [
  "cfg-if",
  "fnv",
@@ -9173,7 +9148,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.7",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9877,7 +9852,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9890,7 +9865,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9971,7 +9946,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10015,6 +9990,31 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "s3_exports"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "aws-credential-types",
+ "aws-sdk-glue",
+ "aws-sdk-s3",
+ "common",
+ "errors",
+ "fastrace",
+ "futures",
+ "iceberg",
+ "iceberg-storage-opendal",
+ "keybroker",
+ "parquet",
+ "pb",
+ "prost 0.14.3",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "value",
+]
 
 [[package]]
 name = "safe_arch"
@@ -11619,10 +11619,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
