@@ -7,11 +7,14 @@
         ".docusaurus/**",
         "typedoc-sidebar.js",
         "docs/api/**",
+        "docs/cli/reference/**",
         "docs/management-api/**",
         "docs/deployment-api/**",
         "docs/public-deployment-api/**",
         ".openapi-filtered/**"
-      ]
+      ],
+      // Picks the convex commit the reference pages document.
+      "env": ["CONVEX_DOCS_REFERENCE_SOURCE"]
     }
   }
 }
