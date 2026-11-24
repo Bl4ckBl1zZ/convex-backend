@@ -25,12 +25,36 @@ const REPO_ROOT = path.resolve(__dirname, "../../..");
 const CONVEX_PACKAGE_DIR = "npm-packages/convex";
 const PACKAGE_JSON = `${CONVEX_PACKAGE_DIR}/package.json`;
 const SOURCE_ENV_VAR = "CONVEX_DOCS_REFERENCE_SOURCE";
-// Holds the extracted release and the generated tsconfig. The release is laid
-// out like the repository, so that paths relative to it are also paths in the
-// GitHub repository.
+// In release mode, the commit to document, as printed by running this script.
+// CI resolves it in a step that can read `origin` and builds without access.
+const COMMIT_ENV_VAR = "CONVEX_DOCS_REFERENCE_COMMIT";
+// Holds the checkout of the release and the generated tsconfig.
 const CACHE_DIR = path.resolve(__dirname, "../.reference-source");
-const EXTRACT_ROOT = path.join(CACHE_DIR, "release");
-const MANIFEST_PATH = path.join(EXTRACT_ROOT, "manifest.json");
+// A sparse, detached worktree at the release, so that paths relative to it are
+// also paths in the GitHub repository. It's kept between builds, and checking
+// out the next release only rewrites the files that changed.
+const CHECKOUT_ROOT = path.join(CACHE_DIR, "release");
+// The commit whose dependencies CHECKOUT_ROOT has finished installing.
+const CHECKOUT_MANIFEST_PATH = path.join(CACHE_DIR, "release.json");
+const WORKSPACE_DIR = "npm-packages";
+// Everything the reference pages read from the release, plus the workspace
+// files that `pnpm install` needs to install the package's dependencies from
+// the release's lockfile. The workspace's other packages stay unchecked-out:
+// the lockfile lists them, but installing only `convex` doesn't read them.
+const SPARSE_CHECKOUT_PATTERNS = [
+  `/${CONVEX_PACKAGE_DIR}/src/`,
+  `/${CONVEX_PACKAGE_DIR}/tsconfig.json`,
+  // TypeDoc renders the README closest to the entry points' package.json.
+  `/${PACKAGE_JSON}`,
+  `/${CONVEX_PACKAGE_DIR}/README.md`,
+  // Its `packageManager` pins the pnpm that wrote the lockfile.
+  `/${WORKSPACE_DIR}/package.json`,
+  `/${WORKSPACE_DIR}/pnpm-workspace.yaml`,
+  `/${WORKSPACE_DIR}/pnpm-lock.yaml`,
+  `/${WORKSPACE_DIR}/.npmrc`,
+  // Patch files belong here too once pnpm-workspace.yaml has
+  // `patchedDependencies`.
+];
 // How many commits to fetch at a time when the commit that set the version is
 // missing from a shallow clone.
 const DEEPEN_BY = 500;
@@ -198,46 +222,60 @@ function versionAt(commit) {
   return JSON.parse(git("show", `${commit}:${PACKAGE_JSON}`)).version;
 }
 
-function extract(commit) {
-  if (fs.existsSync(MANIFEST_PATH)) {
-    const manifest = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
-    if (manifest.commit === commit) {
-      return;
-    }
+function readCheckoutManifest() {
+  try {
+    return JSON.parse(fs.readFileSync(CHECKOUT_MANIFEST_PATH, "utf8"));
+  } catch {
+    return null;
   }
-
-  fs.rmSync(EXTRACT_ROOT, { recursive: true, force: true });
-  fs.mkdirSync(EXTRACT_ROOT, { recursive: true });
-  const archive = execFileSync(
-    "git",
-    [
-      "archive",
-      "--format=tar",
-      commit,
-      "--",
-      `${CONVEX_PACKAGE_DIR}/src`,
-      `${CONVEX_PACKAGE_DIR}/tsconfig.json`,
-      // TypeDoc renders the README closest to the entry points' package.json.
-      PACKAGE_JSON,
-      `${CONVEX_PACKAGE_DIR}/README.md`,
-    ],
-    { cwd: REPO_ROOT, maxBuffer: 256 * 1024 * 1024 },
-  );
-  execFileSync("tar", ["-x", "-C", EXTRACT_ROOT], { input: archive });
-
-  // The release resolves its dependencies from the working tree's
-  // `node_modules`. They can be newer than the release's, which only matters
-  // if a documented type or the CLI's behavior changed.
-  fs.symlinkSync(
-    path.join(REPO_ROOT, CONVEX_PACKAGE_DIR, "node_modules"),
-    path.join(EXTRACT_ROOT, CONVEX_PACKAGE_DIR, "node_modules"),
-    "dir",
-  );
-
-  fs.writeFileSync(MANIFEST_PATH, JSON.stringify({ commit }) + "\n");
 }
 
-function findRelease() {
+// Checks out `commit` into CHECKOUT_ROOT and installs the release's own
+// dependencies there, so the CLI and the documented types run against the
+// versions the release shipped with rather than the working tree's.
+function checkOut(commit) {
+  const isWorktree = fs.existsSync(path.join(CHECKOUT_ROOT, ".git"));
+  if (isWorktree && readCheckoutManifest()?.commit === commit) {
+    return;
+  }
+
+  const checkoutGit = (...args) =>
+    execFileSync("git", ["-C", CHECKOUT_ROOT, ...args], { encoding: "utf8" });
+  if (!isWorktree) {
+    // Replaces what's there, e.g. a `git archive` extraction from before this
+    // was a worktree, and drops the registration of a worktree whose
+    // directory was deleted by hand.
+    fs.rmSync(CHECKOUT_ROOT, { recursive: true, force: true });
+    git("worktree", "prune");
+    git("worktree", "add", "--detach", "--no-checkout", CHECKOUT_ROOT, commit);
+    checkoutGit(
+      "sparse-checkout",
+      "set",
+      "--no-cone",
+      ...SPARSE_CHECKOUT_PATTERNS,
+    );
+  }
+  fs.rmSync(CHECKOUT_MANIFEST_PATH, { force: true });
+  checkoutGit("checkout", "--quiet", "--force", "--detach", commit);
+
+  // The release's package has no install scripts that the docs need.
+  execFileSync(
+    "pnpm",
+    [
+      "install",
+      "--filter",
+      "convex",
+      "--frozen-lockfile",
+      "--ignore-scripts",
+      "--config.confirmModulesPurge=false",
+    ],
+    { cwd: path.join(CHECKOUT_ROOT, WORKSPACE_DIR), stdio: "inherit" },
+  );
+
+  fs.writeFileSync(CHECKOUT_MANIFEST_PATH, JSON.stringify({ commit }) + "\n");
+}
+
+function documentedVersion() {
   const version = JSON.parse(
     fs.readFileSync(path.join(REPO_ROOT, PACKAGE_JSON), "utf8"),
   ).version;
@@ -248,33 +286,52 @@ function findRelease() {
         "document the working tree.",
     );
   }
+  return version;
+}
 
+function checkSetsVersion(commit, version) {
+  if (versionAt(commit) !== version) {
+    throw new Error(
+      `${commit} sets the version in ${PACKAGE_JSON} to ` +
+        `${versionAt(commit)}, not ${version}`,
+    );
+  }
+}
+
+/**
+ * Returns the commit of the release that release mode documents, fetching
+ * from `origin` what the clone is missing to find it.
+ *
+ * - `{ kind: "release", version, tag, commit }`: the release's tag.
+ * - `{ kind: "untagged", version, tag, commit }`: the commit that last changed
+ *   the version, while the release is untagged.
+ */
+function resolveRelease() {
+  const version = documentedVersion();
   const tag = `npm/${version}`;
   if (ensureTag(tag)) {
-    const commit = git("rev-parse", `${tag}^{commit}`);
     return {
       kind: "release",
       version,
       tag,
-      commit,
-      ...releaseSourceLinks(commit),
+      commit: git("rev-parse", `${tag}^{commit}`),
     };
   }
-
   const commit = lastVersionCommit();
-  if (versionAt(commit) !== version) {
-    throw new Error(
-      `The last commit that changes the version in ${PACKAGE_JSON} ` +
-        `(${commit}) sets it to ${versionAt(commit)}, not ${version}`,
-    );
-  }
-  return {
-    kind: "untagged",
-    version,
-    tag,
-    commit,
-    ...releaseSourceLinks(commit),
-  };
+  checkSetsVersion(commit, version);
+  return { kind: "untagged", version, tag, commit };
+}
+
+// Describes `commit`, which an earlier resolveRelease() returned, without
+// reading from `origin`.
+function describeResolvedRelease(commit) {
+  const version = documentedVersion();
+  const tag = `npm/${version}`;
+  checkSetsVersion(commit, version);
+  const tagged =
+    git("tag", "--list", tag) === tag &&
+    git("rev-parse", `${tag}^{commit}`) === commit;
+  return { kind: tagged ? "release" : "untagged", version, tag, commit };
 }
 
 /**
@@ -305,12 +362,16 @@ function prepareReferenceSource() {
     );
   }
 
-  const release = findRelease();
-  extract(release.commit);
+  const resolvedCommit = process.env[COMMIT_ENV_VAR];
+  const resolved = resolvedCommit
+    ? describeResolvedRelease(resolvedCommit)
+    : resolveRelease();
+  const release = { ...resolved, ...releaseSourceLinks(resolved.commit) };
+  checkOut(release.commit);
   printBanner(release);
   return {
-    root: EXTRACT_ROOT,
-    packageDir: path.join(EXTRACT_ROOT, CONVEX_PACKAGE_DIR),
+    root: CHECKOUT_ROOT,
+    packageDir: path.join(CHECKOUT_ROOT, CONVEX_PACKAGE_DIR),
     linkRepo: release.mirrorRepo,
     linkRef: release.mirrorRef,
     pageBanner: "",
@@ -343,3 +404,8 @@ function writeEntryPointsTsconfig(source, entryPoints) {
 }
 
 module.exports = { prepareReferenceSource, writeEntryPointsTsconfig };
+
+// Prints the commit that release mode documents.
+if (require.main === module) {
+  console.log(resolveRelease().commit);
+}

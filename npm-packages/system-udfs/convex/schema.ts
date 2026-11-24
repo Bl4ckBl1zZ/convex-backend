@@ -164,20 +164,31 @@ const exportRequestor = v.union(
   v.literal("cloudBackup"),
 );
 
+const exportFormat = v.object({
+  format: v.literal("zip"),
+  include_storage: v.boolean(),
+});
+
+// Null for the app.
+const exportComponent = v.union(v.string(), v.null());
+
 export const completedExport = v.object({
   state: v.literal("completed"),
   complete_ts: v.int64(),
   expiration_ts: v.int64(),
   start_ts: v.int64(),
+
+  // Legacy field that Rust ignores.
   tables: v.optional(v.array(v.array(v.string()))),
-  zip_object_key: v.optional(v.string()),
-  format: v.optional(
-    v.object({
-      format: v.literal("zip"),
-      include_storage: v.boolean(),
-    }),
-  ),
+
+  zip_object_key: v.string(),
+  format: exportFormat,
+  component: exportComponent,
   requestor: exportRequestor,
+
+  // Size of the zip in bytes. Missing on exports completed before it was
+  // recorded.
+  size: v.optional(v.int64()),
 });
 
 const cronJobStatus = v.union(
@@ -209,6 +220,10 @@ export const integrationState = v.union(
   v.object({
     type: v.literal("deleting"),
   }),
+  // Set on active integrations while the backend restarts them.
+  v.object({
+    type: v.literal("restarting"),
+  }),
 );
 
 // The subscribable log stream topics.
@@ -231,6 +246,9 @@ export const logTopic = v.union(
 // topics, including ones added in the future.
 const subscribedTopics = v.optional(v.array(logTopic));
 
+// Rust writes unset optional config fields as null.
+const optionalNullableString = v.optional(v.union(v.string(), v.null()));
+
 export const datadogConfig = v.object({
   type: v.literal("datadog"),
   siteLocation: v.union(
@@ -243,7 +261,7 @@ export const datadogConfig = v.object({
   ),
   ddApiKey: v.string(),
   ddTags: v.array(v.string()),
-  service: v.optional(v.string()),
+  service: optionalNullableString,
   version: v.optional(v.union(v.literal("1"), v.literal("2"))),
   topics: subscribedTopics,
 });
@@ -267,29 +285,29 @@ export const axiomConfig = v.object({
     }),
   ),
   version: v.optional(v.union(v.literal("1"), v.literal("2"))),
-  ingestUrl: v.optional(v.string()),
+  ingestUrl: optionalNullableString,
   topics: subscribedTopics,
 });
 
 export const sentryConfig = v.object({
   type: v.literal("sentry"),
   dsn: v.string(),
-  tags: v.optional(v.record(v.string(), v.string())),
+  tags: v.optional(v.union(v.record(v.string(), v.string()), v.null())),
   version: v.optional(v.union(v.literal("1"), v.literal("2"))),
 });
 
 export const postHogLogsConfig = v.object({
   type: v.literal("postHogLogs"),
   apiKey: v.string(),
-  host: v.optional(v.string()),
-  serviceName: v.optional(v.string()),
+  host: optionalNullableString,
+  serviceName: optionalNullableString,
   topics: subscribedTopics,
 });
 
 export const postHogErrorTrackingConfig = v.object({
   type: v.literal("postHogErrorTracking"),
   apiKey: v.string(),
-  host: v.optional(v.string()),
+  host: optionalNullableString,
 });
 
 const s3ExportProgress = v.union(
@@ -312,13 +330,21 @@ export const s3ExportConfig = v.object({
   type: v.literal("s3Export"),
   bucket: v.string(),
   region: v.string(),
-  prefix: v.optional(v.string()),
+  prefix: optionalNullableString,
   accessKeyId: v.optional(v.string()),
   secretAccessKey: v.optional(v.string()),
   // Empty until the admin pastes the ARN from their CloudFormation stack.
   roleArn: v.optional(v.string()),
   roleExternalId: v.optional(v.string()),
   selection: syncSelection,
+
+  // Left on configs written before the sync period was removed and the
+  // export progress moved to `_s3_export_state`. Rust ignores them.
+  period: v.optional(
+    v.union(v.literal("continuous"), v.literal("hourly"), v.literal("daily")),
+  ),
+  cursor: v.optional(v.union(v.string(), v.null())),
+  progress: v.optional(v.union(s3ExportProgress, v.null())),
 });
 
 export const integrationConfig = v.union(
@@ -374,11 +400,18 @@ const textIndexSegment = v.object({
   id: v.string(),
 });
 
+// Rust keeps snapshot data in a format it doesn't recognize (for example, one
+// written by a newer backend) as an opaque object and writes it back unchanged.
+const unknownIndexSnapshotData = v.record(v.string(), v.any());
+
 const textIndexSnapshot = {
-  data: v.object({
-    data_type: v.literal("MultiSegment"),
-    segments: v.array(textIndexSegment),
-  }),
+  data: v.union(
+    v.object({
+      data_type: v.literal("MultiSegment"),
+      segments: v.array(textIndexSegment),
+    }),
+    unknownIndexSnapshotData,
+  ),
   ts: v.int64(),
   version: v.int64(),
 };
@@ -413,6 +446,57 @@ const textIndexOnDiskState = v.union(
     // "backfilled" is the legacy name of "snapshotted".
     state: v.union(v.literal("backfilled"), v.literal("snapshotted")),
     ...textIndexSnapshot,
+  }),
+);
+
+const vectorIndexSegment = v.object({
+  segment_key: v.string(),
+  id_tracker_key: v.string(),
+  deleted_bitset_key: v.string(),
+  num_vectors: v.int64(),
+  num_deleted: v.int64(),
+  id: v.string(),
+});
+
+const vectorIndexSnapshot = {
+  data: v.union(
+    v.object({
+      data_type: v.literal("MultiSegment"),
+      segments: v.array(vectorIndexSegment),
+    }),
+    unknownIndexSnapshotData,
+  ),
+  ts: v.int64(),
+};
+
+const vectorIndexBackfilling = {
+  state: v.literal("backfilling"),
+  segments: v.optional(v.union(v.array(vectorIndexSegment), v.null())),
+  staged: v.optional(v.union(v.boolean(), v.null())),
+};
+
+const vectorIndexOnDiskState = v.union(
+  // Rust sets both cursor fields or neither, and fails to read anything else.
+  v.object({
+    ...vectorIndexBackfilling,
+    table_scan_cursor: tableScanCursor,
+    last_segment_ts: v.int64(),
+  }),
+  v.object({
+    ...vectorIndexBackfilling,
+    table_scan_cursor: v.optional(v.null()),
+    last_segment_ts: v.optional(v.null()),
+  }),
+
+  v.object({
+    state: v.literal("backfilled2"),
+    snapshot: v.object(vectorIndexSnapshot),
+    staged: v.boolean(),
+  }),
+  v.object({
+    // "backfilled" is the legacy name of "snapshotted".
+    state: v.union(v.literal("backfilled"), v.literal("snapshotted")),
+    ...vectorIndexSnapshot,
   }),
 );
 
@@ -473,17 +557,7 @@ export default defineSchema({
         vectorField: v.string(),
         dimensions: v.int64(),
         filterFields: v.array(v.string()),
-        onDiskState: v.union(
-          v.object({
-            state: v.union(
-              v.literal("backfilling"),
-              v.literal("backfilled"),
-              v.literal("backfilled2"),
-            ),
-            staged: v.optional(v.boolean()),
-          }),
-          v.object({ state: v.literal("snapshotted") }),
-        ),
+        onDiskState: vectorIndexOnDiskState,
       }),
     ),
   }),
@@ -570,22 +644,35 @@ export default defineSchema({
         state: v.literal("failed"),
         start_ts: v.int64(),
         failed_ts: v.int64(),
+        format: exportFormat,
+        component: exportComponent,
         requestor: exportRequestor,
       }),
       v.object({
         state: v.literal("in_progress"),
         start_ts: v.int64(),
+        expiration_ts: v.int64(),
+        format: exportFormat,
+        component: exportComponent,
         requestor: exportRequestor,
         progress_message: v.optional(v.union(v.null(), v.string())),
+
+        // Opaque state for resuming the export after a restart.
+        resumption_token: v.optional(v.record(v.string(), v.any())),
       }),
       v.object({
         state: v.literal("requested"),
+        expiration_ts: v.int64(),
+        format: exportFormat,
+        component: exportComponent,
         requestor: exportRequestor,
       }),
       v.object({
         state: v.literal("canceled"),
         start_ts: v.optional(v.union(v.null(), v.int64())),
         canceled_ts: v.int64(),
+        format: exportFormat,
+        component: exportComponent,
         requestor: exportRequestor,
       }),
     ),
