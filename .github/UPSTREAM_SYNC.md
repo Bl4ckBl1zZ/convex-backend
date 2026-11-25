@@ -28,24 +28,39 @@ git merge upstream/main
 .github/fork_workflows.sh --prune  # drop upstream workflows; see invariant 3
 ```
 
-**Merging to `main` redeploys production, but not its backend.** Dokploy
+**Merging to `main` deploys the new backend to Dev, then production.** Dokploy
 auto-deploys the profile on every push to `main`, so compose, SQL and dashboard
-changes go live on merge. The backend image is pinned by `CONVEX_BACKEND_IMAGE`
-in the Dokploy environment, so a merge alone keeps the old backend. To roll out
-a new backend:
+changes go live on merge. Production and ModularBots Dev both run
+`ghcr.io/bl4ckbl1zz/convex-backend:latest` with `pull_policy: always`, and
+neither sets `CONVEX_BACKEND_IMAGE`. After "Publish Fork Backend Image" moves
+`latest`, its `deploy` job:
 
-1. Wait for "Publish Fork Backend Image" to finish for the merge commit. It runs
-   on every push to `main` except merges that touch only the fork-owned paths in
-   its `paths-ignore` list (sync merges always publish). Without an image for
-   the merge commit, start the workflow by hand on `main`.
-2. Resolve its digest:
-   `docker buildx imagetools inspect ghcr.io/bl4ckbl1zz/convex-backend:sha-<merge-sha>`.
-3. Deploy it to ModularBots Dev first (its raw compose pins the image), then set
-   `CONVEX_BACKEND_IMAGE=ghcr.io/bl4ckbl1zz/convex-backend:sha-<merge-sha>@sha256:<digest>`
-   on production and redeploy.
-4. A new backend runs its database migrations in the background after startup.
-   Errors such as `missing field` can appear until the logs show
-   `Migration complete`; wait for that before deciding to roll back.
+1. Redeploys Dev through its Dokploy webhook and waits until Dev's `/version`
+   answers with the merge commit for a minute.
+2. Redeploys production the same way, then checks the app's health endpoint.
+
+A failure stops the job, and GitHub reports the failed run. Production keeps
+whatever it ran, unless the failure came after its redeploy. The job needs the
+repository secrets `DOKPLOY_DEV_DEPLOY_WEBHOOK`, `DEV_CONVEX_URL`,
+`DOKPLOY_PROD_DEPLOY_WEBHOOK`, `PROD_CONVEX_URL` and, optionally,
+`PROD_APP_HEALTH_URL`. A webhook URL is the stack's Dokploy deploy URL
+(`/api/deploy/compose/<refreshToken>`), and anyone holding it can redeploy that
+stack. Merges that touch only the fork-owned paths in `paths-ignore` publish
+nothing and deploy nothing new.
+
+A new backend runs its database migrations in the background after startup.
+Errors such as `missing field` can appear until the logs show
+`Migration complete`; wait for that before deciding to roll back.
+
+**Rolling back or holding a version.** Set
+`CONVEX_BACKEND_IMAGE=ghcr.io/bl4ckbl1zz/convex-backend:sha-<commit>` in the
+stack's Dokploy environment and redeploy. Later publishes then leave it alone;
+remove the variable to follow `latest` again. Going back to an image with an
+older `DATABASE_VERSION` (`crates/migrations_model/src/lib.rs`) does not work.
+The backend has already migrated its system tables, so restore a backup taken
+before the update instead. `/version` reports the running commit because
+`Dockerfile.backend`'s final stage sets `CONVEX_RELEASE_VERSION_DEV` from
+`VERGEN_GIT_SHA`. Keep that line when a sync touches the Dockerfile.
 
 ## Conflict resolution principle
 
@@ -112,12 +127,13 @@ own artifacts.
   `ubuntu-24.04-arm` in parallel, pushes `sha-<sha>-amd64` and
   `sha-<sha>-arm64`, then joins them into `sha-<sha>` (plus `latest` and `main`
   on `main` only). Both architectures are needed: production is amd64,
-  RestoreCord's MicroApi Convex host is arm64. Keep the image name and the
-  `sha-<commit>` scheme: `CONVEX_BACKEND_IMAGE` pins depend on them. It uses no
-  layer cache on purpose: cargo writes to BuildKit cache mounts, which a layer
-  cache does not save, and exporting it cost 5-22 minutes per run without making
-  cargo faster. `CARGO_BUILD_JOBS=4` matches the runners' 4 vCPUs (the
-  Dockerfile's default is also 4).
+  RestoreCord's MicroApi Convex host is arm64. Keep the image name, `latest` and
+  the `sha-<commit>` scheme: the Dokploy stacks follow `latest`, and rollbacks
+  pin `sha-` tags. On `main`, its `deploy` job then redeploys Dev and production
+  (see "Merge strategy"). It uses no layer cache on purpose: cargo writes to
+  BuildKit cache mounts, which a layer cache does not save, and exporting it
+  cost 5-22 minutes per run without making cargo faster. `CARGO_BUILD_JOBS=4`
+  matches the runners' 4 vCPUs (the Dockerfile's default is also 4).
 - **Build Convex Backend** is the pre-merge check for syncs: `cargo check`, a
   clippy pass over the fork's crates and the Node executor pool tests. Its first
   step runs `.github/fork_workflows.sh`.

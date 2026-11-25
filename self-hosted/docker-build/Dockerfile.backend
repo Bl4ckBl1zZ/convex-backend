@@ -118,6 +118,10 @@ FROM ubuntu:noble
 ARG VERGEN_GIT_SHA
 LABEL org.opencontainers.repository=https://github.com/convex/convex-backend
 LABEL org.opencontainers.image.revision=${VERGEN_GIT_SHA}
+# Fork-only: `/version` answers with the commit the image was built from, so
+# the publish workflow can tell when a deployment runs the new image. Empty
+# (a local build) leaves it at "unknown".
+ENV CONVEX_RELEASE_VERSION_DEV=${VERGEN_GIT_SHA}
 
 WORKDIR /convex
 

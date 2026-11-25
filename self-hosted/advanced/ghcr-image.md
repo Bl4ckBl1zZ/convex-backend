@@ -23,12 +23,17 @@ MicroApi Convex host is arm64. A run takes about 35 minutes; see
 - `sha-<full-git-sha>-amd64` and `sha-<full-git-sha>-arm64` identify the
   platform-specific images used to construct the multi-platform manifest.
 
-Use `latest` for automatic updates or set `CONVEX_BACKEND_IMAGE` to an immutable
-tag or digest for controlled production rollouts:
+Production and ModularBots Dev use `latest`. The publish workflow redeploys them
+after each build from `main`: Dev first, then production once Dev answers
+`/version` with the new commit. Set `CONVEX_BACKEND_IMAGE` to an immutable tag
+only to hold a stack on one version or to roll back:
 
 ```dotenv
 CONVEX_BACKEND_IMAGE=ghcr.io/bl4ckbl1zz/convex-backend:sha-<full-git-sha>
 ```
+
+An image's `/version` endpoint answers with the commit it was built from. Images
+published before the deploy job existed answer `unknown`.
 
 Both Dokploy Compose profiles use the published image and set
 `pull_policy: always`. They no longer compile the Rust backend on the Dokploy
