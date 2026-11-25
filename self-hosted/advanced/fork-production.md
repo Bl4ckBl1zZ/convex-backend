@@ -119,10 +119,10 @@ the end, against 172 MiB for upstream's one.
 
 ### What production needs to know
 
-- Merging to `main` redeploys the profile, but the backend image is pinned by
-  `CONVEX_BACKEND_IMAGE` in the Dokploy environment; see "Merge strategy" in
-  `.github/UPSTREAM_SYNC.md` for rolling out a new backend. Production has run
-  `sha-3860098a0` since 2026-10-19.
+- Production follows `latest`. Merging to `main` publishes a new image, then
+  redeploys Dev and, once Dev runs it, production. See "Merge strategy" in
+  `.github/UPSTREAM_SYNC.md` for the deploy job, rollbacks and holding a
+  version.
 - The new image uses less memory than the one production ran, but the 4-process
   Node pool still adds roughly 0.5-0.75 GiB over upstream. Check the backend's
   steady-state usage with `docker stats` against its 12 GiB limit before raising

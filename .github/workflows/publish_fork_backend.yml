@@ -158,3 +158,88 @@ jobs:
             fi
             echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Both Dokploy stacks run `latest` with `pull_policy: always`, so a redeploy
+  # takes the image just published. Dev goes first and must answer with the new
+  # commit on `/version` before production is redeployed. The URLs are secrets:
+  # each webhook deploys only its own stack, and none of them is named here.
+  deploy:
+    name: Deploy to Dev, then production
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Deploy and verify
+        shell: bash
+        env:
+          DEV_DEPLOY_WEBHOOK: ${{ secrets.DOKPLOY_DEV_DEPLOY_WEBHOOK }}
+          DEV_CONVEX_URL: ${{ secrets.DEV_CONVEX_URL }}
+          PROD_DEPLOY_WEBHOOK: ${{ secrets.DOKPLOY_PROD_DEPLOY_WEBHOOK }}
+          PROD_CONVEX_URL: ${{ secrets.PROD_CONVEX_URL }}
+          PROD_APP_HEALTH_URL: ${{ secrets.PROD_APP_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          for name in DEV_DEPLOY_WEBHOOK DEV_CONVEX_URL PROD_DEPLOY_WEBHOOK PROD_CONVEX_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret for $name is not set; nothing was deployed."
+              exit 1
+            fi
+          done
+
+          # Dokploy's compose webhook takes a GitHub push payload; both stacks
+          # deploy on `main` with no watch paths.
+          trigger() {
+            local stage=$1 webhook=$2 payload status
+            payload=$(jq -n --arg sha "$GITHUB_SHA" \
+              '{ref: "refs/heads/main", after: $sha, commits: [],
+                head_commit: {id: $sha, message: ("Backend image sha-" + $sha[0:12])}}')
+            status=$(curl -sS -o /tmp/response -w '%{http_code}' --max-time 60 -X POST \
+              -H 'content-type: application/json' -H 'x-github-event: push' \
+              --data "$payload" "$webhook")
+            echo "$stage webhook: HTTP $status $(cat /tmp/response)"
+            # Dokploy answers 301 when it skips a deploy, so only 200 counts.
+            [ "$status" = 200 ] || { echo "::error::$stage was not deployed (HTTP $status)."; exit 1; }
+          }
+
+          # The backend answers /version with its image's commit. It must keep
+          # answering it for a minute, so a crash after migrating fails here.
+          await_version() {
+            local stage=$1 url=$2 deadline=$((SECONDS + 1500)) streak=0 version
+            while [ $SECONDS -lt $deadline ]; do
+              version=$(curl -fsS --max-time 10 "${url%/}/version" 2>/dev/null || true)
+              if [ "$version" = "$GITHUB_SHA" ]; then
+                streak=$((streak + 1))
+                [ $streak -ge 6 ] && { echo "$stage runs ${GITHUB_SHA:0:12}."; return 0; }
+              else
+                streak=0
+              fi
+              sleep 10
+            done
+            echo "::error::$stage did not come up on ${GITHUB_SHA:0:12} within 25 minutes (last /version: ${version:-no answer})."
+            exit 1
+          }
+
+          trigger Dev "$DEV_DEPLOY_WEBHOOK"
+          await_version Dev "$DEV_CONVEX_URL"
+          trigger Production "$PROD_DEPLOY_WEBHOOK"
+          await_version Production "$PROD_CONVEX_URL"
+
+          if [ -n "$PROD_APP_HEALTH_URL" ]; then
+            for attempt in 1 2 3 4 5 6; do
+              if curl -fsS --max-time 20 "$PROD_APP_HEALTH_URL" | jq -e '.status == "ok" and (.convex.ok // true)' >/dev/null; then
+                echo "Production app health: ok."
+                break
+              fi
+              [ $attempt -eq 6 ] && { echo "::error::Production app health check failed after the backend update."; exit 1; }
+              sleep 20
+            done
+          fi
+
+          {
+            echo "### Deployed"
+            echo
+            echo "Dev, then production, run \`sha-${GITHUB_SHA}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
