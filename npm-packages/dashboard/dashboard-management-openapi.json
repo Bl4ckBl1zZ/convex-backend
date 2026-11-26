@@ -788,24 +788,6 @@
         }
       }
     },
-    "/delete_project/{project_id}": {
-      "post": {
-        "operationId": "dashboard_delete_project",
-        "parameters": [
-          {
-            "name": "project_id",
-            "in": "path",
-            "description": "",
-            "required": true
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": ""
-          }
-        }
-      }
-    },
     "/delete_projects": {
       "post": {
         "operationId": "dashboard_delete_projects",
@@ -3495,7 +3477,7 @@
       },
       "AdminKey": {
         "type": "string",
-        "description": "Encrypted admin key"
+        "deprecated": true
       },
       "AppAccessTokenResponse": {
         "type": "object",
@@ -3559,7 +3541,7 @@
           "receiveProject",
           "updateProject",
           "deleteProject",
-          "undeleteProject",
+          "recoverProject",
           "createProjectEnvironmentVariable",
           "updateProjectEnvironmentVariable",
           "deleteProjectEnvironmentVariable",
@@ -5314,6 +5296,11 @@
           }
         }
       },
+      "LegacyAdminKey": {
+        "type": "string",
+        "description": "An encrypted key for a deployment admin identity.",
+        "deprecated": true
+      },
       "LegacyAdminKeyDeploymentUsage": {
         "type": "object",
         "required": [
@@ -5408,7 +5395,7 @@
         ],
         "properties": {
           "adminKey": {
-            "$ref": "#/components/schemas/AdminKey"
+            "$ref": "#/components/schemas/LegacyAdminKey"
           },
           "deploymentUrl": {
             "type": "string"

@@ -176,6 +176,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/teams/{team_id}/projects/{project_id}/recover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Recover project
+         * @description Recover a recently deleted project and its eligible deployments.
+         */
+        post: operations["recover project"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/teams/{team_id}/list_deleted_projects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List deleted projects
+         * @description List a team's deleted projects within the recovery window, newest first.
+         */
+        get: operations["list deleted projects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/teams/{team_id_or_slug}/projects/{project_slug}": {
         parameters: {
             query?: never;
@@ -1004,7 +1044,7 @@ export interface components {
     schemas: {
         /** Format: int64 */
         AccessTokenId: number;
-        /** @description Encrypted admin key */
+        /** @deprecated */
         AdminKey: string;
         /** @description The wire format of the claims sent to the gateway.
          *
@@ -1046,7 +1086,7 @@ export interface components {
             /** @description The identity that executed the action */
             actor: components["schemas"]["AuditLogActor"];
             /** @enum {string} */
-            action: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:undelete" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "member:token:createWithSsoAccess" | "team:domain:create" | "team:domain:delete" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "member:loginWithSso" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
+            action: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:recover" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "member:token:createWithSsoAccess" | "team:domain:create" | "team:domain:delete" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "member:loginWithSso" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
             /**
              * Format: int64
              * @description Time the event was created, in milliseconds since epoch.
@@ -1153,6 +1193,23 @@ export interface components {
             /** @description The token to delete. This can be its secret value or its name. */
             id: string;
         };
+        DeletedProject: {
+            id: components["schemas"]["ProjectId"];
+            name: components["schemas"]["ProjectName"];
+            slug: components["schemas"]["ProjectSlug"];
+            /**
+             * Format: int64
+             * @description Deletion time in milliseconds since epoch.
+             */
+            deletedAt: number;
+            /**
+             * Format: int64
+             * @description Recovery deadline in milliseconds since epoch.
+             */
+            recoverableUntil: number;
+        };
+        /** @description An access token with a deployment or project routing prefix. */
+        DeployKey: string;
         /** @enum {string} */
         DeploymentClass: "s16" | "s256" | "d1024" | "d2048" | "p256";
         DeploymentClassMetadata: {
@@ -1219,6 +1276,10 @@ export interface components {
             items: components["schemas"]["DefaultEnvironmentVariableResponse"][];
             pagination: components["schemas"]["PaginationMetadata"];
         };
+        PaginatedDeletedProjectsResponse: {
+            items: components["schemas"]["DeletedProject"][];
+            pagination: components["schemas"]["PaginationMetadata"];
+        };
         PaginatedDeploymentsResponse: {
             items: components["schemas"]["PlatformDeploymentResponse"][];
             pagination: components["schemas"]["PaginationMetadata"];
@@ -1257,7 +1318,7 @@ export interface components {
         };
         PlatformCreateDeployKeyResponse: {
             /** @description The generated deploy key. */
-            deployKey: components["schemas"]["AdminKey"];
+            deployKey: components["schemas"]["DeployKey"];
         };
         PlatformCreateDeploymentArgs: {
             type: components["schemas"]["CreateDeploymentType"];
@@ -1307,7 +1368,7 @@ export interface components {
         };
         PlatformCreatePreviewDeployKeyResponse: {
             /** @description The generated preview deploy key. */
-            previewDeployKey: components["schemas"]["AdminKey"];
+            previewDeployKey: components["schemas"]["DeployKey"];
         };
         PlatformCreateProjectArgs: {
             /** @description The full name of the project as it will appear in the dashboard. Spaces
@@ -1764,6 +1825,8 @@ export type DefaultEnvironmentVariableResponse = components['schemas']['DefaultE
 export type DeleteCustomRoleArgs = components['schemas']['DeleteCustomRoleArgs'];
 export type DeletePersonalAccessTokenArgs = components['schemas']['DeletePersonalAccessTokenArgs'];
 export type DeleteTeamAccessTokenArgs = components['schemas']['DeleteTeamAccessTokenArgs'];
+export type DeletedProject = components['schemas']['DeletedProject'];
+export type DeployKey = components['schemas']['DeployKey'];
 export type DeploymentClass = components['schemas']['DeploymentClass'];
 export type DeploymentClassMetadata = components['schemas']['DeploymentClassMetadata'];
 export type DeploymentId = components['schemas']['DeploymentId'];
@@ -1784,6 +1847,7 @@ export type MemberId = components['schemas']['MemberId'];
 export type MintLocalAiGatewayJwtArgs = components['schemas']['MintLocalAiGatewayJwtArgs'];
 export type MintLocalAiGatewayJwtResponse = components['schemas']['MintLocalAiGatewayJwtResponse'];
 export type PaginatedDefaultEnvironmentVariablesResponse = components['schemas']['PaginatedDefaultEnvironmentVariablesResponse'];
+export type PaginatedDeletedProjectsResponse = components['schemas']['PaginatedDeletedProjectsResponse'];
 export type PaginatedDeploymentsResponse = components['schemas']['PaginatedDeploymentsResponse'];
 export type PaginatedPersonalAccessTokensResponse = components['schemas']['PaginatedPersonalAccessTokensResponse'];
 export type PaginationMetadata = components['schemas']['PaginationMetadata'];
@@ -2081,6 +2145,55 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    "recover project": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: components["schemas"]["TeamId"];
+                /** @description Project ID */
+                project_id: components["schemas"]["ProjectId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    "list deleted projects": {
+        parameters: {
+            query?: {
+                /** @description Cursor from the previous page. */
+                cursor?: string | null;
+                /** @description Maximum number of projects to return (1–100, defaults to 100). */
+                limit?: number | null;
+            };
+            header?: never;
+            path: {
+                /** @description Team ID */
+                team_id: components["schemas"]["TeamId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaginatedDeletedProjectsResponse"];
+                };
             };
         };
     };
@@ -2816,7 +2929,7 @@ export interface operations {
                 to: number;
                 /** @description Only return events performed by this member. */
                 memberId?: null | components["schemas"]["MemberId"];
-                action?: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:undelete" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "member:token:createWithSsoAccess" | "team:domain:create" | "team:domain:delete" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "member:loginWithSso" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
+                action?: "team:join" | "team:create" | "team:update" | "team:delete" | "project:create" | "project:transfer" | "project:receive" | "project:update" | "project:delete" | "project:recover" | "defaultEnvironmentVariable:create" | "defaultEnvironmentVariable:update" | "defaultEnvironmentVariable:delete" | "deployment:create" | "deployment:delete" | "member:invite" | "member:cancelInvitation" | "member:remove" | "member:updateRole" | "project:updateMemberRole" | "billing:paymentMethod:update" | "billing:contact:update" | "billing:address:update" | "billing:subscription:create" | "billing:subscription:resume" | "billing:subscription:cancel" | "billing:subscription:changePlan" | "team:token:create" | "team:token:update" | "team:token:delete" | "team:token:view" | "project:token:create" | "project:token:update" | "project:token:delete" | "project:token:view" | "deployment:token:create" | "deployment:token:update" | "deployment:token:delete" | "deployment:token:view" | "member:token:createWithSsoAccess" | "team:domain:create" | "team:domain:delete" | "deployment:customDomain:create" | "deployment:customDomain:delete" | "deployment:backups:create" | "deployment:backups:import" | "deployment:backups:configurePeriodic" | "deployment:backups:disablePeriodic" | "deployment:backups:delete" | "team:disableExceedingSpendingLimits" | "billing:spendingLimit:update" | "team:applyReferralCode" | "oauthApplication:create" | "oauthApplication:update" | "oauthApplication:delete" | "oauthApplication:verify" | "oauthApplication:generateClientSecret" | "integration:workos:team:create" | "integration:workos:environment:create" | "integration:workos:environment:delete" | "integration:workos:environment:retrieveCredentials" | "integration:workos:team:disconnect" | "integration:workos:team:inviteMember" | "integration:workos:projectEnvironment:create" | "integration:workos:projectEnvironment:delete" | "integration:workos:projectEnvironment:retrieveCredentials" | "sso:enable" | "sso:disable" | "sso:update" | "member:loginWithSso" | "directorySync:enable" | "directorySync:disable" | "directorySync:updateGroupMapping" | "directorySync:deleteGroupMapping" | "deployment:transfer" | "deployment:receive" | "deployment:update" | "customRole:create" | "customRole:update" | "customRole:delete";
                 /** @description Maximum number of events to return (1-100, defaults to 15). */
                 limit?: number | null;
                 /** @description Cursor from a previous response to fetch the next page. */

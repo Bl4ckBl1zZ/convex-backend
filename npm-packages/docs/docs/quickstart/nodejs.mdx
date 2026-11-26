@@ -8,7 +8,8 @@ sidebar_position: 400
 
 import sampleData from "!!raw-loader!@site/../private-demos/quickstarts/nodejs/sampleData.jsonl";
 import tasks from "!!raw-loader!@site/../private-demos/quickstarts/nodejs/convex/tasks.ts";
-import script from "!!raw-loader!@site/../private-demos/quickstarts/nodejs/script.js";
+import script from "!!raw-loader!@site/../private-demos/quickstarts/nodejs/script.ts";
+import ConvexDevStep from "@site/docs/quickstart/_convex_dev_step.mdx";
 
 Learn how to query data from Convex in a Node.js project.
 
@@ -28,7 +29,7 @@ project configurations (TypeScript, bundlers, CJS vs ESM) see
   <Step title="Install the Convex client and server library">
     Install the `convex`
     package which provides a convenient interface for working
-    with Convex from JavaScript.
+    with Convex from TypeScript.
 
     Also install the `dotenv` library for loading `.env` files.
 
@@ -38,15 +39,7 @@ project configurations (TypeScript, bundlers, CJS vs ESM) see
 
   </Step>
   <Step title="Set up a Convex dev deployment">
-    Next, run `npx convex dev`. This
-    will prompt you to log in with GitHub,
-    create a project, and save your production and deployment URLs.
-
-    It will also create a `convex/` folder for you
-    to write your backend API functions in. The `dev` command
-    will then continue running to sync your functions
-    with your dev deployment in the cloud.
-
+    <ConvexDevStep />
 
     ```sh
     npx convex dev
@@ -92,21 +85,22 @@ project configurations (TypeScript, bundlers, CJS vs ESM) see
   </Step>
 
   <Step title="Connect the script to your backend">
-    In a new file `script.js`, create a `ConvexHttpClient` using
+    In a new file `script.ts`, create a `ConvexHttpClient` using
     the URL of your development environment.
 
     <Snippet
       source={script}
-      title="script.js"
+      title="script.ts"
     />
 
   </Step>
 
   <Step title="Run the script">
     Run the script from the same directory and see the list of tasks logged to the terminal.
+    Node.js 22.18 and later run TypeScript files directly.
 
     ```sh
-    node script.js
+    node script.ts
     ```
 
   </Step>

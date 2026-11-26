@@ -672,6 +672,27 @@ register_convex_counter!(
      transitions; see the created counter.",
     &["cluster_name"]
 );
+register_convex_histogram!(
+    INDEXES_LOG_BUCKET_DDL_SECONDS,
+    "Duration of V6 index log bucket CREATE and DROP statements. A DROP that frees cached table \
+     handles Aurora has swapped out pages them back in, so a slow DROP measures swapped handles.",
+    &[STATUS_LABEL[0], "cluster_name", "statement"]
+);
+#[derive(Clone, Copy, Debug, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum BucketDdl {
+    Create,
+    Drop,
+}
+pub fn indexes_log_bucket_ddl_timer(cluster_name: &str, statement: BucketDdl) -> StatusTimer {
+    let mut timer = StatusTimer::new(&INDEXES_LOG_BUCKET_DDL_SECONDS);
+    timer.add_label(cluster_name_label(cluster_name));
+    timer.add_label(StaticMetricLabel::new(
+        "statement",
+        <&'static str>::from(statement),
+    ));
+    timer
+}
 
 register_convex_counter!(
     INDEXES_LOG_MAINTENANCE_ROUNDS_TOTAL,
@@ -701,6 +722,39 @@ pub fn initialize_indexes_log_maintenance_rounds(cluster_name: &str) {
     use strum::IntoEnumIterator as _;
     for outcome in MaintenanceRoundOutcome::iter() {
         INDEXES_LOG_MAINTENANCE_ROUNDS_TOTAL
+            .with_label_values(&[cluster_name, outcome.into()])
+            .inc_by(0);
+    }
+}
+
+register_convex_counter!(
+    MYSQL_V6_POINT_READS_TOTAL,
+    "V6 reads of one exact index key by outcome. Every outcome but `hit` falls back to the full \
+     index query",
+    &["cluster_name", "outcome"]
+);
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr, strum::EnumIter)]
+#[strum(serialize_all = "snake_case")]
+pub enum PointReadOutcome {
+    /// The key's `indexes_latest` entry was visible at the read timestamp.
+    Hit,
+    /// The key has no `indexes_latest` entry: it was never written, or its
+    /// document was deleted before or after the read timestamp.
+    Missing,
+    /// The key's `indexes_latest` entry was written after the read timestamp.
+    Newer,
+}
+pub fn log_v6_point_read(cluster_name: &str, outcome: PointReadOutcome) {
+    MYSQL_V6_POINT_READS_TOTAL
+        .with_label_values(&[cluster_name, outcome.into()])
+        .inc();
+}
+/// Publishes zeroes so each outcome's first read has a baseline to increase
+/// from.
+pub fn initialize_v6_point_reads(cluster_name: &str) {
+    use strum::IntoEnumIterator as _;
+    for outcome in PointReadOutcome::iter() {
+        MYSQL_V6_POINT_READS_TOTAL
             .with_label_values(&[cluster_name, outcome.into()])
             .inc_by(0);
     }

@@ -744,9 +744,12 @@ pub static INDEX_RETENTION_DELAY: LazyLock<Duration> =
 /// last timestamp, as index history to inspect by hand during an incident.
 /// Reads and writes never use a bucket below the published floor, which follows
 /// `INDEX_RETENTION_DELAY`, so this only delays drops. A bucket is never
-/// dropped above the floor, even when this is shorter.
+/// dropped above the floor, even when this is shorter. The default of 0 drops a
+/// bucket as soon as the floor passes it, while MySQL's cached handles for its
+/// table are still in memory; hours later Aurora has swapped them out, and the
+/// drop stalls the writer paging them back in.
 pub static V6_INDEX_LOG_RETENTION_DELAY: LazyLock<Duration> =
-    LazyLock::new(|| Duration::from_secs(env_config("V6_INDEX_LOG_RETENTION_DELAY", 3 * 60 * 60)));
+    LazyLock::new(|| Duration::from_secs(env_config("V6_INDEX_LOG_RETENTION_DELAY", 0)));
 
 /// How often each conductor checks that the MySQL V6 `indexes_log_<bucket>`
 /// tables its cluster needs exist, and that buckets past retention are gone.
@@ -980,6 +983,14 @@ pub static MAX_SESSION_CLEANUP_DURATION: LazyLock<Option<Duration>> = LazyLock::
 /// Number of concurrent commits to use for deleting session requests.
 pub static SESSION_CLEANUP_DELETE_CONCURRENCY: LazyLock<usize> =
     LazyLock::new(|| env_config("SESSION_CLEANUP_DELETE_CONCURRENCY", 2));
+
+/// Default cloud backup retention in days.
+pub static CLOUD_BACKUP_DEFAULT_EXPIRATION: LazyLock<Duration> = LazyLock::new(|| {
+    Duration::from_days(u64::from(env_config(
+        "CLOUD_BACKUP_DEFAULT_EXPIRATION_DAYS",
+        7u32,
+    )))
+});
 
 /// Snapshots that expired more than this number of days ago are purged
 /// from storage.
