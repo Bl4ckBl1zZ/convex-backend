@@ -368,7 +368,11 @@ const usageLimitStopState = v.union(v.literal("none"), v.literal("disabled"));
 
 export const backendState = v.object({
   system: systemStopState,
-  usage_limit: usageLimitStopState,
+
+  // Not set on older documents. `SerializedBackendState` defaults it to
+  // "none", but reads from JS don't get this default value.
+  usage_limit: v.optional(usageLimitStopState),
+
   user: userStopState,
 });
 
@@ -565,6 +569,19 @@ export default defineSchema({
     indexId: v.id("_index"),
     numDocsIndexed: v.int64(),
     totalDocs: v.union(v.int64(), v.null()),
+    // Null for search and vector indexes, which keep their backfill state in
+    // `_index`. Missing on backfills that started before checkpointing.
+    cursor: v.optional(
+      v.union(
+        v.object({
+          snapshotTs: v.int64(),
+          // ID of the last document indexed in the table being backfilled,
+          // null before the first checkpoint.
+          cursor: v.union(v.string(), v.null()),
+        }),
+        v.null(),
+      ),
+    ),
   }).index("by_index_id", ["indexId"]),
   _components: defineTable({
     definitionId: v.id("_component_definitions"),
@@ -719,6 +736,18 @@ export default defineSchema({
   _cron_jobs: defineTable({
     name: v.string(),
     cronSpec: analyzedCronSpec,
+
+    // Legacy fields that Rust ignores. Crons last written before April 2025
+    // kept their next run here, before it moved to `_cron_next_run`.
+    state: v.optional(
+      v.union(
+        v.object({ type: v.literal("pending") }),
+        v.object({ type: v.literal("inProgress") }),
+        v.null(),
+      ),
+    ),
+    prevTs: v.optional(v.union(v.int64(), v.null())),
+    nextTs: v.optional(v.union(v.int64(), v.null())),
   }).index("by_name", ["name"]),
   _cron_next_run: defineTable({
     cronJobId: v.id("_cron_jobs"),
